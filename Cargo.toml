@@ -1,0 +1,11 @@
+[package]
+name = "dlep"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Implementation of the DLEP (Dynamic Link Exchange Protocol) in Rust"
+readme = "README.md"
+authors = ["Piotr Olszewski <asmie@asmie.pl>"]
+repository = "https://github.com/asmie/dlep"
+
+[dependencies]
