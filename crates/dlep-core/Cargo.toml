@@ -1,0 +1,14 @@
+[package]
+name = "dlep-core"
+description = "DLEP (RFC 8175) wire types, data items and codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+ipnet.workspace = true
