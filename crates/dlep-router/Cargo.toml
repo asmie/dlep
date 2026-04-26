@@ -1,0 +1,22 @@
+[package]
+name = "dlep-router"
+description = "DLEP (RFC 8175) router-side daemon binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dlep-router"
+path = "src/main.rs"
+
+[dependencies]
+dlep-daemon.workspace = true
+tokio.workspace = true
+clap.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
