@@ -1,0 +1,14 @@
+[package]
+name = "dlep-fsm"
+description = "DLEP (RFC 8175) state machines — discovery and session, router and modem sides"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dlep-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
