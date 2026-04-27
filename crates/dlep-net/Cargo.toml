@@ -1,0 +1,22 @@
+[package]
+name = "dlep-net"
+description = "DLEP (RFC 8175) transport: UDP multicast discovery, TCP, TLS, GTSM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dlep-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+socket2.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
