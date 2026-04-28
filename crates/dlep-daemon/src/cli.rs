@@ -27,7 +27,9 @@ pub fn load_toml_config<T>(path: Option<&Path>) -> Result<T, ConfigLoadError>
 where
     T: serde::de::DeserializeOwned + Default,
 {
-    let Some(p) = path else { return Ok(T::default()) };
+    let Some(p) = path else {
+        return Ok(T::default());
+    };
     let text = std::fs::read_to_string(p).map_err(|source| ConfigLoadError::Read {
         path: p.to_path_buf(),
         source,

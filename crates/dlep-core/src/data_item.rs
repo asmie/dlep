@@ -103,7 +103,9 @@ impl DataItem {
             DataItem::Latency(_) => DataItemType::LATENCY,
             DataItem::Resources(_) => DataItemType::RESOURCES,
             DataItem::RelativeLinkQualityReceive(_) => DataItemType::RELATIVE_LINK_QUALITY_RECEIVE,
-            DataItem::RelativeLinkQualityTransmit(_) => DataItemType::RELATIVE_LINK_QUALITY_TRANSMIT,
+            DataItem::RelativeLinkQualityTransmit(_) => {
+                DataItemType::RELATIVE_LINK_QUALITY_TRANSMIT
+            }
             DataItem::Mtu(_) => DataItemType::MTU,
             DataItem::Unknown(r) => r.type_id,
         }

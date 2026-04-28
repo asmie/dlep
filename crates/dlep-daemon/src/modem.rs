@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::ModemConfig;
 use crate::events::{DestinationId, LinkMetrics};
-use crate::runtime::{new_event_channel, DaemonError, EventRx, EventTx};
+use crate::runtime::{DaemonError, EventRx, EventTx, new_event_channel};
 
 pub struct ModemDaemon {
     events_tx: EventTx,

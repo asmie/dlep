@@ -6,12 +6,12 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use crate::SIGNAL_PREFIX;
 use crate::data_item::RawDataItem;
 use crate::error::CodecError;
 use crate::ids::{DataItemType, MessageType, SignalType};
 use crate::message::Message;
 use crate::signal::Signal;
-use crate::SIGNAL_PREFIX;
 
 /// Length of the fixed-size signal header: `"DLEP" (4) || type (2) || length (2)`.
 pub const SIGNAL_HEADER_LEN: usize = 8;

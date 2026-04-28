@@ -1,11 +1,55 @@
-[package]
-name = "dlep"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Implementation of the DLEP (Dynamic Link Exchange Protocol) in Rust"
-readme = "README.md"
 authors = ["Piotr Olszewski <asmie@asmie.pl>"]
 repository = "https://github.com/asmie/dlep"
+rust-version = "1.85"
 
-[dependencies]
+[workspace.dependencies]
+# protocol / core
+bytes = "1"
+thiserror = "2"
+ipnet = "2"
+
+# async runtime + io
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# TLS
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+
+# sockets / os
+socket2 = { version = "0.5", features = ["all"] }
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# CLI / config
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+
+# internal crates
+dlep-core = { path = "crates/dlep-core", version = "0.1.0" }
+dlep-fsm = { path = "crates/dlep-fsm", version = "0.1.0" }
+dlep-net = { path = "crates/dlep-net", version = "0.1.0" }
+dlep-ext = { path = "crates/dlep-ext", version = "0.1.0" }
+dlep-daemon = { path = "crates/dlep-daemon", version = "0.1.0" }

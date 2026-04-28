@@ -6,7 +6,7 @@ use dlep_net::ClientConfig;
 use tokio::task::JoinHandle;
 
 use crate::config::RouterConfig;
-use crate::runtime::{new_event_channel, DaemonError, EventRx, EventTx};
+use crate::runtime::{DaemonError, EventRx, EventTx, new_event_channel};
 
 /// Public router handle. Holds channel senders and background task handles.
 pub struct RouterDaemon {

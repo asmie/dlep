@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use dlep_daemon::{load_toml_config, RouterConfig, RouterDaemon};
+use dlep_daemon::{RouterConfig, RouterDaemon, load_toml_config};
 use tracing_subscriber::EnvFilter;
 
 /// DLEP (RFC 8175) router-side daemon.
@@ -57,9 +57,7 @@ fn init_tracing(requested: &str) {
     let filter = match EnvFilter::try_new(requested) {
         Ok(f) => f,
         Err(err) => {
-            eprintln!(
-                "warning: invalid log level {requested:?} ({err}); falling back to 'info'"
-            );
+            eprintln!("warning: invalid log level {requested:?} ({err}); falling back to 'info'");
             EnvFilter::new("info")
         }
     };
