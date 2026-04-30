@@ -44,7 +44,9 @@ impl DiscoverySocket {
     pub async fn send_to_group(&self, signal: &Signal) -> io::Result<()> {
         // TODO (M6): pick v4 vs v6 per config and send to the DLEP
         // link-local multicast group.
-        let _encoded = signal.encode();
+        let _encoded = signal
+            .encode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Ok(())
     }
 }

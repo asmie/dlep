@@ -16,7 +16,7 @@ pub mod signal;
 pub mod status;
 
 pub use data_item::{DataItem, RawDataItem};
-pub use error::CodecError;
+pub use error::{CodecError, ExpectedLen};
 pub use ids::{DataItemType, ExtensionId, MessageType, SignalType};
 pub use mac::MacAddress;
 pub use message::Message;

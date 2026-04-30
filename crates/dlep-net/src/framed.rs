@@ -36,7 +36,7 @@ impl Encoder<Message> for MessageCodec {
     type Error = CodecError;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let bytes = item.encode();
+        let bytes = item.encode()?;
         dst.reserve(bytes.len());
         dst.extend_from_slice(&bytes);
         Ok(())
@@ -51,7 +51,7 @@ impl SignalCodec {
         Signal::decode(buf.freeze())
     }
 
-    pub fn encode_datagram(&self, signal: &Signal) -> BytesMut {
+    pub fn encode_datagram(&self, signal: &Signal) -> Result<BytesMut, CodecError> {
         signal.encode()
     }
 }

@@ -12,3 +12,6 @@ rust-version.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 ipnet.workspace = true
+
+[dev-dependencies]
+proptest = "1"
