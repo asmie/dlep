@@ -209,6 +209,7 @@ dependencies = [
 name = "dlep-daemon"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dlep-core",
  "dlep-ext",
  "dlep-fsm",

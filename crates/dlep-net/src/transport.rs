@@ -5,6 +5,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
+/// Error message surfaced when a daemon is configured with `use_tls = true`
+/// before the TLS path is wired (M7). Centralised so the three call sites
+/// (transport, router, modem) cannot drift in wording.
+pub const TLS_NOT_IMPLEMENTED_MSG: &str = "TLS transport is not yet implemented";
+
 /// Erased stream type for a session transport. A single trait object carries
 /// either a plain TCP stream or a TLS-wrapped one; the rest of the runtime
 /// does not care which.
@@ -54,7 +59,7 @@ impl Connector {
             }
             TransportKind::Tls { .. } => {
                 // TODO (M7): wire tokio-rustls TlsConnector + ServerName.
-                Err(io::Error::other("TLS transport is not yet implemented"))
+                Err(io::Error::other(TLS_NOT_IMPLEMENTED_MSG))
             }
         }
     }
@@ -72,7 +77,7 @@ impl Acceptor {
             TransportKind::Plain => Ok(Box::new(stream)),
             TransportKind::Tls { .. } => {
                 // TODO (M7): wire tokio-rustls TlsAcceptor.
-                Err(io::Error::other("TLS transport is not yet implemented"))
+                Err(io::Error::other(TLS_NOT_IMPLEMENTED_MSG))
             }
         }
     }

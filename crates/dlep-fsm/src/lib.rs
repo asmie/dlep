@@ -11,10 +11,12 @@
 pub mod discovery_modem;
 pub mod discovery_router;
 pub mod events;
+pub mod session_common;
 pub mod session_modem;
 pub mod session_router;
 pub mod timers;
 pub mod transaction;
 
 pub use events::{FsmAction, FsmEvent, SendTarget};
+pub use session_common::SessionConfig;
 pub use timers::{TimerId, TimerKind};

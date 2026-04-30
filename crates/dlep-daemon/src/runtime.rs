@@ -5,10 +5,19 @@
 //! session (owning the FSM) serializes all state mutation; cross-task
 //! concurrency happens only via channels.
 
+use dlep_core::StatusCode;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::events::DaemonEvent;
+
+/// Per-session control message. The session task receives one of these on its
+/// mpsc command channel and translates into the appropriate `FsmEvent`.
+#[derive(Clone, Debug)]
+pub enum SessionCommand {
+    /// Start the local-initiated termination handshake.
+    Shutdown { reason: StatusCode },
+}
 
 /// Broadcast buffer size for public `DaemonEvent`s. When a subscriber lags
 /// past this many events, the oldest events are dropped for that subscriber
