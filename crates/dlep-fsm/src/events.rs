@@ -71,7 +71,16 @@ pub enum FsmAction {
         periodic: bool,
     },
     CancelTimer(TimerId),
-    ResetHeartbeat,
+    /// Re-arm the missed-heartbeat deadline timer. The runtime cancels the
+    /// timer at `timer_id` (if armed) and starts a fresh single-shot timer
+    /// at `missed_deadline`. The FSM owns the timer-id choice so the runtime
+    /// stays decoupled from FSM-internal timer naming. The send-side
+    /// periodic heartbeat timer is independent (started once at `InSession`
+    /// entry) and is *not* affected.
+    ResetHeartbeat {
+        timer_id: TimerId,
+        missed_deadline: Duration,
+    },
     CloseTcp,
     /// Hand an event to the public API (e.g. `DestinationEvent::Up`).
     Emit(EmittedEvent),

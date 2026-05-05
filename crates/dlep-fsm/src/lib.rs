@@ -19,4 +19,7 @@ pub mod transaction;
 
 pub use events::{FsmAction, FsmEvent, SendTarget};
 pub use session_common::SessionConfig;
+pub use session_router::{
+    TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
+};
 pub use timers::{TimerId, TimerKind};

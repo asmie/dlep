@@ -9,8 +9,8 @@ use bytes::{Bytes, BytesMut};
 use dlep_core::codec::{MESSAGE_HEADER_LEN, SIGNAL_HEADER_LEN};
 use dlep_core::data_item::{ConnectionPointFlags, PeerFlags};
 use dlep_core::{
-    DataItem, ExtensionId, MacAddress, Message, MessageType, RawDataItem, Signal, SignalType,
-    StatusCode,
+    DataItem, ExtensionId, MIN_HEARTBEAT_INTERVAL_MS, MacAddress, Message, MessageType,
+    RawDataItem, Signal, SignalType, StatusCode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 use proptest::prelude::*;
@@ -58,7 +58,8 @@ fn arb_peer_type() -> impl Strategy<Value = DataItem> {
 }
 
 fn arb_heartbeat() -> impl Strategy<Value = DataItem> {
-    any::<u32>().prop_map(|ms| DataItem::HeartbeatInterval(Duration::from_millis(ms.into())))
+    (MIN_HEARTBEAT_INTERVAL_MS..=u32::MAX)
+        .prop_map(|ms| DataItem::HeartbeatInterval(Duration::from_millis(ms.into())))
 }
 
 fn arb_extensions_supported() -> impl Strategy<Value = DataItem> {
@@ -67,7 +68,11 @@ fn arb_extensions_supported() -> impl Strategy<Value = DataItem> {
 }
 
 fn arb_mac() -> impl Strategy<Value = DataItem> {
-    any::<[u8; 6]>().prop_map(|o| DataItem::MacAddress(MacAddress(o)))
+    // RFC 8175 §13.7 allows EUI-48 (6 octets) or EUI-64 (8 octets).
+    prop_oneof![
+        any::<[u8; 6]>().prop_map(|o| DataItem::MacAddress(MacAddress::Eui48(o))),
+        any::<[u8; 8]>().prop_map(|o| DataItem::MacAddress(MacAddress::Eui64(o))),
+    ]
 }
 
 fn arb_ipv4_addr_item() -> impl Strategy<Value = DataItem> {

@@ -29,6 +29,9 @@ pub const SIGNAL_PREFIX: &[u8; 4] = b"DLEP";
 /// Default IANA-assigned TCP/UDP port for DLEP.
 pub const DEFAULT_PORT: u16 = 854;
 
+/// RFC 8175 §7.3.1 requires the heartbeat interval to be at least one second.
+pub const MIN_HEARTBEAT_INTERVAL_MS: u32 = 1_000;
+
 /// IANA-assigned IPv4 link-local multicast group for discovery.
 pub const DISCOVERY_IPV4_GROUP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(224, 0, 0, 117);
 

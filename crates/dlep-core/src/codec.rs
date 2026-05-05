@@ -15,7 +15,6 @@ use std::time::Duration;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ipnet::{Ipv4Net, Ipv6Net};
 
-use crate::SIGNAL_PREFIX;
 use crate::data_item::{ConnectionPointFlags, DataItem, PeerFlags, RawDataItem};
 use crate::error::{CodecError, ExpectedLen};
 use crate::ids::{DataItemType, ExtensionId, MessageType, SignalType};
@@ -23,6 +22,7 @@ use crate::mac::MacAddress;
 use crate::message::Message;
 use crate::signal::Signal;
 use crate::status::StatusCode;
+use crate::{MIN_HEARTBEAT_INTERVAL_MS, SIGNAL_PREFIX};
 
 /// Length of the fixed-size signal header: `"DLEP" (4) || type (2) || length (2)`.
 pub const SIGNAL_HEADER_LEN: usize = 8;
@@ -141,6 +141,12 @@ impl DataItem {
             }
             DataItem::HeartbeatInterval(d) => {
                 let ms = d.as_millis();
+                if ms < MIN_HEARTBEAT_INTERVAL_MS as u128 {
+                    return Err(CodecError::OutOfRange {
+                        field: field::HEARTBEAT_INTERVAL_MS,
+                        value: u64::try_from(ms).unwrap_or(u64::MAX),
+                    });
+                }
                 if ms > u32::MAX as u128 {
                     return Err(CodecError::OutOfRange {
                         field: field::HEARTBEAT_INTERVAL_MS,
@@ -155,7 +161,8 @@ impl DataItem {
                 }
             }
             DataItem::MacAddress(mac) => {
-                out.put_slice(&mac.0);
+                // RFC 8175 §13.7: 6 octets for EUI-48, 8 for EUI-64.
+                out.put_slice(mac.as_bytes());
             }
             DataItem::Ipv4Address { add, addr } => {
                 out.put_u8(u8::from(*add));
@@ -308,6 +315,12 @@ impl DataItem {
             DataItemType::HEARTBEAT_INTERVAL => {
                 expect_exact(kind, len, 4)?;
                 let ms = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+                if ms < MIN_HEARTBEAT_INTERVAL_MS {
+                    return Err(CodecError::OutOfRange {
+                        field: field::HEARTBEAT_INTERVAL_MS,
+                        value: ms.into(),
+                    });
+                }
                 Ok(DataItem::HeartbeatInterval(Duration::from_millis(
                     ms.into(),
                 )))
@@ -329,14 +342,30 @@ impl DataItem {
                 Ok(DataItem::ExtensionsSupported(ids))
             }
             DataItemType::MAC_ADDRESS => {
-                // RFC 8175 §13.7 fixes MAC Address at exactly 6 octets (EUI-48).
-                // RFC 8703 introduces a separate Link Identifier Data Item to
-                // carry destination IDs of arbitrary length; that lives in the
-                // dlep-ext-lid extension crate, not as a length variant here.
-                expect_exact(kind, len, 6)?;
-                let mut octets = [0u8; 6];
-                octets.copy_from_slice(&v[..6]);
-                Ok(DataItem::MacAddress(MacAddress(octets)))
+                // RFC 8175 §13.7: "Length: 6 for EUI-48 format or 8 for
+                // EUI-64 format." All destination MACs in a single session
+                // MUST share one format (consistency check belongs at the
+                // session layer, not the codec).
+                let mac = match len {
+                    6 => {
+                        let mut octets = [0u8; 6];
+                        octets.copy_from_slice(&v[..6]);
+                        MacAddress::Eui48(octets)
+                    }
+                    8 => {
+                        let mut octets = [0u8; 8];
+                        octets.copy_from_slice(&v[..8]);
+                        MacAddress::Eui64(octets)
+                    }
+                    _ => {
+                        return Err(CodecError::InvalidDataItemLength {
+                            kind,
+                            expected: ExpectedLen::OneOf(&[6, 8]),
+                            got: len,
+                        });
+                    }
+                };
+                Ok(DataItem::MacAddress(mac))
             }
             DataItemType::IPV4_ADDRESS => {
                 expect_exact(kind, len, 5)?;
@@ -870,6 +899,41 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_interval_below_rfc_minimum_rejected_on_encode() {
+        for ms in [0, MIN_HEARTBEAT_INTERVAL_MS - 1] {
+            let item = DataItem::HeartbeatInterval(Duration::from_millis(ms.into()));
+            let mut buf = BytesMut::new();
+            let err = item.encode(&mut buf).unwrap_err();
+            assert!(matches!(
+                err,
+                CodecError::OutOfRange {
+                    field: field::HEARTBEAT_INTERVAL_MS,
+                    ..
+                }
+            ));
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn heartbeat_interval_below_rfc_minimum_rejected_on_decode() {
+        for ms in [0, MIN_HEARTBEAT_INTERVAL_MS - 1] {
+            let raw = RawDataItem {
+                type_id: DataItemType::HEARTBEAT_INTERVAL,
+                value: Bytes::copy_from_slice(&ms.to_be_bytes()),
+            };
+            let err = DataItem::decode(raw).unwrap_err();
+            assert!(matches!(
+                err,
+                CodecError::OutOfRange {
+                    field: field::HEARTBEAT_INTERVAL_MS,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn heartbeat_interval_overflow_rejected_on_encode() {
         let item = DataItem::HeartbeatInterval(Duration::from_secs(u64::MAX / 1000));
         let mut buf = BytesMut::new();
@@ -933,8 +997,8 @@ mod tests {
     }
 
     #[test]
-    fn mac_address_encodes() {
-        let item = DataItem::MacAddress(MacAddress([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]));
+    fn mac_address_eui48_encodes() {
+        let item = DataItem::MacAddress(MacAddress::Eui48([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]));
         // type=7, length=6
         assert_eq!(
             encode_one(item),
@@ -943,16 +1007,66 @@ mod tests {
     }
 
     #[test]
-    fn mac_address_wrong_length_rejected() {
-        // RFC 8703 will allow longer link IDs; until then, EUI-48 only.
-        let raw = RawDataItem {
-            type_id: DataItemType::MAC_ADDRESS,
-            value: Bytes::from_static(&[0u8; 8]),
+    fn mac_address_eui64_encodes() {
+        let item = DataItem::MacAddress(MacAddress::Eui64([
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        ]));
+        // type=7, length=8
+        assert_eq!(
+            encode_one(item),
+            vec![
+                0x00, 0x07, 0x00, 0x08, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            ]
+        );
+    }
+
+    #[test]
+    fn mac_address_eui48_roundtrips() {
+        let bytes = encode_one(DataItem::MacAddress(MacAddress::Eui48([
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ])));
+        let DataItem::MacAddress(mac) = decode_one(&bytes) else {
+            panic!("expected MacAddress variant")
         };
-        assert!(matches!(
-            DataItem::decode(raw).unwrap_err(),
-            CodecError::InvalidDataItemLength { .. }
-        ));
+        assert!(mac.is_eui48());
+        assert_eq!(mac.as_bytes(), &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn mac_address_eui64_roundtrips() {
+        let bytes = encode_one(DataItem::MacAddress(MacAddress::Eui64([
+            0x02, 0x00, 0x00, 0xFF, 0xFE, 0x00, 0x00, 0x01,
+        ])));
+        let DataItem::MacAddress(mac) = decode_one(&bytes) else {
+            panic!("expected MacAddress variant")
+        };
+        assert!(mac.is_eui64());
+        assert_eq!(
+            mac.as_bytes(),
+            &[0x02, 0x00, 0x00, 0xFF, 0xFE, 0x00, 0x00, 0x01]
+        );
+    }
+
+    /// RFC 8175 §13.7 explicitly allows lengths 6 *and* 8 — every other
+    /// length must be rejected with `OneOf([6, 8])`. The samples below
+    /// straddle each accepted length (5/7 around 6, 7/9 around 8) plus
+    /// extremes (0, 1, 16) to guard against overly permissive bounds.
+    #[test]
+    fn mac_address_wrong_length_rejected() {
+        for bad_len in [0usize, 1, 5, 7, 9, 16] {
+            let raw = RawDataItem {
+                type_id: DataItemType::MAC_ADDRESS,
+                value: Bytes::from(vec![0u8; bad_len]),
+            };
+            match DataItem::decode(raw).unwrap_err() {
+                CodecError::InvalidDataItemLength {
+                    kind: DataItemType::MAC_ADDRESS,
+                    expected: ExpectedLen::OneOf(&[6, 8]),
+                    got,
+                } => assert_eq!(got, bad_len),
+                other => panic!("len={bad_len} got unexpected error {other:?}"),
+            }
+        }
     }
 
     #[test]

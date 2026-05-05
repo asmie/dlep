@@ -11,11 +11,29 @@ use std::time::Duration;
 
 use dlep_daemon::{
     DaemonEvent, ModemConfig, ModemDaemon, NetworkConfig, RouterConfig, RouterDaemon, SharedConfig,
+    TimersConfig,
 };
 use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Aggressive timer overrides for the heartbeat keepalive test. RFC 8175
+/// requires heartbeat intervals to be at least one second, so keep this at
+/// the protocol minimum.
+const FAST_HEARTBEAT_MS: u32 = 1_000;
+const FAST_SESSION_INIT_MS: u32 = 500;
+const FAST_TERMINATION_MS: u32 = 200;
+
+fn fast_timers() -> TimersConfig {
+    TimersConfig {
+        heartbeat_interval_ms: FAST_HEARTBEAT_MS,
+        discovery_interval_ms: 5_000,
+        session_init_timeout_ms: FAST_SESSION_INIT_MS,
+        termination_timeout_ms: FAST_TERMINATION_MS,
+    }
+}
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
@@ -145,6 +163,72 @@ async fn router_dropped_without_shutdown_terminates_session() {
     await_session_down(&mut modem_events).await;
 
     modem.shutdown().await.expect("modem shutdown");
+}
+
+/// M4: with a 1s heartbeat interval and a 2s missed-deadline (2×),
+/// run the session for ~2.5s (2+ heartbeat round-trips) and assert the
+/// session stays up — no `SessionDown` is emitted on either side. Pins the
+/// runtime's periodic-timer loop and the FSM's `RecvMessage(_)` keepalive
+/// catch-all working together end-to-end.
+#[tokio::test]
+async fn heartbeat_keepalive_over_loopback() {
+    let mut modem_cfg = loopback_modem_config();
+    modem_cfg.shared.timers = fast_timers();
+    let modem = ModemDaemon::builder()
+        .config(modem_cfg)
+        .spawn()
+        .await
+        .expect("modem spawn");
+    let modem_addr = modem.local_addr();
+    let mut modem_events = modem.subscribe();
+
+    let mut router_cfg = loopback_router_config();
+    router_cfg.shared.timers = fast_timers();
+    let router = RouterDaemon::builder()
+        .config(router_cfg)
+        .spawn()
+        .await
+        .expect("router spawn");
+    let mut router_events = router.subscribe();
+
+    router
+        .connect_static(modem_addr)
+        .await
+        .expect("router connect_static");
+
+    await_session_up(&mut router_events).await;
+    await_session_up(&mut modem_events).await;
+
+    // Run for several heartbeat cycles. With FAST_HEARTBEAT_MS=1000 and
+    // missed-deadline=2000ms, surviving 2500ms means ≥2 heartbeats round-tripped
+    // on each side and at least one missed-deadline reset has fired without
+    // tearing down.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    // Neither side should have emitted SessionDown.
+    assert_no_session_down(&mut router_events);
+    assert_no_session_down(&mut modem_events);
+
+    // Clean shutdown still works.
+    router.shutdown().await.expect("router shutdown");
+    await_session_down(&mut router_events).await;
+    await_session_down(&mut modem_events).await;
+
+    modem.shutdown().await.expect("modem shutdown");
+}
+
+fn assert_no_session_down(rx: &mut Receiver<DaemonEvent>) {
+    loop {
+        match rx.try_recv() {
+            Ok(DaemonEvent::SessionDown { reason }) => {
+                panic!("unexpected SessionDown({reason:?}) during keepalive window");
+            }
+            Ok(_) => continue, // ignore other events
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Closed) => panic!("event channel closed unexpectedly"),
+            Err(TryRecvError::Lagged(_)) => continue,
+        }
+    }
 }
 
 #[tokio::test]

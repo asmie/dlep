@@ -6,16 +6,23 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_session_termination, build_session_termination_response, extract_status,
+    SessionConfig, build_heartbeat, build_session_termination, build_session_termination_response,
+    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::timers::{TimerId, TimerKind};
 use crate::transaction::TransactionTracker;
 
-/// Stable timer IDs. M3 only ever has at most one of each kind in flight, so
-/// fixed IDs are sufficient; M4+ may need an allocator if heartbeat timers
-/// stack on top.
+/// Stable timer IDs. Each session has at most one of each kind in flight,
+/// so fixed IDs are sufficient.
 pub const TIMER_SESSION_INIT: TimerId = TimerId::new(1);
 pub const TIMER_TERMINATION: TimerId = TimerId::new(2);
+/// Periodic timer that drives outbound `Heartbeat` sends at the local
+/// announced interval (RFC 8175 §9, §11.2).
+pub const TIMER_HEARTBEAT: TimerId = TimerId::new(3);
+/// Single-shot deadline armed at `2 × peer_interval`. One fire ⇒ "two
+/// consecutive missed heartbeats" ⇒ Terminate with `TIMED_OUT` (RFC 8175
+/// §11.2).
+pub const TIMER_HEARTBEAT_MISSED: TimerId = TimerId::new(4);
 
 /// Router-side session states (RFC 8175 §7.1). The current runtime calls
 /// `Connector::connect` synchronously and feeds `TcpConnected` once that
@@ -36,6 +43,12 @@ pub struct RouterSessionFsm {
     pub tx: TransactionTracker,
     pub destinations: HashMap<MacAddress, DestinationState>,
     config: SessionConfig,
+    /// Peer's announced heartbeat interval, captured from the Heartbeat
+    /// Interval Data Item in `Session Initialization Response`. `None` means
+    /// the field was absent (RFC-non-conformant peer; we are lenient at the
+    /// FSM layer). The codec rejects zero and sub-1s intervals before they
+    /// reach this state.
+    pub peer_heartbeat_interval: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +73,7 @@ impl RouterSessionFsm {
             tx: TransactionTracker::default(),
             destinations: HashMap::new(),
             config,
+            peer_heartbeat_interval: None,
         }
     }
 
@@ -104,12 +118,22 @@ impl RouterSessionFsm {
                         FsmAction::Emit(EmittedEvent::SessionDown(status)),
                     ]
                 } else {
+                    self.peer_heartbeat_interval = extract_heartbeat_interval(&msg);
                     self.state = RouterSessionState::InSession;
-                    vec![
-                        FsmAction::CancelTimer(TIMER_SESSION_INIT),
-                        FsmAction::ResetHeartbeat,
-                        FsmAction::Emit(EmittedEvent::SessionUp),
-                    ]
+                    let mut actions = vec![FsmAction::CancelTimer(TIMER_SESSION_INIT)];
+                    actions.push(FsmAction::StartTimer {
+                        id: TIMER_HEARTBEAT,
+                        kind: TimerKind::Heartbeat,
+                        duration: local_heartbeat_interval(&self.config),
+                        periodic: true,
+                    });
+                    if let Some(action) =
+                        heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    {
+                        actions.push(action);
+                    }
+                    actions.push(FsmAction::Emit(EmittedEvent::SessionUp));
+                    actions
                 }
             }
             (
@@ -136,27 +160,73 @@ impl RouterSessionFsm {
                     FsmAction::Emit(EmittedEvent::SessionDown(reason)),
                 ]
             }
-
-            // InSession: heartbeats, peer-initiated termination, app shutdown.
-            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
-                if msg.message_type == MessageType::HEARTBEAT =>
-            {
-                vec![FsmAction::ResetHeartbeat]
+            // RFC 8175 §7.2 mandates strict rejection only on the modem
+            // side. Router-side defensive symmetry: any message that isn't
+            // a Session Initialization Response is by definition out of
+            // sequence here, so drop the connection now rather than wait
+            // for the SessionInit timer.
+            (RouterSessionState::SessionInitPending, FsmEvent::RecvMessage(_)) => {
+                self.state = RouterSessionState::Terminated;
+                vec![
+                    FsmAction::CancelTimer(TIMER_SESSION_INIT),
+                    FsmAction::CloseTcp,
+                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA)),
+                ]
             }
+
+            // InSession: peer-initiated termination is special (teardown).
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::SESSION_TERMINATION =>
             {
                 let status = extract_status(&msg).unwrap_or(StatusCode::SHUTTING_DOWN);
                 self.state = RouterSessionState::Terminated;
                 vec![
+                    FsmAction::CancelTimer(TIMER_HEARTBEAT),
+                    FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED),
                     FsmAction::SendMessage(build_session_termination_response()),
                     FsmAction::CloseTcp,
                     FsmAction::Emit(EmittedEvent::SessionDown(status)),
                 ]
             }
+            // Catch-all for any other successfully decoded message in
+            // InSession (Heartbeat, future Destination_*, etc.) — RFC 8175
+            // §11.2 says any received message resets the missed-heartbeat
+            // deadline. Stay in InSession.
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(_)) => {
+                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    .into_iter()
+                    .collect()
+            }
+            // New: periodic heartbeat-send timer fires.
+            (RouterSessionState::InSession, FsmEvent::TimerExpired(_, TimerKind::Heartbeat)) => {
+                vec![FsmAction::SendMessage(build_heartbeat())]
+            }
+            // New: missed-deadline fires ⇒ "two consecutive missed
+            // heartbeats" per RFC §11.2 ⇒ Terminate with TIMED_OUT (132).
+            // Mirror the InSession+AppShutdown shape: cancel the periodic
+            // send timer, send Termination, arm the Termination response
+            // deadline, transition to Terminating.
+            (
+                RouterSessionState::InSession,
+                FsmEvent::TimerExpired(_, TimerKind::HeartbeatMissed),
+            ) => {
+                self.state = RouterSessionState::Terminating;
+                vec![
+                    FsmAction::CancelTimer(TIMER_HEARTBEAT),
+                    FsmAction::SendMessage(build_session_termination(StatusCode::TIMED_OUT)),
+                    FsmAction::StartTimer {
+                        id: TIMER_TERMINATION,
+                        kind: TimerKind::Termination,
+                        duration: self.config.termination_timeout,
+                        periodic: false,
+                    },
+                ]
+            }
             (RouterSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
                 self.state = RouterSessionState::Terminating;
                 vec![
+                    FsmAction::CancelTimer(TIMER_HEARTBEAT),
+                    FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED),
                     FsmAction::SendMessage(build_session_termination(reason)),
                     FsmAction::StartTimer {
                         id: TIMER_TERMINATION,
@@ -168,9 +238,11 @@ impl RouterSessionFsm {
             }
             (RouterSessionState::InSession, FsmEvent::TcpClosed) => {
                 self.state = RouterSessionState::Terminated;
-                vec![FsmAction::Emit(EmittedEvent::SessionDown(
-                    StatusCode::TIMED_OUT,
-                ))]
+                vec![
+                    FsmAction::CancelTimer(TIMER_HEARTBEAT),
+                    FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED),
+                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::TIMED_OUT)),
+                ]
             }
 
             // Terminating: await Session Termination Response or timer.
@@ -215,8 +287,8 @@ impl RouterSessionFsm {
 
 fn build_session_initialization(config: &SessionConfig) -> Message {
     Message::new(MessageType::SESSION_INITIALIZATION)
-        .with_item(DataItem::HeartbeatInterval(Duration::from_millis(
-            config.heartbeat_interval_ms.into(),
+        .with_item(DataItem::HeartbeatInterval(local_heartbeat_interval(
+            config,
         )))
         .with_item(DataItem::PeerType {
             flags: PeerFlags::default(),

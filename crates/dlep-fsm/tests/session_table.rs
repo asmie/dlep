@@ -7,25 +7,46 @@
 //! `PartialEq` (its `Message` payload carries heap-backed fields), so matches
 //! use `matches!` and explicit destructuring.
 
+use std::time::Duration;
+
 use dlep_core::{DataItem, MessageType, StatusCode};
 use dlep_fsm::events::{EmittedEvent, FsmAction, FsmEvent};
 use dlep_fsm::session_modem::{ModemSessionFsm, ModemSessionState};
 use dlep_fsm::session_router::{
-    RouterSessionFsm, RouterSessionState, TIMER_SESSION_INIT, TIMER_TERMINATION,
+    RouterSessionFsm, RouterSessionState, TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED,
+    TIMER_SESSION_INIT, TIMER_TERMINATION,
 };
 use dlep_fsm::timers::TimerKind;
 
 // --- Small helpers ---------------------------------------------------------
 
+/// Default peer heartbeat interval used when a test puts the FSM into a
+/// post-InSession state via the state setter (bypassing the natural
+/// `SessionInitPending → InSession` transition that would have populated
+/// `peer_heartbeat_interval` from the inbound Session Init Response).
+const DEFAULT_PEER_HEARTBEAT: Duration = Duration::from_millis(60_000);
+
 fn router_at(state: RouterSessionState) -> RouterSessionFsm {
     let mut fsm = RouterSessionFsm::new();
     fsm.state = state;
+    if matches!(
+        state,
+        RouterSessionState::InSession | RouterSessionState::Terminating
+    ) {
+        fsm.peer_heartbeat_interval = Some(DEFAULT_PEER_HEARTBEAT);
+    }
     fsm
 }
 
 fn modem_at(state: ModemSessionState) -> ModemSessionFsm {
     let mut fsm = ModemSessionFsm::new();
     fsm.state = state;
+    if matches!(
+        state,
+        ModemSessionState::InSession | ModemSessionState::Terminating
+    ) {
+        fsm.peer_heartbeat_interval = Some(DEFAULT_PEER_HEARTBEAT);
+    }
     fsm
 }
 
@@ -131,15 +152,34 @@ fn router_session_init_pending_to_in_session_on_success_response() {
         StatusCode::SUCCESS,
     )));
     assert_eq!(fsm.state(), RouterSessionState::InSession);
-    assert!(matches!(
-        actions[0],
-        FsmAction::CancelTimer(TIMER_SESSION_INIT)
-    ));
-    assert!(matches!(actions[1], FsmAction::ResetHeartbeat));
-    assert!(matches!(
-        actions[2],
-        FsmAction::Emit(EmittedEvent::SessionUp)
-    ));
+    // Predicate-based so M5 additions to InSession entry don't break the test.
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_SESSION_INIT)))
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::StartTimer {
+            kind: TimerKind::Heartbeat,
+            periodic: true,
+            ..
+        }
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::SessionUp)))
+    );
+    assert_eq!(
+        fsm.peer_heartbeat_interval,
+        Some(Duration::from_millis(60_000))
+    );
 }
 
 #[test]
@@ -221,12 +261,43 @@ fn router_session_init_pending_to_terminated_on_app_shutdown() {
     }
 }
 
+/// Symmetric to the modem-side rule (RFC 8175 §7.2): a router awaiting
+/// Session Initialization Response that receives any other message type
+/// drops the connection rather than waiting for its session-init timer.
+#[test]
+fn router_session_init_pending_to_terminated_on_unexpected_message() {
+    let mut fsm = router_at(RouterSessionState::SessionInitPending);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
+    assert_eq!(fsm.state(), RouterSessionState::Terminated);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_SESSION_INIT)))
+    );
+    assert!(actions.iter().any(|a| matches!(a, FsmAction::CloseTcp)));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
+    )));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::SendMessage(_))),
+        "router MUST NOT send any Message before completing init"
+    );
+}
+
 #[test]
 fn router_in_session_heartbeat_resets_heartbeat() {
     let mut fsm = router_at(RouterSessionState::InSession);
     let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
     assert_eq!(fsm.state(), RouterSessionState::InSession);
-    assert!(matches!(actions[0], FsmAction::ResetHeartbeat));
+    // Per RFC 8175 §11.2 the missed-deadline is rearmed at 2 × peer interval.
+    let expected = DEFAULT_PEER_HEARTBEAT * 2;
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::ResetHeartbeat { missed_deadline, timer_id: _ } if *missed_deadline == expected
+    )));
 }
 
 #[test]
@@ -252,19 +323,29 @@ fn router_in_session_to_terminating_on_app_shutdown() {
         reason: StatusCode::SHUTTING_DOWN,
     });
     assert_eq!(fsm.state(), RouterSessionState::Terminating);
-    match &actions[0] {
-        FsmAction::SendMessage(msg) => {
-            assert_eq!(msg.message_type, MessageType::SESSION_TERMINATION);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::SendMessage(msg) if msg.message_type == MessageType::SESSION_TERMINATION
+    )));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::StartTimer {
+            kind: TimerKind::Termination,
+            id: TIMER_TERMINATION,
+            ..
         }
-        other => panic!("expected SendMessage(SessionTermination), got {other:?}"),
-    }
-    match &actions[1] {
-        FsmAction::StartTimer { kind, id, .. } => {
-            assert_eq!(*kind, TimerKind::Termination);
-            assert_eq!(*id, TIMER_TERMINATION);
-        }
-        other => panic!("expected StartTimer(Termination), got {other:?}"),
-    }
+    )));
+    // M4: heartbeat timers must be cancelled before the Termination handshake.
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT)))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED)))
+    );
 }
 
 #[test]
@@ -272,10 +353,22 @@ fn router_in_session_to_terminated_on_tcp_closed() {
     let mut fsm = router_at(RouterSessionState::InSession);
     let actions = fsm.step(FsmEvent::TcpClosed);
     assert_eq!(fsm.state(), RouterSessionState::Terminated);
-    assert!(matches!(
-        actions[0],
-        FsmAction::Emit(EmittedEvent::SessionDown(_))
-    ));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::SessionDown(_))))
+    );
+    // M4: heartbeat timers cancelled on transport drop.
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT)))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED)))
+    );
 }
 
 #[test]
@@ -352,29 +445,47 @@ fn modem_awaiting_session_init_to_in_session_on_session_init_message() {
     let mut fsm = modem_at(ModemSessionState::AwaitingSessionInit);
     let actions = fsm.step(FsmEvent::RecvMessage(make_session_init()));
     assert_eq!(fsm.state(), ModemSessionState::InSession);
-    // Expect: CancelTimer(SessionInit), SendMessage(InitResponse), ResetHeartbeat, Emit(SessionUp).
-    assert!(matches!(
-        actions[0],
-        FsmAction::CancelTimer(TIMER_SESSION_INIT)
-    ));
-    match &actions[1] {
-        FsmAction::SendMessage(msg) => {
-            assert_eq!(
-                msg.message_type,
-                MessageType::SESSION_INITIALIZATION_RESPONSE
-            );
-            // RFC 8175 §11.2: response carries Status, Heartbeat, PeerType,
-            // ExtensionsSupported, MTU, MaxDR Rx/Tx, CurDR Rx/Tx, Latency,
-            // Resources, RLQ Rx/Tx — at least 13 items.
-            assert!(msg.data_items.len() >= 13);
+    // Predicate-based so M5 additions don't break the test.
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_SESSION_INIT)))
+    );
+    let init_response = actions.iter().find_map(|a| match a {
+        FsmAction::SendMessage(msg)
+            if msg.message_type == MessageType::SESSION_INITIALIZATION_RESPONSE =>
+        {
+            Some(msg)
         }
-        other => panic!("expected SendMessage(InitResponse), got {other:?}"),
-    }
-    assert!(matches!(actions[2], FsmAction::ResetHeartbeat));
-    assert!(matches!(
-        actions[3],
-        FsmAction::Emit(EmittedEvent::SessionUp)
-    ));
+        _ => None,
+    });
+    let init_response = init_response.expect("expected SendMessage(InitResponse)");
+    // RFC 8175 §11.2: response carries Status, Heartbeat, PeerType,
+    // ExtensionsSupported, MTU, MaxDR Rx/Tx, CurDR Rx/Tx, Latency,
+    // Resources, RLQ Rx/Tx — at least 13 items.
+    assert!(init_response.data_items.len() >= 13);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::StartTimer {
+            kind: TimerKind::Heartbeat,
+            periodic: true,
+            ..
+        }
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::SessionUp)))
+    );
+    assert_eq!(
+        fsm.peer_heartbeat_interval,
+        Some(Duration::from_millis(60_000))
+    );
 }
 
 #[test]
@@ -419,6 +530,34 @@ fn modem_awaiting_session_init_to_terminated_on_app_shutdown() {
     }
 }
 
+/// RFC 8175 §7.2: a modem in AwaitingSessionInit that receives anything
+/// other than Session Initialization MUST close the TCP connection without
+/// sending a reply.
+#[test]
+fn modem_awaiting_session_init_to_terminated_on_unexpected_message() {
+    let mut fsm = modem_at(ModemSessionState::AwaitingSessionInit);
+    // A Heartbeat is one example of an unexpected message in this state.
+    let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
+    assert_eq!(fsm.state(), ModemSessionState::Terminated);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_SESSION_INIT)))
+    );
+    assert!(actions.iter().any(|a| matches!(a, FsmAction::CloseTcp)));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
+    )));
+    // Critical: per RFC, the modem MUST NOT send any Message in this case.
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::SendMessage(_))),
+        "modem MUST NOT send any Message on non-Init in AwaitingSessionInit"
+    );
+}
+
 #[test]
 fn modem_in_session_to_terminating_on_app_shutdown() {
     let mut fsm = modem_at(ModemSessionState::InSession);
@@ -426,12 +565,21 @@ fn modem_in_session_to_terminating_on_app_shutdown() {
         reason: StatusCode::SHUTTING_DOWN,
     });
     assert_eq!(fsm.state(), ModemSessionState::Terminating);
-    match &actions[0] {
-        FsmAction::SendMessage(msg) => {
-            assert_eq!(msg.message_type, MessageType::SESSION_TERMINATION);
-        }
-        other => panic!("expected SendMessage(SessionTermination), got {other:?}"),
-    }
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::SendMessage(msg) if msg.message_type == MessageType::SESSION_TERMINATION
+    )));
+    // M4: heartbeat timers cancelled.
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT)))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED)))
+    );
 }
 
 #[test]
@@ -477,4 +625,209 @@ fn modem_terminating_to_terminated_on_tcp_closed_treats_as_success() {
         }
         other => panic!("expected SessionDown(SUCCESS), got {other:?}"),
     }
+}
+
+// --- M4 transitions (heartbeat send + missed-deadline) ---------------------
+
+#[test]
+fn router_in_session_periodic_heartbeat_send() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let actions = fsm.step(FsmEvent::TimerExpired(
+        TIMER_HEARTBEAT,
+        TimerKind::Heartbeat,
+    ));
+    assert_eq!(fsm.state(), RouterSessionState::InSession);
+    let send = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(msg) => Some(msg),
+            _ => None,
+        })
+        .expect("expected SendMessage(Heartbeat)");
+    assert_eq!(send.message_type, MessageType::HEARTBEAT);
+    assert!(send.data_items.is_empty());
+}
+
+#[test]
+fn modem_in_session_periodic_heartbeat_send() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::TimerExpired(
+        TIMER_HEARTBEAT,
+        TimerKind::Heartbeat,
+    ));
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    let send = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(msg) => Some(msg),
+            _ => None,
+        })
+        .expect("expected SendMessage(Heartbeat)");
+    assert_eq!(send.message_type, MessageType::HEARTBEAT);
+}
+
+#[test]
+fn router_in_session_to_terminating_on_missed_deadline() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let actions = fsm.step(FsmEvent::TimerExpired(
+        TIMER_HEARTBEAT_MISSED,
+        TimerKind::HeartbeatMissed,
+    ));
+    assert_eq!(fsm.state(), RouterSessionState::Terminating);
+    // Cancels the periodic send, sends Termination(TIMED_OUT), starts the
+    // termination timer.
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT)))
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::SendMessage(msg) if msg.message_type == MessageType::SESSION_TERMINATION
+    )));
+    let term = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(msg) if msg.message_type == MessageType::SESSION_TERMINATION => {
+                Some(msg)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let status = term
+        .data_items
+        .iter()
+        .find_map(|d| match d {
+            DataItem::Status { code, .. } => Some(*code),
+            _ => None,
+        })
+        .expect("Status mandatory in Session Termination");
+    assert_eq!(status, StatusCode::TIMED_OUT);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::StartTimer {
+            kind: TimerKind::Termination,
+            id: TIMER_TERMINATION,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn modem_in_session_to_terminating_on_missed_deadline() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::TimerExpired(
+        TIMER_HEARTBEAT_MISSED,
+        TimerKind::HeartbeatMissed,
+    ));
+    assert_eq!(fsm.state(), ModemSessionState::Terminating);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_HEARTBEAT)))
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::SendMessage(msg) if msg.message_type == MessageType::SESSION_TERMINATION
+    )));
+}
+
+#[test]
+fn router_in_session_missing_peer_interval_skips_reset() {
+    // Build the FSM directly into InSession with peer_heartbeat_interval = None
+    // (= the field was missing). RecvMessage(Heartbeat) must not emit
+    // ResetHeartbeat because there is no peer interval to double.
+    let mut fsm = RouterSessionFsm::new();
+    fsm.state = RouterSessionState::InSession;
+    fsm.peer_heartbeat_interval = None;
+    let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. })),
+        "expected no ResetHeartbeat when peer_heartbeat_interval is None"
+    );
+}
+
+#[test]
+fn modem_in_session_missing_peer_interval_skips_reset() {
+    let mut fsm = ModemSessionFsm::new();
+    fsm.state = ModemSessionState::InSession;
+    fsm.peer_heartbeat_interval = None;
+    let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+}
+
+#[test]
+fn router_session_init_pending_to_in_session_clamps_local_interval_to_rfc_minimum() {
+    use dlep_fsm::SessionConfig;
+    let mut fsm = RouterSessionFsm::with_config(SessionConfig {
+        heartbeat_interval_ms: 0,
+        ..SessionConfig::default()
+    });
+    fsm.state = RouterSessionState::SessionInitPending;
+    let actions = fsm.step(FsmEvent::RecvMessage(make_init_response(
+        StatusCode::SUCCESS,
+    )));
+    assert_eq!(fsm.state(), RouterSessionState::InSession);
+    // RFC 8175 requires a minimum 1s interval and forbids zero, so local
+    // misconfiguration is clamped before advertising/arming.
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::StartTimer {
+            kind: TimerKind::Heartbeat,
+            duration,
+            ..
+        } if *duration == Duration::from_millis(1_000)
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+}
+
+#[test]
+fn modem_awaiting_session_init_to_in_session_clamps_local_interval_to_rfc_minimum() {
+    use dlep_fsm::SessionConfig;
+    let mut fsm = ModemSessionFsm::with_config(SessionConfig {
+        heartbeat_interval_ms: 0,
+        peer_description: "dlep-modem".into(),
+        ..SessionConfig::default()
+    });
+    fsm.state = ModemSessionState::AwaitingSessionInit;
+    let actions = fsm.step(FsmEvent::RecvMessage(make_session_init()));
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::StartTimer {
+            kind: TimerKind::Heartbeat,
+            duration,
+            ..
+        } if *duration == Duration::from_millis(1_000)
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+}
+
+/// Stray Heartbeat tick that lands during `Terminated` (after `CancelTimer`
+/// abort but before the in-flight expiry event was drained from the channel)
+/// must be silently absorbed by the catch-all rather than panicking on an
+/// unmatched arm.
+#[test]
+fn router_terminated_ignores_stray_heartbeat_timer_expiry() {
+    let mut fsm = router_at(RouterSessionState::Terminated);
+    let actions = fsm.step(FsmEvent::TimerExpired(
+        TIMER_HEARTBEAT,
+        TimerKind::Heartbeat,
+    ));
+    assert!(actions.is_empty());
+    assert_eq!(fsm.state(), RouterSessionState::Terminated);
 }
