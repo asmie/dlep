@@ -299,11 +299,11 @@ The current state of the tree is the **scaffolding** — types, traits, module l
 
 The intended order of further work is:
 
-1. Codec — fill in per-variant encode/decode and proptest the roundtrip.
-2. FSMs — happy-path transitions for both session sides.
-3. Plain-TCP session over a static peer (loopback integration test).
-4. Heartbeat timers + missed-deadline termination.
-5. Destinations and metrics end-to-end.
+1. Codec — fill in per-variant encode/decode and proptest the roundtrip. **Done.**
+2. FSMs — happy-path transitions for both session sides. **Done.**
+3. Plain-TCP session over a static peer (loopback integration test). **Done.**
+4. Heartbeat timers + missed-deadline termination. **Done.**
+5. Destinations and metrics end-to-end. **Done (M5)** — modem→router `Destination_Up`/`Update`/`Down` round-trip, including FSM transitions, daemon command/event plumbing, and the `destination_round_trip_over_loopback` integration test. Out-of-scope follow-ups: `Destination_Announce` (router-initiated query) and `Link_Characteristics_Request`/`Response`.
 6. UDP multicast discovery, including GTSM cmsg handling.
 7. TLS via tokio-rustls, then flip the `use_tls` default.
 8. Wire the extension plug-in API and round-trip a private-use ID through a test-only extension.
