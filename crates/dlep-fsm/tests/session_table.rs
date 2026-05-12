@@ -1050,3 +1050,92 @@ fn router_in_session_destination_update_emits() {
             .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
     );
 }
+
+fn make_destination_down_response(status: StatusCode) -> dlep_core::Message {
+    dlep_core::Message::new(MessageType::DESTINATION_DOWN_RESPONSE)
+        .with_item(DataItem::MacAddress(dest_mac()))
+        .with_item(DataItem::Status {
+            code: status,
+            text: String::new(),
+        })
+}
+
+fn make_destination_down(reason: StatusCode) -> dlep_core::Message {
+    dlep_core::Message::new(MessageType::DESTINATION_DOWN)
+        .with_item(DataItem::MacAddress(dest_mac()))
+        .with_item(DataItem::Status {
+            code: reason,
+            text: String::new(),
+        })
+}
+
+#[test]
+fn modem_in_session_app_drop_destination_sends_down() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    fsm.destinations.insert(
+        dest_mac(),
+        dlep_fsm::session_modem::DestinationState { announced: true },
+    );
+    let actions = fsm.step(FsmEvent::AppDropDestination {
+        mac: dest_mac(),
+        reason: StatusCode::SHUTTING_DOWN,
+    });
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    let send = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(m) => Some(m),
+            _ => None,
+        })
+        .expect("expected SendMessage(Destination_Down)");
+    assert_eq!(send.message_type, MessageType::DESTINATION_DOWN);
+    assert!(fsm.tx.destination_busy(&dest_mac()));
+    // Local entry stays until the response arrives.
+    assert!(fsm.destinations.contains_key(&dest_mac()));
+}
+
+#[test]
+fn modem_in_session_destination_down_response_removes_local() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    fsm.destinations.insert(
+        dest_mac(),
+        dlep_fsm::session_modem::DestinationState { announced: true },
+    );
+    let _ = fsm.step(FsmEvent::AppDropDestination {
+        mac: dest_mac(),
+        reason: StatusCode::SHUTTING_DOWN,
+    });
+
+    let _ = fsm.step(FsmEvent::RecvMessage(make_destination_down_response(
+        StatusCode::SUCCESS,
+    )));
+    assert!(!fsm.tx.destination_busy(&dest_mac()));
+    assert!(!fsm.destinations.contains_key(&dest_mac()));
+}
+
+#[test]
+fn router_in_session_destination_down_responds_and_emits() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    fsm.destinations.insert(
+        dest_mac(),
+        dlep_fsm::session_router::DestinationState { up: true },
+    );
+    let actions = fsm.step(FsmEvent::RecvMessage(make_destination_down(
+        StatusCode::SHUTTING_DOWN,
+    )));
+    assert_eq!(fsm.state(), RouterSessionState::InSession);
+    let resp = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(m) => Some(m),
+            _ => None,
+        })
+        .expect("expected SendMessage(Destination_Down_Response)");
+    assert_eq!(resp.message_type, MessageType::DESTINATION_DOWN_RESPONSE);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::Emit(EmittedEvent::DestinationDown { mac, reason })
+            if *mac == dest_mac() && *reason == StatusCode::SHUTTING_DOWN
+    )));
+    assert!(!fsm.destinations.contains_key(&dest_mac()));
+}

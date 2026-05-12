@@ -6,10 +6,10 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_destination_up_response, build_heartbeat, build_session_termination,
-    build_session_termination_response, extract_destination_addrs, extract_destination_mac,
-    extract_heartbeat_interval, extract_link_metrics, extract_status, heartbeat_reset_action,
-    local_heartbeat_interval,
+    SessionConfig, build_destination_down_response, build_destination_up_response, build_heartbeat,
+    build_session_termination, build_session_termination_response, extract_destination_addrs,
+    extract_destination_mac, extract_heartbeat_interval, extract_link_metrics, extract_status,
+    heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::timers::{TimerId, TimerKind};
 use crate::transaction::TransactionTracker;
@@ -249,6 +249,40 @@ impl RouterSessionFsm {
                     mac,
                     metrics,
                 })];
+                if let Some(reset) =
+                    heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                {
+                    actions.push(reset);
+                }
+                actions
+            }
+            // Destination_Down: RFC 8175 §11.5 — modem-initiated teardown of
+            // a known destination. Remove the local entry, ACK with
+            // Destination_Down_Response { SUCCESS }, emit DestinationDown
+            // (carrying the *inbound* reason, not SUCCESS), and reset the
+            // missed-heartbeat deadline (RFC §11.2). Missing MAC: lenient like
+            // Update — drop quietly with only the heartbeat reset rather than
+            // tearing down the session.
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_DOWN =>
+            {
+                let Some(mac) = extract_destination_mac(&msg) else {
+                    return heartbeat_reset_action(
+                        TIMER_HEARTBEAT_MISSED,
+                        self.peer_heartbeat_interval,
+                    )
+                    .into_iter()
+                    .collect();
+                };
+                let reason = extract_status(&msg).unwrap_or(StatusCode::SUCCESS);
+                self.destinations.remove(&mac);
+                let mut actions = vec![
+                    FsmAction::SendMessage(build_destination_down_response(
+                        mac,
+                        StatusCode::SUCCESS,
+                    )),
+                    FsmAction::Emit(EmittedEvent::DestinationDown { mac, reason }),
+                ];
                 if let Some(reset) =
                     heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
                 {

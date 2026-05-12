@@ -6,9 +6,10 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_destination_up, build_destination_update, build_heartbeat,
-    build_session_termination, build_session_termination_response, extract_destination_mac,
-    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    SessionConfig, build_destination_down, build_destination_up, build_destination_update,
+    build_heartbeat, build_session_termination, build_session_termination_response,
+    extract_destination_mac, extract_heartbeat_interval, extract_status, heartbeat_reset_action,
+    local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -244,6 +245,41 @@ impl ModemSessionFsm {
                 vec![FsmAction::SendMessage(build_destination_update(
                     mac, &metrics,
                 ))]
+            }
+            // InSession: app asks us to tear down a previously announced
+            // destination. RFC 8175 §11.5 — open a per-destination transaction
+            // and send `Destination_Down(mac, reason)`. The local entry stays
+            // until the response arrives (symmetric to the Up flow where
+            // `announced` flips only on response).
+            (ModemSessionState::InSession, FsmEvent::AppDropDestination { mac, reason }) => {
+                use crate::transaction::RequestKind;
+                if !self.destinations.contains_key(&mac) {
+                    tracing::debug!(?mac, "drop_destination for unknown destination; ignoring");
+                    return Vec::new();
+                }
+                if self
+                    .tx
+                    .open_destination(mac, RequestKind::DestinationDown)
+                    .is_err()
+                {
+                    tracing::debug!(?mac, "drop_destination while another tx pending; ignoring");
+                    return Vec::new();
+                }
+                vec![FsmAction::SendMessage(build_destination_down(mac, reason))]
+            }
+            // InSession: router replied to our Destination_Down. Close the
+            // per-destination transaction, remove the local entry, and reset
+            // the missed-heartbeat deadline (RFC §11.2).
+            (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_DOWN_RESPONSE =>
+            {
+                if let Some(mac) = extract_destination_mac(&msg) {
+                    self.tx.close_destination(&mac);
+                    self.destinations.remove(&mac);
+                }
+                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    .into_iter()
+                    .collect()
             }
             // Catch-all for any other successfully decoded message —
             // RFC 8175 §11.2 says any received message resets the
