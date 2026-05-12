@@ -1,6 +1,8 @@
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use dlep_core::{MacAddress, Message, Signal, StatusCode};
+use ipnet::{Ipv4Net, Ipv6Net};
 
 use crate::timers::{TimerId, TimerKind};
 
@@ -13,6 +15,36 @@ pub enum SendTarget {
     DiscoveryGroup,
     /// Unicast reply to a discovered peer.
     Unicast(std::net::SocketAddr),
+}
+
+/// Metric values reported per destination. Mirrors the RFC 8175 §11.3
+/// metric Data Items (data rates, latency, RLQ, resources, MTU). Lives in
+/// `dlep-fsm` so both the FSM-internal events and the daemon's public API
+/// share one type — `dlep_daemon::LinkMetrics` re-exports this.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinkMetrics {
+    pub max_data_rate_rx_bps: u64,
+    pub max_data_rate_tx_bps: u64,
+    pub current_data_rate_rx_bps: u64,
+    pub current_data_rate_tx_bps: u64,
+    pub latency: Duration,
+    pub resources: u8,
+    pub rlq_rx: u8,
+    pub rlq_tx: u8,
+    pub mtu: u16,
+}
+
+/// Address / subnet payload accompanying a destination. All four vectors
+/// may be empty — the modem reports only what it knows. The `add` flag is
+/// implicit (true for the Up / Update direction); the FSM never emits
+/// remove-style entries until a follow-up plan adds the `Address Remove`
+/// path.
+#[derive(Clone, Debug, Default)]
+pub struct DestinationAddrs {
+    pub v4: Vec<Ipv4Addr>,
+    pub v6: Vec<Ipv6Addr>,
+    pub v4_subnets: Vec<Ipv4Net>,
+    pub v6_subnets: Vec<Ipv6Net>,
 }
 
 /// Inbound events consumed by any FSM.
@@ -36,6 +68,8 @@ pub enum FsmEvent {
     // Application-level commands (modem side dominates)
     AppAddDestination {
         mac: MacAddress,
+        metrics: LinkMetrics,
+        addrs: DestinationAddrs,
     },
     AppDropDestination {
         mac: MacAddress,
@@ -43,6 +77,7 @@ pub enum FsmEvent {
     },
     AppUpdateMetrics {
         mac: MacAddress,
+        metrics: LinkMetrics,
     },
     AppAnnounceDestination {
         mac: MacAddress,
@@ -92,7 +127,17 @@ pub enum FsmAction {
 pub enum EmittedEvent {
     SessionUp,
     SessionDown(StatusCode),
-    DestinationUp(MacAddress),
-    DestinationDown(MacAddress, StatusCode),
-    DestinationUpdate(MacAddress),
+    DestinationUp {
+        mac: MacAddress,
+        metrics: LinkMetrics,
+        addrs: DestinationAddrs,
+    },
+    DestinationDown {
+        mac: MacAddress,
+        reason: StatusCode,
+    },
+    DestinationUpdate {
+        mac: MacAddress,
+        metrics: LinkMetrics,
+    },
 }

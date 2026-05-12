@@ -395,10 +395,11 @@ fn translate_emitted(emitted: EmittedEvent, peer: &PeerInfo) -> Option<DaemonEve
             negotiated_extensions: Vec::new(),
         }),
         EmittedEvent::SessionDown(reason) => Some(DaemonEvent::SessionDown { reason }),
-        // M5 wires destination events through to DaemonEvent::Destination.
-        EmittedEvent::DestinationUp(_)
-        | EmittedEvent::DestinationDown(_, _)
-        | EmittedEvent::DestinationUpdate(_) => None,
+        // M5 wires destination events through to DaemonEvent::Destination
+        // in Task 8 of the M5 plan.
+        EmittedEvent::DestinationUp { .. }
+        | EmittedEvent::DestinationDown { .. }
+        | EmittedEvent::DestinationUpdate { .. } => None,
     }
 }
 

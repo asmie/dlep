@@ -17,7 +17,7 @@ pub mod session_router;
 pub mod timers;
 pub mod transaction;
 
-pub use events::{FsmAction, FsmEvent, SendTarget};
+pub use events::{DestinationAddrs, FsmAction, FsmEvent, LinkMetrics, SendTarget};
 pub use session_common::SessionConfig;
 pub use session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,

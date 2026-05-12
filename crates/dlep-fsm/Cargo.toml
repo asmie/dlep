@@ -10,5 +10,6 @@ rust-version.workspace = true
 
 [dependencies]
 dlep-core.workspace = true
+ipnet.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

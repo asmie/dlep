@@ -2,10 +2,11 @@ use std::any::Any;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use dlep_core::{ExtensionId, MacAddress, StatusCode};
 use ipnet::{Ipv4Net, Ipv6Net};
+
+pub use dlep_fsm::LinkMetrics;
 
 /// Opaque destination identifier. Today it is a MAC address; this wrapper
 /// lets the API evolve (e.g. for logical-destination extensions).
@@ -16,19 +17,6 @@ impl From<MacAddress> for DestinationId {
     fn from(m: MacAddress) -> Self {
         Self(m)
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LinkMetrics {
-    pub max_data_rate_rx_bps: u64,
-    pub max_data_rate_tx_bps: u64,
-    pub current_data_rate_rx_bps: u64,
-    pub current_data_rate_tx_bps: u64,
-    pub latency: Duration,
-    pub resources: u8,
-    pub rlq_rx: u8,
-    pub rlq_tx: u8,
-    pub mtu: u16,
 }
 
 #[derive(Clone, Debug)]
