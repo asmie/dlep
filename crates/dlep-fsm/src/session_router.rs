@@ -226,6 +226,36 @@ impl RouterSessionFsm {
                 }
                 actions
             }
+            // Destination_Update: RFC 8175 §11.7 — one-way notification of
+            // metric changes for an existing destination. No response message.
+            // Emit DestinationUpdate so the app can refresh its view, then
+            // reset the missed-heartbeat deadline (RFC §11.2). Malformed
+            // inbound (no MAC) is leniently dropped here — only the
+            // heartbeat-reset side-effect survives; we don't tear down the
+            // session for a metric update we can't apply.
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_UPDATE =>
+            {
+                let Some(mac) = extract_destination_mac(&msg) else {
+                    return heartbeat_reset_action(
+                        TIMER_HEARTBEAT_MISSED,
+                        self.peer_heartbeat_interval,
+                    )
+                    .into_iter()
+                    .collect();
+                };
+                let metrics = extract_link_metrics(&msg).unwrap_or_default();
+                let mut actions = vec![FsmAction::Emit(EmittedEvent::DestinationUpdate {
+                    mac,
+                    metrics,
+                })];
+                if let Some(reset) =
+                    heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                {
+                    actions.push(reset);
+                }
+                actions
+            }
             // Catch-all for any other successfully decoded message in
             // InSession (Heartbeat, future Destination_*, etc.) — RFC 8175
             // §11.2 says any received message resets the missed-heartbeat

@@ -6,9 +6,9 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_destination_up, build_heartbeat, build_session_termination,
-    build_session_termination_response, extract_destination_mac, extract_heartbeat_interval,
-    extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    SessionConfig, build_destination_up, build_destination_update, build_heartbeat,
+    build_session_termination, build_session_termination_response, extract_destination_mac,
+    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -230,6 +230,20 @@ impl ModemSessionFsm {
                 heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
                     .into_iter()
                     .collect()
+            }
+            // InSession: app asks us to advertise an updated metric set for
+            // an existing destination. RFC 8175 §11.7 — Destination_Update is
+            // one-way; there is no Response. If the MAC is unknown locally,
+            // log+drop (symmetric to the Up dedup-guard) so we never advertise
+            // an Update for a destination the router never saw an Up for.
+            (ModemSessionState::InSession, FsmEvent::AppUpdateMetrics { mac, metrics }) => {
+                if !self.destinations.contains_key(&mac) {
+                    tracing::debug!(?mac, "update_metrics for unknown destination; ignoring");
+                    return Vec::new();
+                }
+                vec![FsmAction::SendMessage(build_destination_update(
+                    mac, &metrics,
+                ))]
             }
             // Catch-all for any other successfully decoded message —
             // RFC 8175 §11.2 says any received message resets the

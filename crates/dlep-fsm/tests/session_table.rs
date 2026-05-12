@@ -986,3 +986,67 @@ fn modem_in_session_destination_up_response_failure_drops_local() {
         "non-Success response should drop the local destination"
     );
 }
+
+#[test]
+fn modem_in_session_app_update_metrics_sends_update() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let _ = fsm.step(FsmEvent::AppAddDestination {
+        mac: dest_mac(),
+        metrics: sample_metrics_dest(),
+        addrs: DestinationAddrs::default(),
+    });
+
+    let mut new_metrics = sample_metrics_dest();
+    new_metrics.current_data_rate_rx_bps = 1_234_567;
+    let actions = fsm.step(FsmEvent::AppUpdateMetrics {
+        mac: dest_mac(),
+        metrics: new_metrics,
+    });
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    let send = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(m) => Some(m),
+            _ => None,
+        })
+        .expect("expected SendMessage(Destination_Update)");
+    assert_eq!(send.message_type, MessageType::DESTINATION_UPDATE);
+}
+
+#[test]
+fn modem_in_session_app_update_metrics_ignored_for_unknown_destination() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::AppUpdateMetrics {
+        mac: dest_mac(),
+        metrics: sample_metrics_dest(),
+    });
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::SendMessage(_))),
+        "update for unknown MAC must not send a message"
+    );
+}
+
+#[test]
+fn router_in_session_destination_update_emits() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let metrics = sample_metrics_dest();
+    let update_msg = dlep_fsm::session_common::build_destination_update(dest_mac(), &metrics);
+    let actions = fsm.step(FsmEvent::RecvMessage(update_msg));
+    assert_eq!(fsm.state(), RouterSessionState::InSession);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::Emit(EmittedEvent::DestinationUpdate { mac, .. }) if *mac == dest_mac()
+    )));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::SendMessage(_)))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+}
