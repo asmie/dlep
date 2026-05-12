@@ -9,9 +9,10 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use dlep_core::{MacAddress, StatusCode};
 use dlep_daemon::{
-    DaemonEvent, ModemConfig, ModemDaemon, NetworkConfig, RouterConfig, RouterDaemon, SharedConfig,
-    TimersConfig,
+    DaemonEvent, DestinationEvent, DestinationId, LinkMetrics, ModemConfig, ModemDaemon,
+    NetworkConfig, RouterConfig, RouterDaemon, SharedConfig, TimersConfig,
 };
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -267,4 +268,121 @@ async fn router_tls_config_fails_instead_of_plaintext_downgrade() {
         err.to_string()
             .contains("TLS transport is not yet implemented")
     );
+}
+
+fn sample_metrics() -> LinkMetrics {
+    LinkMetrics {
+        max_data_rate_rx_bps: 100_000_000,
+        max_data_rate_tx_bps: 100_000_000,
+        current_data_rate_rx_bps: 80_000_000,
+        current_data_rate_tx_bps: 80_000_000,
+        latency: Duration::from_micros(2_500),
+        resources: 85,
+        rlq_rx: 95,
+        rlq_tx: 95,
+        mtu: 1500,
+    }
+}
+
+async fn await_destination_event<F>(rx: &mut Receiver<DaemonEvent>, mut pred: F) -> DestinationEvent
+where
+    F: FnMut(&DestinationEvent) -> bool,
+{
+    loop {
+        let evt = timeout(STEP_TIMEOUT, rx.recv())
+            .await
+            .expect("timed out waiting for destination event")
+            .expect("event channel closed");
+        if let DaemonEvent::Destination(d) = evt {
+            if pred(&d) {
+                return d;
+            }
+            // Predicate didn't match; consume the next event.
+        }
+    }
+}
+
+#[tokio::test]
+async fn destination_round_trip_over_loopback() {
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .spawn()
+        .await
+        .expect("modem spawn");
+    let modem_addr = modem.local_addr();
+    let mut modem_events = modem.subscribe();
+
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .spawn()
+        .await
+        .expect("router spawn");
+    let mut router_events = router.subscribe();
+
+    router
+        .connect_static(modem_addr)
+        .await
+        .expect("router connect_static");
+
+    await_session_up(&mut router_events).await;
+    await_session_up(&mut modem_events).await;
+
+    let mac = MacAddress::new_eui48([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let id = DestinationId(mac);
+
+    // Up
+    modem
+        .add_destination(id, sample_metrics())
+        .await
+        .expect("add_destination");
+    let up = await_destination_event(
+        &mut router_events,
+        |d| matches!(d, DestinationEvent::Up { id: got, .. } if *got == id),
+    )
+    .await;
+    if let DestinationEvent::Up { metrics, .. } = up {
+        assert_eq!(metrics.current_data_rate_rx_bps, 80_000_000);
+    } else {
+        unreachable!()
+    }
+
+    // Update
+    let mut updated = sample_metrics();
+    updated.current_data_rate_rx_bps = 12_345_678;
+    modem
+        .update_destination(id, updated)
+        .await
+        .expect("update_destination");
+    let upd = await_destination_event(
+        &mut router_events,
+        |d| matches!(d, DestinationEvent::Update { id: got, .. } if *got == id),
+    )
+    .await;
+    if let DestinationEvent::Update { metrics, .. } = upd {
+        assert_eq!(metrics.current_data_rate_rx_bps, 12_345_678);
+    } else {
+        unreachable!()
+    }
+
+    // Down
+    modem
+        .drop_destination(id, StatusCode::SHUTTING_DOWN)
+        .await
+        .expect("drop_destination");
+    let down = await_destination_event(
+        &mut router_events,
+        |d| matches!(d, DestinationEvent::Down { id: got, .. } if *got == id),
+    )
+    .await;
+    if let DestinationEvent::Down { reason, .. } = down {
+        assert_eq!(reason, StatusCode::SHUTTING_DOWN);
+    } else {
+        unreachable!()
+    }
+
+    // Clean shutdown.
+    router.shutdown().await.expect("router shutdown");
+    await_session_down(&mut router_events).await;
+    await_session_down(&mut modem_events).await;
+    modem.shutdown().await.expect("modem shutdown");
 }

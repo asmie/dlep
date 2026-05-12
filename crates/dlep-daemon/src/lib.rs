@@ -14,6 +14,8 @@ pub mod session;
 
 pub use cli::{ConfigLoadError, load_toml_config};
 pub use config::{ModemConfig, NetworkConfig, RouterConfig, SharedConfig, TimersConfig, TlsConfig};
-pub use events::{DaemonEvent, DestinationEvent, LinkMetrics, MetricsEvent, PeerInfo};
+pub use events::{
+    DaemonEvent, DestinationEvent, DestinationId, LinkMetrics, MetricsEvent, PeerInfo,
+};
 pub use modem::{ModemBuilder, ModemDaemon};
 pub use router::{RouterBuilder, RouterDaemon};
