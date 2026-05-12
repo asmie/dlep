@@ -6,8 +6,9 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_heartbeat, build_session_termination, build_session_termination_response,
-    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    SessionConfig, build_destination_up, build_heartbeat, build_session_termination,
+    build_session_termination_response, extract_heartbeat_interval, extract_status,
+    heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -178,6 +179,31 @@ impl ModemSessionFsm {
                     FsmAction::CloseTcp,
                     FsmAction::Emit(EmittedEvent::SessionDown(status)),
                 ]
+            }
+            // InSession: app asks us to advertise a new destination.
+            (
+                ModemSessionState::InSession,
+                FsmEvent::AppAddDestination {
+                    mac,
+                    metrics,
+                    addrs,
+                },
+            ) => {
+                use crate::transaction::RequestKind;
+                if self
+                    .tx
+                    .open_destination(mac, RequestKind::DestinationUp)
+                    .is_err()
+                {
+                    tracing::debug!(?mac, "duplicate add_destination while Up pending");
+                    return Vec::new();
+                }
+                self.destinations
+                    .entry(mac)
+                    .or_insert(DestinationState { announced: false });
+                vec![FsmAction::SendMessage(build_destination_up(
+                    mac, &metrics, &addrs,
+                ))]
             }
             // Catch-all for any other successfully decoded message —
             // RFC 8175 §11.2 says any received message resets the

@@ -9,8 +9,8 @@
 
 use std::time::Duration;
 
-use dlep_core::{DataItem, MessageType, StatusCode};
-use dlep_fsm::events::{EmittedEvent, FsmAction, FsmEvent};
+use dlep_core::{DataItem, MacAddress, MessageType, StatusCode};
+use dlep_fsm::events::{DestinationAddrs, EmittedEvent, FsmAction, FsmEvent, LinkMetrics};
 use dlep_fsm::session_modem::{ModemSessionFsm, ModemSessionState};
 use dlep_fsm::session_router::{
     RouterSessionFsm, RouterSessionState, TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED,
@@ -91,6 +91,24 @@ fn make_termination(reason: StatusCode) -> dlep_core::Message {
         code: reason,
         text: String::new(),
     })
+}
+
+fn sample_metrics_dest() -> LinkMetrics {
+    LinkMetrics {
+        max_data_rate_rx_bps: 1_000_000,
+        max_data_rate_tx_bps: 1_000_000,
+        current_data_rate_rx_bps: 500_000,
+        current_data_rate_tx_bps: 500_000,
+        latency: std::time::Duration::from_micros(1_000),
+        resources: 90,
+        rlq_rx: 100,
+        rlq_tx: 100,
+        mtu: 1500,
+    }
+}
+
+fn dest_mac() -> MacAddress {
+    MacAddress::new_eui48([0xaa, 0xbb, 0xcc, 0x00, 0x00, 0x01])
 }
 
 /// Find the first action matching the given predicate. Used because the
@@ -830,4 +848,47 @@ fn router_terminated_ignores_stray_heartbeat_timer_expiry() {
     ));
     assert!(actions.is_empty());
     assert_eq!(fsm.state(), RouterSessionState::Terminated);
+}
+
+#[test]
+fn modem_in_session_app_add_destination_sends_up() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::AppAddDestination {
+        mac: dest_mac(),
+        metrics: sample_metrics_dest(),
+        addrs: DestinationAddrs::default(),
+    });
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    let send = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(m) => Some(m),
+            _ => None,
+        })
+        .expect("expected SendMessage(Destination_Up)");
+    assert_eq!(send.message_type, MessageType::DESTINATION_UP);
+    assert!(fsm.destinations.contains_key(&dest_mac()));
+    assert!(!fsm.destinations[&dest_mac()].announced);
+    assert!(fsm.tx.destination_busy(&dest_mac()));
+}
+
+#[test]
+fn modem_in_session_app_add_destination_dedupes_on_repeat() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let _ = fsm.step(FsmEvent::AppAddDestination {
+        mac: dest_mac(),
+        metrics: sample_metrics_dest(),
+        addrs: DestinationAddrs::default(),
+    });
+    let actions = fsm.step(FsmEvent::AppAddDestination {
+        mac: dest_mac(),
+        metrics: sample_metrics_dest(),
+        addrs: DestinationAddrs::default(),
+    });
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::SendMessage(_))),
+        "duplicate add must not emit a second Destination_Up"
+    );
 }
