@@ -931,3 +931,58 @@ fn modem_in_session_app_add_destination_dedupes_on_repeat() {
         "duplicate add must not emit a second Destination_Up"
     );
 }
+
+fn make_destination_up_response(status: StatusCode) -> dlep_core::Message {
+    dlep_core::Message::new(MessageType::DESTINATION_UP_RESPONSE)
+        .with_item(DataItem::MacAddress(dest_mac()))
+        .with_item(DataItem::Status {
+            code: status,
+            text: String::new(),
+        })
+}
+
+#[test]
+fn modem_in_session_destination_up_response_success_marks_announced() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let _ = fsm.step(FsmEvent::AppAddDestination {
+        mac: dest_mac(),
+        metrics: sample_metrics_dest(),
+        addrs: DestinationAddrs::default(),
+    });
+    assert!(fsm.tx.destination_busy(&dest_mac()));
+
+    let actions = fsm.step(FsmEvent::RecvMessage(make_destination_up_response(
+        StatusCode::SUCCESS,
+    )));
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    assert!(!fsm.tx.destination_busy(&dest_mac()), "tx should be closed");
+    assert!(
+        fsm.destinations[&dest_mac()].announced,
+        "announced should flip to true on Success"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+}
+
+#[test]
+fn modem_in_session_destination_up_response_failure_drops_local() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let _ = fsm.step(FsmEvent::AppAddDestination {
+        mac: dest_mac(),
+        metrics: sample_metrics_dest(),
+        addrs: DestinationAddrs::default(),
+    });
+
+    let _ = fsm.step(FsmEvent::RecvMessage(make_destination_up_response(
+        StatusCode::REQUEST_DENIED,
+    )));
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    assert!(!fsm.tx.destination_busy(&dest_mac()));
+    assert!(
+        !fsm.destinations.contains_key(&dest_mac()),
+        "non-Success response should drop the local destination"
+    );
+}

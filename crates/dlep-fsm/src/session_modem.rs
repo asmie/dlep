@@ -7,8 +7,8 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
     SessionConfig, build_destination_up, build_heartbeat, build_session_termination,
-    build_session_termination_response, extract_heartbeat_interval, extract_status,
-    heartbeat_reset_action, local_heartbeat_interval,
+    build_session_termination_response, extract_destination_mac, extract_heartbeat_interval,
+    extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -204,6 +204,32 @@ impl ModemSessionFsm {
                 vec![FsmAction::SendMessage(build_destination_up(
                     mac, &metrics, &addrs,
                 ))]
+            }
+            // InSession: router replied to our Destination_Up. Close the
+            // per-destination transaction. On Success flip `announced`; on
+            // any non-Success status drop the local entry so a future
+            // add_destination(mac) is a clean retry. RFC 8175 §11.2: every
+            // received message resets the missed-heartbeat deadline.
+            (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_UP_RESPONSE =>
+            {
+                let mac = extract_destination_mac(&msg);
+                let status = extract_status(&msg).unwrap_or(StatusCode::SUCCESS);
+                if let Some(mac) = mac {
+                    self.tx.close_destination(&mac);
+                    if status == StatusCode::SUCCESS {
+                        if let Some(d) = self.destinations.get_mut(&mac) {
+                            d.announced = true;
+                        }
+                    } else {
+                        // Router rejected. Drop locally so a later
+                        // add_destination for the same MAC is a clean retry.
+                        self.destinations.remove(&mac);
+                    }
+                }
+                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    .into_iter()
+                    .collect()
             }
             // Catch-all for any other successfully decoded message —
             // RFC 8175 §11.2 says any received message resets the
