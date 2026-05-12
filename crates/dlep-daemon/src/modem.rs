@@ -48,9 +48,12 @@ impl ModemDaemon {
         id: DestinationId,
         metrics: LinkMetrics,
     ) -> Result<(), DaemonError> {
-        // M5 wires this into the session task via SessionCommand::AddDestination.
-        let _ = (id, metrics);
-        Ok(())
+        self.fanout(SessionCommand::AddDestination {
+            mac: id.0,
+            metrics,
+            addrs: dlep_fsm::DestinationAddrs::default(),
+        })
+        .await
     }
 
     pub async fn update_destination(
@@ -58,8 +61,8 @@ impl ModemDaemon {
         id: DestinationId,
         metrics: LinkMetrics,
     ) -> Result<(), DaemonError> {
-        let _ = (id, metrics);
-        Ok(())
+        self.fanout(SessionCommand::UpdateDestination { mac: id.0, metrics })
+            .await
     }
 
     pub async fn drop_destination(
@@ -67,12 +70,29 @@ impl ModemDaemon {
         id: DestinationId,
         reason: StatusCode,
     ) -> Result<(), DaemonError> {
-        let _ = (id, reason);
-        Ok(())
+        self.fanout(SessionCommand::DropDestination { mac: id.0, reason })
+            .await
     }
 
     pub async fn announce_destination(&self, mac: MacAddress) -> Result<(), DaemonError> {
+        // Destination_Announce is out of M5 scope; tracked as future work.
         let _ = mac;
+        Ok(())
+    }
+
+    /// Fan a command to every active session. Snapshot the sender list under
+    /// the lock so we don't hold the mutex across `await`. If a session
+    /// already exited and dropped its receiver, the `send` fails — we drop
+    /// the error rather than surface it, since a dead session is not the
+    /// caller's problem.
+    async fn fanout(&self, cmd: SessionCommand) -> Result<(), DaemonError> {
+        let senders: Vec<_> = {
+            let guard = self.session_cmds.lock().await;
+            guard.clone()
+        };
+        for tx in senders {
+            let _ = tx.send(cmd.clone()).await;
+        }
         Ok(())
     }
 
