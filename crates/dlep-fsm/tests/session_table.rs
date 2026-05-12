@@ -306,6 +306,45 @@ fn router_session_init_pending_to_terminated_on_unexpected_message() {
 }
 
 #[test]
+fn router_in_session_destination_up_responds_and_emits() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let metrics = sample_metrics_dest();
+    let up_msg = dlep_fsm::session_common::build_destination_up(
+        dest_mac(),
+        &metrics,
+        &DestinationAddrs::default(),
+    );
+    let actions = fsm.step(FsmEvent::RecvMessage(up_msg));
+    assert_eq!(fsm.state(), RouterSessionState::InSession);
+
+    let resp = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(m) => Some(m),
+            _ => None,
+        })
+        .expect("expected SendMessage(Destination_Up_Response)");
+    assert_eq!(resp.message_type, MessageType::DESTINATION_UP_RESPONSE);
+
+    let emitted = actions.iter().find_map(|a| match a {
+        FsmAction::Emit(EmittedEvent::DestinationUp { mac, metrics, .. }) => Some((*mac, *metrics)),
+        _ => None,
+    });
+    let (mac, metrics) = emitted.expect("expected Emit(DestinationUp)");
+    assert_eq!(mac, dest_mac());
+    assert_eq!(metrics.current_data_rate_rx_bps, 500_000);
+
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
+    );
+
+    assert!(fsm.destinations.contains_key(&dest_mac()));
+    assert!(fsm.destinations[&dest_mac()].up);
+}
+
+#[test]
 fn router_in_session_heartbeat_resets_heartbeat() {
     let mut fsm = router_at(RouterSessionState::InSession);
     let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));

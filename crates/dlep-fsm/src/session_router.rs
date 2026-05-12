@@ -6,8 +6,10 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_heartbeat, build_session_termination, build_session_termination_response,
-    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    SessionConfig, build_destination_up_response, build_heartbeat, build_session_termination,
+    build_session_termination_response, extract_destination_addrs, extract_destination_mac,
+    extract_heartbeat_interval, extract_link_metrics, extract_status, heartbeat_reset_action,
+    local_heartbeat_interval,
 };
 use crate::timers::{TimerId, TimerKind};
 use crate::transaction::TransactionTracker;
@@ -187,6 +189,42 @@ impl RouterSessionFsm {
                     FsmAction::CloseTcp,
                     FsmAction::Emit(EmittedEvent::SessionDown(status)),
                 ]
+            }
+            // Destination_Up: insert into the map, ACK with
+            // Destination_Up_Response { SUCCESS }, emit DestinationUp, and
+            // reset the missed-heartbeat deadline (RFC §11.2). Malformed
+            // inbound — no MAC — is symmetric to the SessionInitPending
+            // defensive arm: drop the connection rather than emit a partial
+            // event.
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_UP =>
+            {
+                let Some(mac) = extract_destination_mac(&msg) else {
+                    self.state = RouterSessionState::Terminated;
+                    return vec![
+                        FsmAction::CancelTimer(TIMER_HEARTBEAT),
+                        FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED),
+                        FsmAction::CloseTcp,
+                        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA)),
+                    ];
+                };
+                let metrics = extract_link_metrics(&msg).unwrap_or_default();
+                let addrs = extract_destination_addrs(&msg);
+                self.destinations.insert(mac, DestinationState { up: true });
+                let mut actions = vec![
+                    FsmAction::SendMessage(build_destination_up_response(mac, StatusCode::SUCCESS)),
+                    FsmAction::Emit(EmittedEvent::DestinationUp {
+                        mac,
+                        metrics,
+                        addrs,
+                    }),
+                ];
+                if let Some(reset) =
+                    heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                {
+                    actions.push(reset);
+                }
+                actions
             }
             // Catch-all for any other successfully decoded message in
             // InSession (Heartbeat, future Destination_*, etc.) — RFC 8175
