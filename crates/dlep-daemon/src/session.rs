@@ -227,18 +227,29 @@ pub async fn run_session<F: SessionFsm>(
             }
 
             cmd = commands.recv(), if commands_open => {
-                let reason = match cmd {
-                    Some(SessionCommand::Shutdown { reason }) => reason,
+                let event = match cmd {
+                    Some(SessionCommand::Shutdown { reason }) => {
+                        FsmEvent::AppShutdown { reason }
+                    }
+                    Some(SessionCommand::AddDestination { mac, metrics, addrs }) => {
+                        FsmEvent::AppAddDestination { mac, metrics, addrs }
+                    }
+                    Some(SessionCommand::UpdateDestination { mac, metrics }) => {
+                        FsmEvent::AppUpdateMetrics { mac, metrics }
+                    }
+                    Some(SessionCommand::DropDestination { mac, reason }) => {
+                        FsmEvent::AppDropDestination { mac, reason }
+                    }
                     None => {
                         // Daemon dropped the channel without an explicit
                         // Shutdown command. Treat as a one-shot signal:
                         // synthesise AppShutdown once, then disable this
                         // branch so we don't spin.
                         commands_open = false;
-                        StatusCode::SHUTTING_DOWN
+                        FsmEvent::AppShutdown { reason: StatusCode::SHUTTING_DOWN }
                     }
                 };
-                let actions = fsm.step(FsmEvent::AppShutdown { reason });
+                let actions = fsm.step(event);
                 if process_actions(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
@@ -389,17 +400,37 @@ async fn process_actions(
 }
 
 fn translate_emitted(emitted: EmittedEvent, peer: &PeerInfo) -> Option<DaemonEvent> {
+    use crate::events::{DestinationEvent, DestinationId};
     match emitted {
         EmittedEvent::SessionUp => Some(DaemonEvent::SessionUp {
             peer: peer.clone(),
             negotiated_extensions: Vec::new(),
         }),
         EmittedEvent::SessionDown(reason) => Some(DaemonEvent::SessionDown { reason }),
-        // M5 wires destination events through to DaemonEvent::Destination
-        // in Task 8 of the M5 plan.
-        EmittedEvent::DestinationUp { .. }
-        | EmittedEvent::DestinationDown { .. }
-        | EmittedEvent::DestinationUpdate { .. } => None,
+        EmittedEvent::DestinationUp {
+            mac,
+            metrics,
+            addrs,
+        } => Some(DaemonEvent::Destination(DestinationEvent::Up {
+            id: DestinationId(mac),
+            metrics,
+            v4_addrs: addrs.v4,
+            v6_addrs: addrs.v6,
+            v4_subnets: addrs.v4_subnets,
+            v6_subnets: addrs.v6_subnets,
+        })),
+        EmittedEvent::DestinationUpdate { mac, metrics } => {
+            Some(DaemonEvent::Destination(DestinationEvent::Update {
+                id: DestinationId(mac),
+                metrics,
+            }))
+        }
+        EmittedEvent::DestinationDown { mac, reason } => {
+            Some(DaemonEvent::Destination(DestinationEvent::Down {
+                id: DestinationId(mac),
+                reason,
+            }))
+        }
     }
 }
 

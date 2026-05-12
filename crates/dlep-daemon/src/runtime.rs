@@ -5,7 +5,8 @@
 //! session (owning the FSM) serializes all state mutation; cross-task
 //! concurrency happens only via channels.
 
-use dlep_core::StatusCode;
+use dlep_core::{MacAddress, StatusCode};
+use dlep_fsm::{DestinationAddrs, LinkMetrics};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 
@@ -17,6 +18,19 @@ use crate::events::DaemonEvent;
 pub enum SessionCommand {
     /// Start the local-initiated termination handshake.
     Shutdown { reason: StatusCode },
+    /// Modem-side: announce a new destination to the peer router.
+    AddDestination {
+        mac: MacAddress,
+        metrics: LinkMetrics,
+        addrs: DestinationAddrs,
+    },
+    /// Modem-side: push fresh metrics for an existing destination.
+    UpdateDestination {
+        mac: MacAddress,
+        metrics: LinkMetrics,
+    },
+    /// Modem-side: drop a destination at the peer router.
+    DropDestination { mac: MacAddress, reason: StatusCode },
 }
 
 /// Broadcast buffer size for public `DaemonEvent`s. When a subscriber lags
