@@ -21,3 +21,6 @@ nix.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

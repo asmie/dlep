@@ -37,6 +37,7 @@ rustls-pki-types = "1"
 # sockets / os
 socket2 = { version = "0.5", features = ["all"] }
 nix = { version = "0.31", features = ["socket", "net", "uio"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 # logging
 tracing = "0.1"
