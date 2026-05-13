@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+pub mod discovery_common;
 pub mod discovery_modem;
 pub mod discovery_router;
 pub mod events;
