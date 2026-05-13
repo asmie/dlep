@@ -44,6 +44,7 @@ fn loopback_modem_config() -> ModemConfig {
                 // OS-specific behaviour of `connect("0.0.0.0:N")`.
                 bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 tcp_port: 0, // OS-assigned
+                discovery_port: 0,
                 use_tls: false,
                 ..NetworkConfig::default()
             },

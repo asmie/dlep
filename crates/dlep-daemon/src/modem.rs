@@ -26,6 +26,8 @@ pub struct ModemDaemon {
     /// First entry is the listen task; subsequent entries are per-session.
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     listen_task: JoinHandle<()>,
+    discovery_shutdown: Mutex<Option<mpsc::Sender<()>>>,
+    discovery_task: Mutex<Option<JoinHandle<Result<(), DaemonError>>>>,
 }
 
 impl ModemDaemon {
@@ -97,6 +99,19 @@ impl ModemDaemon {
     }
 
     pub async fn shutdown(self) -> Result<(), DaemonError> {
+        // Stop the discovery task first so it doesn't try to reply to a
+        // late Peer_Discovery after the TCP machinery is gone.
+        if let Some(tx) = self.discovery_shutdown.lock().await.take() {
+            let _ = tx.send(()).await;
+        }
+        if let Some(handle) = self.discovery_task.lock().await.take() {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("modem discovery task returned error during shutdown: {e}"),
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => warn!("modem discovery task panicked during shutdown: {e}"),
+            }
+        }
         // Stop accepting new connections first so a slow shutdown isn't racing
         // a fresh peer.
         self.listen_task.abort();
@@ -178,14 +193,76 @@ impl ModemBuilder {
             tasks.clone(),
         ));
 
+        // Discovery: bind the UDP multicast socket and spawn the listener.
+        // The modem starts in Listening; it has no app-driven start event
+        // (router-side is the active probe). The bind is best-effort — if it
+        // fails (privileged port, no MULTICAST flag on the interface, etc.)
+        // we log and continue so the rest of the daemon stays usable.
+        let (discovery_shutdown, discovery_task) =
+            match spawn_modem_discovery(&cfg, local_addr, events_tx.clone()).await? {
+                Some((tx, handle)) => (Some(tx), Some(handle)),
+                None => (None, None),
+            };
+
         Ok(ModemDaemon {
             events_tx,
             local_addr,
             session_cmds,
             tasks,
             listen_task,
+            discovery_shutdown: Mutex::new(discovery_shutdown),
+            discovery_task: Mutex::new(discovery_task),
         })
     }
+}
+
+async fn spawn_modem_discovery(
+    cfg: &ModemConfig,
+    local_addr: SocketAddr,
+    events_tx: EventTx,
+) -> Result<Option<(mpsc::Sender<()>, JoinHandle<Result<(), DaemonError>>)>, DaemonError> {
+    use std::net::IpAddr;
+
+    use dlep_fsm::discovery_modem::ModemDiscoveryFsm;
+    use dlep_net::discovery::{DiscoveryParams, DiscoverySocket};
+
+    let interface_v4 = match cfg.shared.network.bind_addr {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => {
+            return Err(DaemonError::Config(
+                "M6 discovery only supports v4 bind_addr".into(),
+            ));
+        }
+    };
+    let params = DiscoveryParams {
+        group_v4: cfg.shared.network.discovery_v4_group,
+        interface_v4,
+        port: cfg.shared.network.discovery_port,
+        multicast_loop: true,
+    };
+    let socket = match DiscoverySocket::bind(&params) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "modem discovery socket bind failed ({e}); discovery disabled. \
+                 Set discovery_port to an unprivileged port or run with \
+                 CAP_NET_BIND_SERVICE if discovery is required."
+            );
+            return Ok(None);
+        }
+    };
+
+    let fsm = ModemDiscoveryFsm::new(
+        local_addr,
+        cfg.peer_description.clone(),
+        cfg.shared.network.use_tls,
+    );
+
+    let (tx, rx) = mpsc::channel::<()>(1);
+    let handle = tokio::spawn(async move {
+        crate::discovery::run_discovery(fsm, socket, None, rx, events_tx).await
+    });
+    Ok(Some((tx, handle)))
 }
 
 async fn modem_accept_loop(
