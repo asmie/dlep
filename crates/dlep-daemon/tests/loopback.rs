@@ -245,7 +245,8 @@ async fn modem_tls_config_fails_instead_of_plaintext_downgrade() {
 
     assert!(
         err.to_string()
-            .contains("TLS transport is not yet implemented")
+            .contains("use_tls = true requires ModemBuilder::with_rustls_server"),
+        "unexpected error: {err}"
     );
 }
 
@@ -267,7 +268,8 @@ async fn router_tls_config_fails_instead_of_plaintext_downgrade() {
 
     assert!(
         err.to_string()
-            .contains("TLS transport is not yet implemented")
+            .contains("use_tls = true requires RouterBuilder::with_rustls_client"),
+        "unexpected error: {err}"
     );
 }
 
