@@ -1,11 +1,10 @@
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use dlep_core::{MacAddress, StatusCode};
 use dlep_ext::{DlepExtension, ExtensionRegistry};
 use dlep_fsm::session_modem::ModemSessionFsm;
-use dlep_net::{Acceptor, ServerConfig, TLS_NOT_IMPLEMENTED_MSG};
+use dlep_net::{Acceptor, ServerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -165,16 +164,21 @@ impl ModemBuilder {
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
         let _ = self.extensions; // M8 hands these to per-session FSMs.
-        let _ = self.server_tls; // M7 wires this into the Acceptor.
-        if cfg.shared.network.use_tls {
-            return Err(io::Error::other(TLS_NOT_IMPLEMENTED_MSG).into());
-        }
 
         let bind_addr = SocketAddr::new(cfg.shared.network.bind_addr, cfg.shared.network.tcp_port);
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
 
-        let acceptor = Acceptor::plain(listener);
+        let acceptor = if cfg.shared.network.use_tls {
+            let server_cfg = self.server_tls.clone().ok_or_else(|| {
+                DaemonError::Config(
+                    "use_tls = true requires ModemBuilder::with_rustls_server(...)".into(),
+                )
+            })?;
+            Acceptor::tls(listener, server_cfg)
+        } else {
+            Acceptor::plain(listener)
+        };
 
         let (events_tx, _events_rx) = new_event_channel();
         let session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>> =
