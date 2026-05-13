@@ -5,7 +5,7 @@ use std::sync::Arc;
 use dlep_core::{MacAddress, StatusCode};
 use dlep_ext::{DlepExtension, ExtensionRegistry};
 use dlep_fsm::session_modem::ModemSessionFsm;
-use dlep_net::{Acceptor, ServerConfig, TLS_NOT_IMPLEMENTED_MSG, TransportKind};
+use dlep_net::{Acceptor, ServerConfig, TLS_NOT_IMPLEMENTED_MSG};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -174,10 +174,7 @@ impl ModemBuilder {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
 
-        let acceptor = Acceptor {
-            kind: TransportKind::Plain,
-            listener,
-        };
+        let acceptor = Acceptor::plain(listener);
 
         let (events_tx, _events_rx) = new_event_channel();
         let session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>> =

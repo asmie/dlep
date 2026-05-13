@@ -55,53 +55,81 @@ impl Transport for tokio_rustls::server::TlsStream<TcpStream> {
     }
 }
 
-/// Selects between plain TCP and TLS for outbound/inbound connections.
-pub enum TransportKind {
-    Plain,
-    Tls {
-        client: Arc<rustls::ClientConfig>,
-        server: Arc<rustls::ServerConfig>,
-    },
+pub struct Connector {
+    kind: ConnectorKind,
 }
 
-pub struct Connector {
-    pub kind: TransportKind,
+enum ConnectorKind {
+    Plain,
+    Tls(Arc<rustls::ClientConfig>),
 }
 
 impl Connector {
     pub fn plain() -> Self {
         Self {
-            kind: TransportKind::Plain,
+            kind: ConnectorKind::Plain,
+        }
+    }
+
+    pub fn tls(client: Arc<rustls::ClientConfig>) -> Self {
+        Self {
+            kind: ConnectorKind::Tls(client),
         }
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn Transport>> {
+        let stream = TcpStream::connect(addr).await?;
         match &self.kind {
-            TransportKind::Plain => {
-                let stream = TcpStream::connect(addr).await?;
-                Ok(Box::new(stream))
-            }
-            TransportKind::Tls { .. } => {
-                // TODO (M7): wire tokio-rustls TlsConnector + ServerName.
-                Err(io::Error::other(TLS_NOT_IMPLEMENTED_MSG))
+            ConnectorKind::Plain => Ok(Box::new(stream)),
+            ConnectorKind::Tls(client) => {
+                let connector = tokio_rustls::TlsConnector::from(client.clone());
+                let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+                let tls = connector
+                    .connect(server_name, stream)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Box::new(tls))
             }
         }
     }
 }
 
 pub struct Acceptor {
-    pub kind: TransportKind,
-    pub listener: TcpListener,
+    listener: TcpListener,
+    kind: AcceptorKind,
+}
+
+enum AcceptorKind {
+    Plain,
+    Tls(Arc<rustls::ServerConfig>),
 }
 
 impl Acceptor {
+    pub fn plain(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            kind: AcceptorKind::Plain,
+        }
+    }
+
+    pub fn tls(listener: TcpListener, server: Arc<rustls::ServerConfig>) -> Self {
+        Self {
+            listener,
+            kind: AcceptorKind::Tls(server),
+        }
+    }
+
     pub async fn accept(&self) -> io::Result<Box<dyn Transport>> {
         let (stream, _peer) = self.listener.accept().await?;
         match &self.kind {
-            TransportKind::Plain => Ok(Box::new(stream)),
-            TransportKind::Tls { .. } => {
-                // TODO (M7): wire tokio-rustls TlsAcceptor.
-                Err(io::Error::other(TLS_NOT_IMPLEMENTED_MSG))
+            AcceptorKind::Plain => Ok(Box::new(stream)),
+            AcceptorKind::Tls(server) => {
+                let acceptor = tokio_rustls::TlsAcceptor::from(server.clone());
+                let tls = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Box::new(tls))
             }
         }
     }
