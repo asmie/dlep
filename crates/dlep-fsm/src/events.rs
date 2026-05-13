@@ -85,6 +85,7 @@ pub enum FsmEvent {
     AppRequestLinkCharacteristics {
         mac: MacAddress,
     },
+    AppStartDiscovery,
     AppShutdown {
         reason: StatusCode,
     },
@@ -127,6 +128,11 @@ pub enum FsmAction {
 pub enum EmittedEvent {
     SessionUp,
     SessionDown(StatusCode),
+    PeerDiscovered {
+        addr: std::net::SocketAddr,
+        peer_description: Option<String>,
+        use_tls: bool,
+    },
     DestinationUp {
         mac: MacAddress,
         metrics: LinkMetrics,

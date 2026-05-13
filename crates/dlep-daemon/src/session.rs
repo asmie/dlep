@@ -407,6 +407,15 @@ fn translate_emitted(emitted: EmittedEvent, peer: &PeerInfo) -> Option<DaemonEve
             negotiated_extensions: Vec::new(),
         }),
         EmittedEvent::SessionDown(reason) => Some(DaemonEvent::SessionDown { reason }),
+        EmittedEvent::PeerDiscovered {
+            addr,
+            peer_description,
+            use_tls,
+        } => Some(DaemonEvent::PeerDiscovered(PeerInfo {
+            addr,
+            is_tls: use_tls,
+            peer_description,
+        })),
         EmittedEvent::DestinationUp {
             mac,
             metrics,
