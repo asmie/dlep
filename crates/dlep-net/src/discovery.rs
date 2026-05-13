@@ -104,56 +104,14 @@ impl DiscoverySocket {
         self.port
     }
 
-    pub fn raw_fd(&self) -> i32 {
-        self.fd.get_ref().as_raw_fd()
-    }
-
-    pub(crate) fn fd(&self) -> &AsyncFd<OwnedFd> {
-        &self.fd
-    }
-
-    pub(crate) fn codec(&self) -> &SignalCodec {
-        &self.codec
-    }
-
-    pub(crate) fn group_v4(&self) -> Ipv4Addr {
-        self.group_v4
-    }
-
     /// Send a signal to the configured multicast group. Loops until the
     /// kernel accepts the datagram (handling `EAGAIN` via tokio's
     /// `AsyncFd::writable`). Errors propagate as `io::Error`; a short
     /// `sendto` (which UDP doesn't normally produce) is reported rather
     /// than silently truncated.
     pub async fn send_to_group(&self, signal: &Signal) -> io::Result<()> {
-        let bytes = signal
-            .encode()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let dest = std::net::SocketAddrV4::new(self.group_v4, self.group_port);
-        loop {
-            let mut guard = self.fd.writable().await?;
-            match guard.try_io(|inner| {
-                use nix::sys::socket::{MsgFlags, SockaddrIn, sendto};
-                let nix_addr = SockaddrIn::from(dest);
-                sendto(
-                    inner.get_ref().as_raw_fd(),
-                    &bytes,
-                    &nix_addr,
-                    MsgFlags::empty(),
-                )
-                .map_err(io::Error::from)
-            }) {
-                Ok(Ok(n)) if n == bytes.len() => return Ok(()),
-                Ok(Ok(n)) => {
-                    return Err(io::Error::other(format!(
-                        "short sendto: {n}/{}",
-                        bytes.len()
-                    )));
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(_would_block) => continue,
-            }
-        }
+        self.send_v4(signal, dest).await
     }
 
     /// Send a signal to a specific unicast destination (used for modem
@@ -161,17 +119,21 @@ impl DiscoverySocket {
     /// address comes from the caller (typically the source address of an
     /// inbound Peer_Discovery).
     pub async fn send_unicast(&self, signal: &Signal, dest: SocketAddr) -> io::Result<()> {
-        let bytes = signal
-            .encode()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let SocketAddr::V4(dest_v4) = dest else {
             return Err(io::Error::other("only v4 unicast is supported in M6"));
         };
+        self.send_v4(signal, dest_v4).await
+    }
+
+    async fn send_v4(&self, signal: &Signal, dest: std::net::SocketAddrV4) -> io::Result<()> {
+        let bytes = signal
+            .encode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         loop {
             let mut guard = self.fd.writable().await?;
             match guard.try_io(|inner| {
                 use nix::sys::socket::{MsgFlags, SockaddrIn, sendto};
-                let nix_addr = SockaddrIn::from(dest_v4);
+                let nix_addr = SockaddrIn::from(dest);
                 sendto(
                     inner.get_ref().as_raw_fd(),
                     &bytes,
@@ -204,10 +166,11 @@ impl DiscoverySocket {
 
         // 1500 ≈ standard Ethernet MTU; DLEP signals fit easily. The
         // datagram boundary is authoritative, so a fixed buffer is fine.
-        let mut payload = vec![0u8; 1500];
-        // IP_TTL cmsg payload is `int` on Linux (`ControlMessageOwned::Ipv4Ttl(i32)`).
-        // `i32` matches `libc::c_int` on every supported target — using it
-        // here keeps `dlep-net` free of an explicit `libc` dep.
+        // Hoisted above the retry loop so an EAGAIN spin doesn't re-allocate.
+        // IP_TTL cmsg payload is `int` on Linux (`ControlMessageOwned::Ipv4Ttl(i32)`);
+        // `i32` matches `libc::c_int` on every supported target, keeping
+        // `dlep-net` free of an explicit `libc` dep.
+        let mut payload = [0u8; 1500];
         let mut cmsg_space = nix::cmsg_space!(i32);
 
         loop {

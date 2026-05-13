@@ -36,7 +36,6 @@ pub struct RouterDaemon {
     /// `discovery_shutdown`.
     discovery_task: Mutex<Option<JoinHandle<Result<(), DaemonError>>>>,
     peer_description: String,
-    use_tls: bool,
 }
 
 impl RouterDaemon {
@@ -119,7 +118,7 @@ impl RouterDaemon {
     /// established before this function returns; the session task then runs
     /// independently until shutdown or peer disconnect.
     pub async fn connect_static(&self, peer: SocketAddr) -> Result<(), DaemonError> {
-        if self.use_tls {
+        if self.network.use_tls {
             return Err(io::Error::other(TLS_NOT_IMPLEMENTED_MSG).into());
         }
 
@@ -227,7 +226,6 @@ impl RouterBuilder {
             discovery_shutdown: Mutex::new(None),
             discovery_task: Mutex::new(None),
             peer_description: cfg.peer_description.clone(),
-            use_tls: cfg.shared.network.use_tls,
         })
     }
 }
