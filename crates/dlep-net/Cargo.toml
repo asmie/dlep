@@ -17,6 +17,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 socket2.workspace = true
+nix.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
