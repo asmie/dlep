@@ -21,3 +21,6 @@ tracing.workspace = true
 serde.workspace = true
 toml.workspace = true
 ipnet.workspace = true
+
+[dev-dependencies]
+dlep-net = { workspace = true, features = ["test-helpers"] }
