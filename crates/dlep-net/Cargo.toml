@@ -21,6 +21,14 @@ nix.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+rcgen = { workspace = true, optional = true }
+
+[features]
+# Exposes `tls::test_helpers` for use by integration tests in downstream
+# crates. Off by default so production builds don't pull rcgen and its
+# transitive deps (time, yasna, pem, …).
+test-helpers = ["dep:rcgen"]
 
 [dev-dependencies]
+# Enable our own test_helpers when running this crate's tests.
 rcgen.workspace = true
