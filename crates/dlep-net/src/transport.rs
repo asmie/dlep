@@ -31,6 +31,30 @@ impl Transport for TcpStream {
     }
 }
 
+impl Transport for tokio_rustls::client::TlsStream<TcpStream> {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.get_ref().0.peer_addr()
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.get_ref().0.local_addr()
+    }
+    fn is_tls(&self) -> bool {
+        true
+    }
+}
+
+impl Transport for tokio_rustls::server::TlsStream<TcpStream> {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.get_ref().0.peer_addr()
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.get_ref().0.local_addr()
+    }
+    fn is_tls(&self) -> bool {
+        true
+    }
+}
+
 /// Selects between plain TCP and TLS for outbound/inbound connections.
 pub enum TransportKind {
     Plain,
