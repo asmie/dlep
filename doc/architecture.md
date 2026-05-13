@@ -103,8 +103,8 @@ Everything that touches the operating system. Built on Tokio.
 | `transport.rs` | `Transport` trait (`AsyncRead + AsyncWrite + Unpin + Send + 'static` plus `peer_addr`/`local_addr`/`is_tls`). `Connector` and `Acceptor` produce `Box<dyn Transport>` for either plain TCP or (TODO M7) TLS. |
 | `tls.rs` | rustls helpers: `load_certs`, `load_private_key`, placeholder `client_config_placeholder`. |
 | `framed.rs` | `MessageCodec` and `SignalCodec` — `tokio_util::codec::{Decoder, Encoder}` adapters over the byte-level codec from `dlep-core`. |
-| `discovery.rs` | `DiscoverySocket` for UDP multicast (binding, joining groups, GTSM-aware receive). |
-| `gtsm.rs` | Helpers for RFC 5082 enforcement (`REQUIRED_TTL = 255`, `is_gtsm_valid`). |
+| `discovery.rs` | `DiscoverySocket`: builds a UDP/v4 socket via `socket2` with SO_REUSEADDR/REUSEPORT, optional multicast group join, sets IP_TTL=255 and IP_RECVTTL (GTSM), wraps the fd in `AsyncFd`. Sends via `nix::sendto` (both group and unicast); receives via `nix::recvmsg` extracting the inbound TTL from `IP_TTL` cmsg ancillary data so the daemon can drop non-GTSM packets. |
+| `gtsm.rs` | RFC 5082 helpers: `REQUIRED_TTL = 255`, `set_send_ttl` (configures IP_TTL/IP_MULTICAST_TTL on `socket2::Socket`), `enable_recv_ttl` (enables IP_RECVTTL via `nix::setsockopt`), `is_gtsm_valid` for inbound checks. |
 | `addr.rs` | `InterfaceSpec` (by name / index / any) and `PeerAddr` convenience wrappers. |
 | `lib.rs` | Re-exports `MessageCodec`, `SignalCodec`, `Transport`, `Connector`, `Acceptor`, `TransportKind`, plus `rustls::{ClientConfig, ServerConfig}` so consumers have a single import site for TLS configuration. |
 
@@ -131,6 +131,7 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 | `config.rs` | `RouterConfig`, `ModemConfig`, plus shared `NetworkConfig`, `TlsConfig`, `TimersConfig`. All `serde::Deserialize` for TOML. |
 | `events.rs` | Public `DaemonEvent` enum (`PeerDiscovered`, `SessionUp`, `SessionDown`, `Destination`, `Metrics`, `Extension`), plus `DestinationId`, `LinkMetrics`, `PeerInfo`. `DaemonEvent: Clone` (required by `tokio::sync::broadcast`); `Debug` is hand-written because `Arc<dyn Any + Send + Sync>` does not derive `Debug`. |
 | `runtime.rs` | Channel plumbing: `EventTx = broadcast::Sender<DaemonEvent>` for the public event bus, `mpsc` for internal commands. `DaemonError` lives here too. |
+| `discovery.rs` | `run_discovery` background task: owns a `DiscoverySocket` + a discovery FSM (router or modem), bridges socket I/O to FSM events, applies GTSM filtering on inbound packets, drives periodic Peer_Discovery resends via `DiscoveryTimers`, and translates `EmittedEvent::PeerDiscovered` into `DaemonEvent::PeerDiscovered`. |
 | `session.rs` | The `SessionFsm` trait that the runtime drives, with blanket impls for the router and modem session FSMs. |
 | `router.rs`, `modem.rs` | `RouterDaemon` / `ModemDaemon` handles plus their builders. Builders take a `Config`, optional rustls config, and any number of extensions. |
 | `cli.rs` | Shared CLI helpers used by both binaries: `load_toml_config<T>(Option<&Path>)` and `ConfigLoadError`. |
@@ -304,7 +305,7 @@ The intended order of further work is:
 3. Plain-TCP session over a static peer (loopback integration test). **Done.**
 4. Heartbeat timers + missed-deadline termination. **Done.**
 5. Destinations and metrics end-to-end. **Done (M5)** — modem→router `Destination_Up`/`Update`/`Down` round-trip, including FSM transitions, daemon command/event plumbing, and the `destination_round_trip_over_loopback` integration test. Out-of-scope follow-ups: `Destination_Announce` (router-initiated query) and `Link_Characteristics_Request`/`Response`.
-6. UDP multicast discovery, including GTSM cmsg handling.
+6. UDP multicast discovery, including GTSM cmsg handling. **Done (M6)** — IPv4 multicast group join, `socket2`-built UDP sockets with TTL=255 outbound (GTSM), cmsg-based inbound TTL extraction via `nix::recvmsg`, router + modem discovery FSMs, and the `discovery_loopback_finds_modem_and_establishes_session` integration test. The router is an *active probe* (sends `Peer_Discovery` to the well-known group from an ephemeral source port; does **not** join the group) — the modem is the only group member and replies with unicast `Peer_Offer` to the discovery's source. Modem-side discovery socket bind is best-effort: a bind failure logs a warning and the modem still spawns (the daemon stays usable for direct `connect_static` callers). Follow-ups: IPv6 discovery, `OfferBurst` retries, decoupling `discovery_v4_group` membership from `bind_addr` so production deployments can pick the interface independently of the TCP bind.
 7. TLS via tokio-rustls, then flip the `use_tls` default.
 8. Wire the extension plug-in API and round-trip a private-use ID through a test-only extension.
 9. Polish the CLI binaries and document deployment.
