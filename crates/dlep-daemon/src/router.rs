@@ -1,11 +1,10 @@
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use dlep_core::StatusCode;
 use dlep_ext::{DlepExtension, ExtensionRegistry};
 use dlep_fsm::session_router::RouterSessionFsm;
-use dlep_net::{ClientConfig, Connector, TLS_NOT_IMPLEMENTED_MSG};
+use dlep_net::{ClientConfig, Connector};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -36,6 +35,7 @@ pub struct RouterDaemon {
     /// `discovery_shutdown`.
     discovery_task: Mutex<Option<JoinHandle<Result<(), DaemonError>>>>,
     peer_description: String,
+    client_tls: Option<Arc<ClientConfig>>,
 }
 
 impl RouterDaemon {
@@ -118,11 +118,17 @@ impl RouterDaemon {
     /// established before this function returns; the session task then runs
     /// independently until shutdown or peer disconnect.
     pub async fn connect_static(&self, peer: SocketAddr) -> Result<(), DaemonError> {
-        if self.network.use_tls {
-            return Err(io::Error::other(TLS_NOT_IMPLEMENTED_MSG).into());
-        }
+        let connector = if self.network.use_tls {
+            let cfg = self.client_tls.clone().ok_or_else(|| {
+                DaemonError::Config(
+                    "use_tls = true requires RouterBuilder::with_rustls_client(...)".into(),
+                )
+            })?;
+            Connector::tls(cfg)
+        } else {
+            Connector::plain()
+        };
 
-        let connector = Connector::plain();
         let transport = connector.connect(peer).await?;
         let peer_info = PeerInfo {
             addr: transport.peer_addr()?,
@@ -216,7 +222,6 @@ impl RouterBuilder {
             .ok_or_else(|| DaemonError::Config("RouterConfig required".into()))?;
         let (events_tx, _events_rx) = new_event_channel();
         let _ = self.extensions; // M8 hands these off to the session task.
-        let _ = self.client_tls; // M7 hands this to the Connector.
         Ok(RouterDaemon {
             events_tx,
             timers: cfg.shared.timers.clone(),
@@ -226,6 +231,7 @@ impl RouterBuilder {
             discovery_shutdown: Mutex::new(None),
             discovery_task: Mutex::new(None),
             peer_description: cfg.peer_description.clone(),
+            client_tls: self.client_tls,
         })
     }
 }
