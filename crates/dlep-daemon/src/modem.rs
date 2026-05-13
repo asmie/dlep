@@ -238,7 +238,10 @@ async fn spawn_modem_discovery(
         group_v4: cfg.shared.network.discovery_v4_group,
         interface_v4,
         port: cfg.shared.network.discovery_port,
+        group_port: None,
         multicast_loop: true,
+        // Modem listens on the multicast group for Peer_Discovery.
+        join_group: true,
     };
     let socket = match DiscoverySocket::bind(&params) {
         Ok(s) => s,

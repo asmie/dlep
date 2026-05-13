@@ -72,13 +72,23 @@ impl RouterDaemon {
         let params = DiscoveryParams {
             group_v4: self.network.discovery_v4_group,
             interface_v4,
-            port: self.network.discovery_port,
+            // Router-side: bind ephemeral (port 0) so the modem's unicast
+            // Peer_Offer reply lands on a port not shared with any other
+            // discovery socket — critical for same-host loopback tests
+            // where SO_REUSEPORT would otherwise hash the reply to the
+            // modem's own socket. Routers don't receive multicast (only
+            // unicast offers), so this is also more correct.
+            port: 0,
+            group_port: Some(self.network.discovery_port),
             // Loopback testing runs router and modem in the same process,
             // so the kernel must deliver our own multicast sends to our own
             // receive queue. Production deployments where the modem is on a
             // separate host wouldn't strictly need this, but leaving it on
             // simplifies the public API.
             multicast_loop: true,
+            // Router only sends multicast Peer_Discovery and receives
+            // unicast Peer_Offer; no need to join the discovery group.
+            join_group: false,
         };
         let socket = DiscoverySocket::bind(&params)?;
 

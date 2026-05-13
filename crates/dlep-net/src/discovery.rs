@@ -22,24 +22,44 @@ pub struct DiscoveryParams {
     /// `127.0.0.1` for loopback tests; `0.0.0.0` lets the kernel pick the
     /// default route.
     pub interface_v4: Ipv4Addr,
-    /// UDP port to bind for both send and receive.
+    /// UDP port to bind. `0` lets the kernel pick an ephemeral source port,
+    /// useful for router-side sockets that only send multicast and receive
+    /// unicast Peer_Offer replies — picking ephemeral avoids colliding with
+    /// the modem's well-known port in same-host loopback tests (where
+    /// SO_REUSEPORT would otherwise hash unicast replies to the wrong
+    /// socket).
     pub port: u16,
+    /// Destination port used by `send_to_group`. Defaults to `port` for
+    /// historical callers; an explicit value lets ephemeral-bound sockets
+    /// still send to the canonical multicast port. `None` means "use
+    /// `port`".
+    pub group_port: Option<u16>,
     /// Whether the sender's own packets should loop back to its receive
     /// queue. Required for the loopback integration test where one host
     /// runs both router and modem; ignored in normal multi-host deployments.
     pub multicast_loop: bool,
+    /// When `false`, skip `join_multicast_v4`. Router-side sockets that
+    /// only need to send multicast (not receive it) can opt out, which
+    /// keeps them out of the modem's SO_REUSEPORT group on the same host.
+    pub join_group: bool,
 }
 
 #[derive(Debug)]
 pub struct DiscoverySocket {
     fd: AsyncFd<OwnedFd>,
     group_v4: Ipv4Addr,
+    /// The actual local bind port resolved at bind time (kernel-picked when
+    /// `params.port == 0`).
     port: u16,
+    /// Destination port for multicast group sends (`params.group_port`
+    /// falling back to `params.port`).
+    group_port: u16,
     codec: SignalCodec,
 }
 
 impl DiscoverySocket {
-    /// Bind and join the IPv4 multicast group described by `params`.
+    /// Bind and (optionally) join the IPv4 multicast group described by
+    /// `params`.
     pub fn bind(params: &DiscoveryParams) -> io::Result<Self> {
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
@@ -56,7 +76,16 @@ impl DiscoverySocket {
         sock.set_multicast_loop_v4(params.multicast_loop)?;
         let bind_addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, params.port).into();
         sock.bind(&bind_addr.into())?;
-        sock.join_multicast_v4(&params.group_v4, &params.interface_v4)?;
+        if params.join_group {
+            sock.join_multicast_v4(&params.group_v4, &params.interface_v4)?;
+        }
+        // If the caller asked for ephemeral (`port = 0`), resolve the
+        // actual port the kernel assigned so subsequent unicast replies
+        // can land on this socket.
+        let resolved_port = match sock.local_addr()?.as_socket() {
+            Some(SocketAddr::V4(v4)) => v4.port(),
+            _ => params.port,
+        };
         let raw = sock.into_raw_fd();
         // Safety: `raw` came from `socket2::Socket` which uniquely owned the
         // descriptor; `into_raw_fd` consumed the Socket, so `OwnedFd::from_raw_fd`
@@ -65,7 +94,8 @@ impl DiscoverySocket {
         Ok(Self {
             fd: AsyncFd::new(owned)?,
             group_v4: params.group_v4,
-            port: params.port,
+            port: resolved_port,
+            group_port: params.group_port.unwrap_or(resolved_port),
             codec: SignalCodec,
         })
     }
@@ -99,7 +129,7 @@ impl DiscoverySocket {
         let bytes = signal
             .encode()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let dest = std::net::SocketAddrV4::new(self.group_v4, self.port);
+        let dest = std::net::SocketAddrV4::new(self.group_v4, self.group_port);
         loop {
             let mut guard = self.fd.writable().await?;
             match guard.try_io(|inner| {
@@ -242,7 +272,9 @@ mod tests {
             group_v4: Ipv4Addr::new(224, 0, 0, 117),
             interface_v4: Ipv4Addr::LOCALHOST,
             port,
+            group_port: None,
             multicast_loop: true,
+            join_group: true,
         }
     }
 
@@ -255,13 +287,16 @@ mod tests {
     #[tokio::test]
     async fn two_sockets_can_share_group() {
         // SO_REUSEADDR + SO_REUSEPORT + same multicast group → both join.
-        // This is the configuration used by the loopback integration test
-        // (router and modem both bind the group).
+        // This is the legacy configuration used before M6's discovery
+        // integration test split router (ephemeral, no group join) from
+        // modem (well-known port, group join). Both binds succeed; the
+        // resolved local ports come from the kernel-assigned ephemeral
+        // pool when `port = 0`.
         let params = loopback_params(0);
         let a = DiscoverySocket::bind(&params).unwrap();
         let b = DiscoverySocket::bind(&params).unwrap();
-        assert_eq!(a.local_port(), 0);
-        assert_eq!(b.local_port(), 0);
+        assert_ne!(a.local_port(), 0, "kernel must resolve ephemeral port");
+        assert_ne!(b.local_port(), 0, "kernel must resolve ephemeral port");
     }
 
     #[tokio::test]
@@ -288,7 +323,9 @@ mod tests {
             group_v4: Ipv4Addr::new(224, 0, 0, 117),
             interface_v4: Ipv4Addr::UNSPECIFIED,
             port,
+            group_port: None,
             multicast_loop: true,
+            join_group: true,
         };
         let sender = DiscoverySocket::bind(&params).unwrap();
         let receiver = DiscoverySocket::bind(&params).unwrap();
