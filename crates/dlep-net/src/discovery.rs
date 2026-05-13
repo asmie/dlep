@@ -90,20 +90,109 @@ impl DiscoverySocket {
         self.group_v4
     }
 
-    /// Send a signal to the configured multicast group. **Stub** —
-    /// real implementation lands in Task 6.
-    pub async fn send_to_group(&self, _signal: &Signal) -> io::Result<()> {
-        Err(io::Error::other(
-            "DiscoverySocket::send_to_group not yet implemented (Task 6)",
-        ))
+    /// Send a signal to the configured multicast group. Loops until the
+    /// kernel accepts the datagram (handling `EAGAIN` via tokio's
+    /// `AsyncFd::writable`). Errors propagate as `io::Error`; a short
+    /// `sendto` (which UDP doesn't normally produce) is reported rather
+    /// than silently truncated.
+    pub async fn send_to_group(&self, signal: &Signal) -> io::Result<()> {
+        let bytes = signal
+            .encode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let dest = std::net::SocketAddrV4::new(self.group_v4, self.port);
+        loop {
+            let mut guard = self.fd.writable().await?;
+            match guard.try_io(|inner| {
+                use nix::sys::socket::{MsgFlags, SockaddrIn, sendto};
+                let nix_addr = SockaddrIn::from(dest);
+                sendto(
+                    inner.get_ref().as_raw_fd(),
+                    &bytes,
+                    &nix_addr,
+                    MsgFlags::empty(),
+                )
+                .map_err(io::Error::from)
+            }) {
+                Ok(Ok(n)) if n == bytes.len() => return Ok(()),
+                Ok(Ok(n)) => {
+                    return Err(io::Error::other(format!(
+                        "short sendto: {n}/{}",
+                        bytes.len()
+                    )));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
     }
 
-    /// Receive a single signal with its source address and TTL. **Stub** —
-    /// real implementation lands in Task 6.
+    /// Receive a single signal with its source address and the
+    /// kernel-reported TTL. The TTL comes from an `IP_TTL` cmsg attached
+    /// by the kernel because Task 1 enabled `IP_RECVTTL` on the socket;
+    /// if the cmsg is missing the function returns an error rather than
+    /// guessing (silent guess would defeat GTSM).
     pub async fn recv(&self) -> io::Result<(Signal, SocketAddr, u8)> {
-        Err(io::Error::other(
-            "DiscoverySocket::recv not yet implemented (Task 6)",
-        ))
+        use bytes::BytesMut;
+        use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
+
+        // 1500 ≈ standard Ethernet MTU; DLEP signals fit easily. The
+        // datagram boundary is authoritative, so a fixed buffer is fine.
+        let mut payload = vec![0u8; 1500];
+        // IP_TTL cmsg payload is `int` on Linux (`ControlMessageOwned::Ipv4Ttl(i32)`).
+        // `i32` matches `libc::c_int` on every supported target — using it
+        // here keeps `dlep-net` free of an explicit `libc` dep.
+        let mut cmsg_space = nix::cmsg_space!(i32);
+
+        loop {
+            let mut guard = self.fd.readable().await?;
+            let outcome = guard.try_io(|inner| {
+                let fd = inner.get_ref().as_raw_fd();
+                let mut iov = [std::io::IoSliceMut::new(&mut payload)];
+                let res = recvmsg::<SockaddrStorage>(
+                    fd,
+                    &mut iov,
+                    Some(&mut cmsg_space),
+                    MsgFlags::empty(),
+                )
+                .map_err(io::Error::from)?;
+                let bytes_read = res.bytes;
+                let from: SocketAddr = res
+                    .address
+                    .and_then(|a| {
+                        a.as_sockaddr_in().map(|s| -> SocketAddr {
+                            std::net::SocketAddrV4::new(s.ip(), s.port()).into()
+                        })
+                    })
+                    .ok_or_else(|| io::Error::other("recvmsg without v4 sender"))?;
+                let mut ttl: Option<u8> = None;
+                for cmsg in res.cmsgs().map_err(io::Error::from)? {
+                    if let ControlMessageOwned::Ipv4Ttl(t) = cmsg {
+                        // TTL is a single byte in the IP header; the kernel
+                        // hands it back as `int` (0..=255), so the cast is
+                        // lossless.
+                        ttl = Some(t as u8);
+                    }
+                }
+                Ok::<_, io::Error>((bytes_read, from, ttl))
+            });
+            match outcome {
+                Ok(Ok((bytes_read, from, ttl_opt))) => {
+                    let ttl = ttl_opt.ok_or_else(|| {
+                        io::Error::other(
+                            "recvmsg returned no IP_TTL cmsg — IP_RECVTTL not enabled?",
+                        )
+                    })?;
+                    let buf = BytesMut::from(&payload[..bytes_read]);
+                    let signal = self
+                        .codec
+                        .decode_datagram(buf)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    return Ok((signal, from, ttl));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
     }
 }
 
@@ -136,5 +225,44 @@ mod tests {
         let b = DiscoverySocket::bind(&params).unwrap();
         assert_eq!(a.local_port(), 0);
         assert_eq!(b.local_port(), 0);
+    }
+
+    #[tokio::test]
+    async fn loopback_send_recv_with_ttl_255() {
+        use std::time::Duration;
+
+        use dlep_core::SignalType;
+
+        // High port to minimise collisions.
+        let port = 49_854_u16;
+        // INADDR_ANY (`0.0.0.0`) for the join lets the kernel pick the
+        // default multicast egress interface. On hosts where the loopback
+        // interface lacks the `MULTICAST` link flag (e.g. WSL2 — see
+        // `ip link show lo`), binding the join to `127.0.0.1` would
+        // silently succeed but never deliver datagrams, because the
+        // kernel routes `224.0.0.117` via the default route (typically
+        // `eth0`). Using `UNSPECIFIED` matches the receive interface to
+        // wherever IP_MULTICAST_IF (defaulted by the kernel) sends from,
+        // so the round-trip closes regardless of which interface carries
+        // the traffic. The TTL assertion remains the load-bearing check:
+        // it confirms `set_send_ttl` and `IP_RECVTTL`/cmsg extraction are
+        // wired correctly.
+        let params = DiscoveryParams {
+            group_v4: Ipv4Addr::new(224, 0, 0, 117),
+            interface_v4: Ipv4Addr::UNSPECIFIED,
+            port,
+            multicast_loop: true,
+        };
+        let sender = DiscoverySocket::bind(&params).unwrap();
+        let receiver = DiscoverySocket::bind(&params).unwrap();
+
+        let sig = Signal::new(SignalType::PEER_DISCOVERY);
+        sender.send_to_group(&sig).await.unwrap();
+        let (received, _from, ttl) = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv failed");
+        assert_eq!(received.signal_type, SignalType::PEER_DISCOVERY);
+        assert_eq!(ttl, 255, "GTSM requires outbound TTL=255");
     }
 }
