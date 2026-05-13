@@ -126,6 +126,43 @@ impl DiscoverySocket {
         }
     }
 
+    /// Send a signal to a specific unicast destination (used for modem
+    /// Peer_Offer replies). Like `send_to_group`, but the destination
+    /// address comes from the caller (typically the source address of an
+    /// inbound Peer_Discovery).
+    pub async fn send_unicast(&self, signal: &Signal, dest: SocketAddr) -> io::Result<()> {
+        let bytes = signal
+            .encode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let SocketAddr::V4(dest_v4) = dest else {
+            return Err(io::Error::other("only v4 unicast is supported in M6"));
+        };
+        loop {
+            let mut guard = self.fd.writable().await?;
+            match guard.try_io(|inner| {
+                use nix::sys::socket::{MsgFlags, SockaddrIn, sendto};
+                let nix_addr = SockaddrIn::from(dest_v4);
+                sendto(
+                    inner.get_ref().as_raw_fd(),
+                    &bytes,
+                    &nix_addr,
+                    MsgFlags::empty(),
+                )
+                .map_err(io::Error::from)
+            }) {
+                Ok(Ok(n)) if n == bytes.len() => return Ok(()),
+                Ok(Ok(n)) => {
+                    return Err(io::Error::other(format!(
+                        "short sendto: {n}/{}",
+                        bytes.len()
+                    )));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
     /// Receive a single signal with its source address and the
     /// kernel-reported TTL. The TTL comes from an `IP_TTL` cmsg attached
     /// by the kernel because Task 1 enabled `IP_RECVTTL` on the socket;
