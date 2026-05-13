@@ -38,10 +38,12 @@ impl Default for NetworkConfig {
             discovery_port: DEFAULT_PORT,
             tcp_port: DEFAULT_PORT,
             bind_addr: default_bind_addr(),
-            // Defaults to false until the TLS path is wired end-to-end.
-            // Flip to `true` (matching the RFC recommendation) once rustls
-            // Connector/Acceptor leave the stub stage.
-            use_tls: false,
+            // TLS on by default (RFC 8175 §10 recommendation). Embedders
+            // that need plain TCP must override `use_tls = false` in their
+            // config. Embedders that keep TLS on MUST call
+            // `with_rustls_client` / `with_rustls_server` on the daemon
+            // builder; spawn fails fast otherwise.
+            use_tls: true,
             gtsm_enforce: true,
         }
     }
