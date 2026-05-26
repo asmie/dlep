@@ -25,7 +25,7 @@ pub trait ExtensionCtx {
     fn session_id(&self) -> SessionId;
     fn is_router_side(&self) -> bool;
     fn send_message(&mut self, msg: Message);
-    fn emit_event(&mut self, ev: Box<dyn Any + Send>);
+    fn emit_event(&mut self, ev: Arc<dyn Any + Send + Sync>);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
