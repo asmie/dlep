@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use dlep_core::{
-    DataItem, MIN_HEARTBEAT_INTERVAL_MS, MacAddress, Message, MessageType, StatusCode,
+    DataItem, ExtensionId, MIN_HEARTBEAT_INTERVAL_MS, MacAddress, Message, MessageType, StatusCode,
 };
 
 use crate::events::{DestinationAddrs, FsmAction, LinkMetrics};
@@ -22,6 +22,18 @@ pub struct SessionConfig {
     pub heartbeat_interval_ms: u32,
     pub session_init_timeout: Duration,
     pub termination_timeout: Duration,
+    /// `ExtensionId`s this side announces in the Session Initialization
+    /// / Session Initialization Response `ExtensionsSupported` data item.
+    /// Empty by default — populated by `dlep-daemon` from the registered
+    /// extensions' union of `advertised_ids()`.
+    ///
+    /// Note: this is a snapshot taken at session spawn-time. The daemon
+    /// has no hot-load API for runtime extension registration in M8; an
+    /// extension added to the registry after a session is established
+    /// will NOT appear on the wire for that session — both sides would
+    /// see it as unsupported. A future M-number can add a runtime
+    /// register/renegotiate hook if needed.
+    pub advertised_extensions: Vec<ExtensionId>,
 }
 
 impl Default for SessionConfig {
@@ -31,6 +43,7 @@ impl Default for SessionConfig {
             heartbeat_interval_ms: 60_000,
             session_init_timeout: Duration::from_millis(5_000),
             termination_timeout: Duration::from_millis(1_000),
+            advertised_extensions: Vec::new(),
         }
     }
 }
@@ -80,6 +93,26 @@ pub fn build_heartbeat() -> Message {
 pub fn extract_heartbeat_interval(msg: &Message) -> Option<Duration> {
     msg.data_items.iter().find_map(|item| match item {
         DataItem::HeartbeatInterval(d) => Some(*d),
+        _ => None,
+    })
+}
+
+/// Extract the `ExtensionsSupported` data item from a decoded Session
+/// Initialization or Session Initialization Response message.
+///
+/// Returns:
+/// - `Some(vec)` if the data item is present (the inner vec may be empty
+///   if the peer explicitly advertised zero IDs).
+/// - `None` if the data item is absent (RFC 8175 §13.6: the data item is
+///   optional, and absence semantically means "no extensions advertised"
+///   — but a peer that advertised explicitly is distinguishable from one
+///   that omitted the item, which can matter for interop diagnostics).
+///
+/// Callers that want the "treat absent and empty alike" semantic should
+/// `unwrap_or_default()`.
+pub fn extract_extensions_supported(msg: &Message) -> Option<Vec<ExtensionId>> {
+    msg.data_items.iter().find_map(|item| match item {
+        DataItem::ExtensionsSupported(ids) => Some(ids.clone()),
         _ => None,
     })
 }

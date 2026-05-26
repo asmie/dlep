@@ -8,8 +8,8 @@ use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
     SessionConfig, build_destination_down, build_destination_up, build_destination_update,
     build_heartbeat, build_session_termination, build_session_termination_response,
-    extract_destination_mac, extract_heartbeat_interval, extract_status, heartbeat_reset_action,
-    local_heartbeat_interval,
+    extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
+    extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -47,6 +47,12 @@ pub struct ModemSessionFsm {
     /// [`super::session_router::RouterSessionFsm::peer_heartbeat_interval`]
     /// for the `None`-case semantics.
     pub peer_heartbeat_interval: Option<Duration>,
+    /// Captured from the peer's `Session Initialization Response`
+    /// `ExtensionsSupported` data item at the moment we transition to
+    /// `InSession`. Empty if the peer advertised none. Surfaced via
+    /// `EmittedEvent::SessionUp { peer_extensions }` so the runtime can
+    /// negotiate registered extensions.
+    pub peer_extensions: Vec<dlep_core::ExtensionId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +81,7 @@ impl ModemSessionFsm {
             destinations: HashMap::new(),
             config,
             peer_heartbeat_interval: None,
+            peer_extensions: Vec::new(),
         }
     }
 
@@ -108,6 +115,16 @@ impl ModemSessionFsm {
                 if msg.message_type == MessageType::SESSION_INITIALIZATION =>
             {
                 self.peer_heartbeat_interval = extract_heartbeat_interval(&msg);
+                self.peer_extensions = match extract_extensions_supported(&msg) {
+                    Some(ids) => ids,
+                    None => {
+                        tracing::debug!(
+                            "peer's Session_Initialization omitted ExtensionsSupported \
+                             (RFC 8175 §13.6 optional); treating as no extensions advertised"
+                        );
+                        Vec::new()
+                    }
+                };
                 self.state = ModemSessionState::InSession;
                 let mut actions = vec![
                     FsmAction::CancelTimer(TIMER_SESSION_INIT),
@@ -124,7 +141,9 @@ impl ModemSessionFsm {
                 {
                     actions.push(action);
                 }
-                actions.push(FsmAction::Emit(EmittedEvent::SessionUp));
+                actions.push(FsmAction::Emit(EmittedEvent::SessionUp {
+                    peer_extensions: self.peer_extensions.clone(),
+                }));
                 actions
             }
             (
@@ -375,7 +394,9 @@ fn build_session_initialization_response(config: &SessionConfig) -> Message {
             flags: PeerFlags::default(),
             description: config.peer_description.clone(),
         })
-        .with_item(DataItem::ExtensionsSupported(Vec::new()))
+        .with_item(DataItem::ExtensionsSupported(
+            config.advertised_extensions.clone(),
+        ))
         .with_item(DataItem::Mtu(PLACEHOLDER_MTU))
         .with_item(DataItem::MaxDataRateReceive(PLACEHOLDER_DATA_RATE_BPS))
         .with_item(DataItem::MaxDataRateTransmit(PLACEHOLDER_DATA_RATE_BPS))

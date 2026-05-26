@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use dlep_core::{MacAddress, StatusCode};
-use dlep_ext::{DlepExtension, ExtensionRegistry};
+use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
 use dlep_fsm::session_modem::ModemSessionFsm;
 use dlep_net::{Acceptor, ServerConfig};
 use tokio::net::TcpListener;
@@ -15,7 +15,9 @@ use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, new_event_channel,
 };
-use crate::session::{run_session, session_config_from_timers};
+use crate::session::{
+    SessionIdCounter, new_session_id_counter, run_session, session_config_from_timers,
+};
 
 pub struct ModemDaemon {
     events_tx: EventTx,
@@ -27,6 +29,8 @@ pub struct ModemDaemon {
     listen_task: JoinHandle<()>,
     discovery_shutdown: Mutex<Option<mpsc::Sender<()>>>,
     discovery_task: Mutex<Option<JoinHandle<Result<(), DaemonError>>>>,
+    extensions: ExtensionRegistry,
+    session_id_counter: SessionIdCounter,
 }
 
 impl ModemDaemon {
@@ -163,7 +167,7 @@ impl ModemBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
-        let _ = self.extensions; // M8 hands these to per-session FSMs.
+        let extensions_for_accept = self.extensions.clone();
 
         let bind_addr = SocketAddr::new(cfg.shared.network.bind_addr, cfg.shared.network.tcp_port);
         let listener = TcpListener::bind(bind_addr).await?;
@@ -184,6 +188,7 @@ impl ModemBuilder {
         let session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let session_id_counter = new_session_id_counter();
 
         let listen_task = tokio::spawn(modem_accept_loop(
             acceptor,
@@ -192,6 +197,8 @@ impl ModemBuilder {
             cfg.peer_description.clone(),
             session_cmds.clone(),
             tasks.clone(),
+            extensions_for_accept,
+            session_id_counter.clone(),
         ));
 
         // Discovery: bind the UDP multicast socket and spawn the listener.
@@ -213,6 +220,8 @@ impl ModemBuilder {
             listen_task,
             discovery_shutdown: Mutex::new(discovery_shutdown),
             discovery_task: Mutex::new(discovery_task),
+            extensions: self.extensions,
+            session_id_counter,
         })
     }
 }
@@ -269,6 +278,7 @@ async fn spawn_modem_discovery(
     Ok(Some((tx, handle)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn modem_accept_loop(
     acceptor: Acceptor,
     events_tx: EventTx,
@@ -276,6 +286,8 @@ async fn modem_accept_loop(
     peer_description: String,
     session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    extensions: ExtensionRegistry,
+    session_id_counter: SessionIdCounter,
 ) {
     loop {
         let transport = match acceptor.accept().await {
@@ -299,13 +311,16 @@ async fn modem_accept_loop(
             is_tls: transport.is_tls(),
             peer_description: None,
         };
-        let session_cfg = session_config_from_timers(&timers, peer_description.clone());
+        let advertised = extensions.advertised();
+        let session_cfg = session_config_from_timers(&timers, peer_description.clone(), advertised);
         let fsm = ModemSessionFsm::with_config(session_cfg);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         session_cmds.lock().await.push(cmd_tx);
 
         let events_tx_for_task = events_tx.clone();
+        let extensions_for_task = extensions.clone();
+        let counter_for_task = session_id_counter.clone();
         let handle = tokio::spawn(async move {
             if let Err(e) = run_session(
                 fsm,
@@ -314,6 +329,9 @@ async fn modem_accept_loop(
                 cmd_rx,
                 events_tx_for_task,
                 peer_info,
+                extensions_for_task,
+                Role::Modem,
+                counter_for_task,
             )
             .await
             {

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use dlep_core::StatusCode;
-use dlep_ext::{DlepExtension, ExtensionRegistry};
+use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
 use dlep_fsm::session_router::RouterSessionFsm;
 use dlep_net::{ClientConfig, Connector};
 use tokio::sync::{Mutex, mpsc};
@@ -14,7 +14,9 @@ use crate::events::PeerInfo;
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, new_event_channel,
 };
-use crate::session::{run_session, session_config_from_timers};
+use crate::session::{
+    SessionIdCounter, new_session_id_counter, run_session, session_config_from_timers,
+};
 
 type SessionTaskHandle = JoinHandle<Result<(), DaemonError>>;
 
@@ -36,6 +38,8 @@ pub struct RouterDaemon {
     discovery_task: Mutex<Option<JoinHandle<Result<(), DaemonError>>>>,
     peer_description: String,
     client_tls: Option<Arc<ClientConfig>>,
+    extensions: ExtensionRegistry,
+    session_id_counter: SessionIdCounter,
 }
 
 impl RouterDaemon {
@@ -136,7 +140,9 @@ impl RouterDaemon {
             peer_description: None,
         };
 
-        let session_cfg = session_config_from_timers(&self.timers, self.peer_description.clone());
+        let advertised = self.extensions.advertised();
+        let session_cfg =
+            session_config_from_timers(&self.timers, self.peer_description.clone(), advertised);
         let fsm = RouterSessionFsm::with_config(session_cfg);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
@@ -148,6 +154,9 @@ impl RouterDaemon {
             cmd_rx,
             events_tx,
             peer_info,
+            self.extensions.clone(),
+            Role::Router,
+            self.session_id_counter.clone(),
         ));
 
         self.session_cmds.lock().await.push(cmd_tx);
@@ -221,7 +230,6 @@ impl RouterBuilder {
             .config
             .ok_or_else(|| DaemonError::Config("RouterConfig required".into()))?;
         let (events_tx, _events_rx) = new_event_channel();
-        let _ = self.extensions; // M8 hands these off to the session task.
         Ok(RouterDaemon {
             events_tx,
             timers: cfg.shared.timers.clone(),
@@ -230,8 +238,10 @@ impl RouterBuilder {
             tasks: Arc::new(Mutex::new(Vec::new())),
             discovery_shutdown: Mutex::new(None),
             discovery_task: Mutex::new(None),
+            session_id_counter: new_session_id_counter(),
             peer_description: cfg.peer_description.clone(),
             client_tls: self.client_tls,
+            extensions: self.extensions,
         })
     }
 }

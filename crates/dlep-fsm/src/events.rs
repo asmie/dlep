@@ -1,6 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+pub use dlep_core::LinkMetrics;
 use dlep_core::{MacAddress, Message, Signal, StatusCode};
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -15,23 +16,6 @@ pub enum SendTarget {
     DiscoveryGroup,
     /// Unicast reply to a discovered peer.
     Unicast(std::net::SocketAddr),
-}
-
-/// Metric values reported per destination. Mirrors the RFC 8175 §11.3
-/// metric Data Items (data rates, latency, RLQ, resources, MTU). Lives in
-/// `dlep-fsm` so both the FSM-internal events and the daemon's public API
-/// share one type — `dlep_daemon::LinkMetrics` re-exports this.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LinkMetrics {
-    pub max_data_rate_rx_bps: u64,
-    pub max_data_rate_tx_bps: u64,
-    pub current_data_rate_rx_bps: u64,
-    pub current_data_rate_tx_bps: u64,
-    pub latency: Duration,
-    pub resources: u8,
-    pub rlq_rx: u8,
-    pub rlq_tx: u8,
-    pub mtu: u16,
 }
 
 /// Address / subnet payload accompanying a destination. All four vectors
@@ -126,7 +110,12 @@ pub enum FsmAction {
 /// these into the richer `DaemonEvent` type with full metric payloads.
 #[derive(Debug)]
 pub enum EmittedEvent {
-    SessionUp,
+    SessionUp {
+        /// Extension IDs the peer advertised in `ExtensionsSupported`.
+        /// The daemon intersects with its own advertised set to compute
+        /// `DaemonEvent::SessionUp.negotiated_extensions`.
+        peer_extensions: Vec<dlep_core::ExtensionId>,
+    },
     SessionDown(StatusCode),
     PeerDiscovered {
         addr: std::net::SocketAddr,

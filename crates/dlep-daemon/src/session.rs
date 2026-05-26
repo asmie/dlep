@@ -4,11 +4,18 @@
 //! timer set, and the public event-broadcast handle. The FSM stays
 //! synchronous and tokio-free; everything async lives here.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use dlep_core::StatusCode;
+use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
+use dlep_ext::{
+    DestinationStateSnapshot, DlepExtension, ExtHandled, ExtensionCtx, ExtensionRegistry, Role,
+    SessionId, SessionStateSnapshot,
+};
 use dlep_fsm::events::EmittedEvent;
 use dlep_fsm::{FsmAction, FsmEvent, SessionConfig, TimerId, TimerKind};
 use dlep_net::{MessageCodec, Transport};
@@ -22,6 +29,55 @@ use crate::config::TimersConfig;
 use crate::events::{DaemonEvent, PeerInfo};
 use crate::runtime::{COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionCommand};
 
+/// Per-daemon monotonic counter for `SessionId`. Each daemon constructs
+/// its own `Arc<AtomicU64>` and passes it into every `run_session` call;
+/// two daemons sharing a process have independent id-spaces, and
+/// extensions that key state on `SessionId` see a single contiguous
+/// id-space per daemon instead of a process-wide counter.
+pub type SessionIdCounter = Arc<AtomicU64>;
+
+pub fn new_session_id_counter() -> SessionIdCounter {
+    Arc::new(AtomicU64::new(1))
+}
+
+fn next_session_id(counter: &SessionIdCounter) -> SessionId {
+    SessionId(counter.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Per-hook-call context handed to extensions. Captures references to the
+/// session task's mutable state so the extension can queue outbound
+/// messages (drained to the writer once the hook returns) and emit
+/// application-level events on the broadcast channel.
+///
+/// Constructed fresh on every hook call; never held across `.await`.
+struct SessionCtx<'a> {
+    session_id: SessionId,
+    is_router_side: bool,
+    pending_sends: &'a mut Vec<Message>,
+    events_tx: &'a EventTx,
+}
+
+impl<'a> ExtensionCtx for SessionCtx<'a> {
+    fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+    fn is_router_side(&self) -> bool {
+        self.is_router_side
+    }
+    fn send_message(&mut self, msg: Message) {
+        self.pending_sends.push(msg);
+    }
+    fn emit_event(&mut self, ev: Arc<dyn Any + Send + Sync>) {
+        // `broadcast::Sender::send` returns `Err(SendError)` when there
+        // are zero subscribers — the event is lost. Log at debug so an
+        // extension that emits before any `daemon.subscribe()` call can
+        // diagnose silent drops in production.
+        if self.events_tx.send(DaemonEvent::Extension(ev)).is_err() {
+            debug!("extension emit_event dropped: no broadcast subscribers");
+        }
+    }
+}
+
 /// Hydrate a `SessionConfig` from the daemon-level `TimersConfig` and a
 /// per-role peer description. Centralised here (not on `SessionConfig`
 /// itself) because `dlep-fsm` deliberately doesn't depend on `dlep-daemon`,
@@ -29,12 +85,14 @@ use crate::runtime::{COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionComm
 pub fn session_config_from_timers(
     timers: &TimersConfig,
     peer_description: String,
+    advertised_extensions: Vec<dlep_core::ExtensionId>,
 ) -> SessionConfig {
     SessionConfig {
         peer_description,
         heartbeat_interval_ms: timers.heartbeat_interval_ms,
         session_init_timeout: Duration::from_millis(timers.session_init_timeout_ms.into()),
         termination_timeout: Duration::from_millis(timers.termination_timeout_ms.into()),
+        advertised_extensions,
     }
 }
 
@@ -163,6 +221,11 @@ impl Drop for TimerSet {
 /// `FsmEvent::TcpConnected` for router-side, `FsmEvent::TcpAccepted` for
 /// modem-side. The runtime processes the resulting actions (Session Init
 /// send, timer start) before awaiting any new I/O.
+///
+/// `role` is explicit (not derived from `initial_event`) so future code
+/// paths that use a different startup event for one role can't silently
+/// mislabel the session.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_session<F: SessionFsm>(
     mut fsm: F,
     transport: Box<dyn Transport>,
@@ -170,10 +233,18 @@ pub async fn run_session<F: SessionFsm>(
     mut commands: mpsc::Receiver<SessionCommand>,
     events_tx: EventTx,
     peer: PeerInfo,
+    extensions: ExtensionRegistry,
+    role: Role,
+    session_id_counter: SessionIdCounter,
 ) -> Result<(), DaemonError> {
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut read_buf = BytesMut::with_capacity(4096);
     let mut codec = MessageCodec;
+
+    let session_id = next_session_id(&session_id_counter);
+    let is_router_side = role.is_router();
+    let mut active_exts: Vec<Arc<dyn DlepExtension>> = Vec::new();
+    let mut pending_sends: Vec<Message> = Vec::new();
 
     let (timer_expiry_tx, mut timer_expiry_rx) =
         mpsc::channel::<(TimerId, TimerKind, u64)>(COMMAND_CHANNEL_CAPACITY);
@@ -188,6 +259,11 @@ pub async fn run_session<F: SessionFsm>(
         &timer_expiry_tx,
         &events_tx,
         &peer,
+        &extensions,
+        session_id,
+        is_router_side,
+        &mut active_exts,
+        &mut pending_sends,
     )
     .await?
     {
@@ -207,11 +283,77 @@ pub async fn run_session<F: SessionFsm>(
             read_result = read_frame(&mut reader, &mut read_buf, &mut codec) => {
                 match read_result? {
                     FrameRead::Message(msg) => {
+                        let mt = msg.message_type;
+                        let is_known = is_known_message_type(mt);
+                        // Clone before move-into-FSM so post-step extension
+                        // dispatch can introspect `DataItem::Unknown` items.
+                        let items_for_dispatch = msg.data_items.clone();
+
+                        // ALWAYS feed the message to the FSM. The FSM's
+                        // InSession catch-all resets the missed-heartbeat
+                        // deadline (RFC 8175 §11.2 — *any* received message
+                        // resets it, extension messages included); the
+                        // pre-InSession defensive arms abort on any
+                        // unexpected MessageType (RFC §7.2). Without this,
+                        // unknown-type traffic would silently bypass both
+                        // rules.
                         let actions = fsm.step(FsmEvent::RecvMessage(msg));
-                        if process_actions(
+                        let close = process_actions(
                             actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer,
-                        ).await? {
+                            &extensions, session_id, is_router_side,
+                            &mut active_exts, &mut pending_sends,
+                        ).await?;
+
+                        if !close {
+                            // For unknown MessageTypes, the whole-message
+                            // hook gets first refusal. A `Handled` return
+                            // means the extension claims the entire
+                            // message (items included) — so we MUST skip
+                            // per-item dispatch, otherwise the same
+                            // extension would fire twice on the same
+                            // payload and emit duplicate events.
+                            //
+                            // For known MessageTypes the FSM consumed
+                            // the message; the per-item hook still runs
+                            // for forward-compat `DataItem::Unknown`
+                            // items the FSM didn't itself interpret.
+                            let whole_message_handled = if !is_known {
+                                dispatch_unknown_message(
+                                    &active_exts,
+                                    session_id,
+                                    is_router_side,
+                                    &mut pending_sends,
+                                    &events_tx,
+                                    mt,
+                                    &items_for_dispatch,
+                                )
+                            } else {
+                                false
+                            };
+                            if !whole_message_handled {
+                                dispatch_unknown_items(
+                                    &active_exts,
+                                    session_id,
+                                    is_router_side,
+                                    &mut pending_sends,
+                                    &events_tx,
+                                    mt,
+                                    &items_for_dispatch,
+                                );
+                            }
+                            // Log-and-continue: a write failure here
+                            // shouldn't suppress already-broadcast lifecycle
+                            // events. The session loop will detect the
+                            // wire-side failure on the next read/write.
+                            if let Err(e) = flush_pending_sends(
+                                &mut pending_sends, &mut writer,
+                            ).await {
+                                debug!("flush_pending_sends after RecvMessage: {e}");
+                            }
+                        }
+
+                        if close {
                             break;
                         }
                     }
@@ -220,6 +362,8 @@ pub async fn run_session<F: SessionFsm>(
                         let _ = process_actions(
                             actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer,
+                            &extensions, session_id, is_router_side,
+                            &mut active_exts, &mut pending_sends,
                         ).await?;
                         break;
                     }
@@ -253,6 +397,8 @@ pub async fn run_session<F: SessionFsm>(
                 if process_actions(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
+                    &extensions, session_id, is_router_side,
+                    &mut active_exts, &mut pending_sends,
                 ).await? {
                     break;
                 }
@@ -277,6 +423,8 @@ pub async fn run_session<F: SessionFsm>(
                 if process_actions(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
+                    &extensions, session_id, is_router_side,
+                    &mut active_exts, &mut pending_sends,
                 ).await? {
                     break;
                 }
@@ -311,6 +459,7 @@ async fn read_frame<R: AsyncReadExt + Unpin>(
 /// Drain a batch of `FsmAction`s into real I/O / state mutations. Returns
 /// `Ok(true)` if the FSM asked to close the connection (the caller should
 /// break out of the select loop).
+#[allow(clippy::too_many_arguments)]
 async fn process_actions(
     actions: Vec<FsmAction>,
     writer: &mut WriteHalf<Box<dyn Transport>>,
@@ -318,6 +467,11 @@ async fn process_actions(
     timer_expiry_tx: &mpsc::Sender<(TimerId, TimerKind, u64)>,
     events_tx: &EventTx,
     peer: &PeerInfo,
+    extensions: &ExtensionRegistry,
+    session_id: SessionId,
+    is_router_side: bool,
+    active_exts: &mut Vec<Arc<dyn DlepExtension>>,
+    pending_sends: &mut Vec<Message>,
 ) -> Result<bool, DaemonError> {
     let mut close = false;
     for action in actions {
@@ -387,8 +541,86 @@ async fn process_actions(
                 close = true;
             }
             FsmAction::Emit(emitted) => {
-                if let Some(daemon_event) = translate_emitted(emitted, peer) {
+                // 1. Negotiate active_exts BEFORE translate_emitted so the
+                //    public `negotiated_extensions` reflects extensions
+                //    that actually accepted negotiation (not just the wire
+                //    intersection).
+                if let EmittedEvent::SessionUp { peer_extensions } = &emitted {
+                    *active_exts = extensions.negotiate(peer_extensions);
+                }
+
+                // 2. Broadcast the public lifecycle event FIRST so
+                //    subscribers see e.g. `SessionUp` before any
+                //    `DaemonEvent::Extension` an extension hook may emit
+                //    in response, and so `SessionDown` is always delivered
+                //    even if a subsequent flush errors on a closed socket.
+                if let Some(daemon_event) = translate_emitted(&emitted, peer, active_exts) {
                     let _ = events_tx.send(daemon_event);
+                }
+
+                // 3. Now drive the extension lifecycle hooks. Their queued
+                //    wire messages and emitted events arrive AFTER the
+                //    public lifecycle event.
+                match &emitted {
+                    EmittedEvent::SessionUp { .. } => {
+                        dispatch_session_state(
+                            active_exts,
+                            session_id,
+                            is_router_side,
+                            pending_sends,
+                            events_tx,
+                            true,
+                        );
+                    }
+                    EmittedEvent::SessionDown(_) => {
+                        dispatch_session_state(
+                            active_exts,
+                            session_id,
+                            is_router_side,
+                            pending_sends,
+                            events_tx,
+                            false,
+                        );
+                        // Session is over: clear active_exts so any
+                        // further FSM emits in the same batch (or stray
+                        // events) don't dispatch to extensions that
+                        // already saw `up=false`.
+                        active_exts.clear();
+                    }
+                    EmittedEvent::DestinationUp { mac, metrics, .. } => {
+                        dispatch_destination_state(
+                            active_exts,
+                            session_id,
+                            is_router_side,
+                            pending_sends,
+                            events_tx,
+                            *mac,
+                            true,
+                            Some(*metrics),
+                            StatusCode::SUCCESS,
+                        );
+                    }
+                    EmittedEvent::DestinationDown { mac, reason } => {
+                        dispatch_destination_state(
+                            active_exts,
+                            session_id,
+                            is_router_side,
+                            pending_sends,
+                            events_tx,
+                            *mac,
+                            false,
+                            None,
+                            *reason,
+                        );
+                    }
+                    _ => {}
+                }
+
+                // 4. Flush extension-queued wire messages. Log errors
+                //    instead of propagating so a closed-socket failure
+                //    doesn't drop the FSM batch mid-iteration.
+                if let Err(e) = flush_pending_sends(pending_sends, writer).await {
+                    debug!("flush_pending_sends after Emit: {e}");
                 }
             }
         }
@@ -399,48 +631,226 @@ async fn process_actions(
     Ok(close)
 }
 
-fn translate_emitted(emitted: EmittedEvent, peer: &PeerInfo) -> Option<DaemonEvent> {
+fn translate_emitted(
+    emitted: &EmittedEvent,
+    peer: &PeerInfo,
+    active_exts: &[Arc<dyn DlepExtension>],
+) -> Option<DaemonEvent> {
     use crate::events::{DestinationEvent, DestinationId};
     match emitted {
-        EmittedEvent::SessionUp => Some(DaemonEvent::SessionUp {
-            peer: peer.clone(),
-            negotiated_extensions: Vec::new(),
-        }),
-        EmittedEvent::SessionDown(reason) => Some(DaemonEvent::SessionDown { reason }),
+        EmittedEvent::SessionUp { peer_extensions } => {
+            let negotiated = negotiated_from_active(active_exts, peer_extensions);
+            Some(DaemonEvent::SessionUp {
+                peer: peer.clone(),
+                negotiated_extensions: negotiated,
+            })
+        }
+        EmittedEvent::SessionDown(reason) => Some(DaemonEvent::SessionDown { reason: *reason }),
         EmittedEvent::PeerDiscovered {
             addr,
             peer_description,
             use_tls,
         } => Some(DaemonEvent::PeerDiscovered(PeerInfo {
-            addr,
-            is_tls: use_tls,
-            peer_description,
+            addr: *addr,
+            is_tls: *use_tls,
+            peer_description: peer_description.clone(),
         })),
         EmittedEvent::DestinationUp {
             mac,
             metrics,
             addrs,
         } => Some(DaemonEvent::Destination(DestinationEvent::Up {
-            id: DestinationId(mac),
-            metrics,
-            v4_addrs: addrs.v4,
-            v6_addrs: addrs.v6,
-            v4_subnets: addrs.v4_subnets,
-            v6_subnets: addrs.v6_subnets,
+            id: DestinationId(*mac),
+            metrics: *metrics,
+            v4_addrs: addrs.v4.clone(),
+            v6_addrs: addrs.v6.clone(),
+            v4_subnets: addrs.v4_subnets.clone(),
+            v6_subnets: addrs.v6_subnets.clone(),
         })),
         EmittedEvent::DestinationUpdate { mac, metrics } => {
             Some(DaemonEvent::Destination(DestinationEvent::Update {
-                id: DestinationId(mac),
-                metrics,
+                id: DestinationId(*mac),
+                metrics: *metrics,
             }))
         }
         EmittedEvent::DestinationDown { mac, reason } => {
             Some(DaemonEvent::Destination(DestinationEvent::Down {
-                id: DestinationId(mac),
-                reason,
+                id: DestinationId(*mac),
+                reason: *reason,
             }))
         }
     }
+}
+
+/// Compute the public `negotiated_extensions` set: the IDs advertised by
+/// extensions that accepted negotiation (i.e. whose `on_negotiated()`
+/// returned `true` and thus survived into `active_exts`), restricted to
+/// IDs the peer also advertised. Sorted-deduped for determinism.
+///
+/// This is intentionally NOT the raw wire-intersection of advertised IDs
+/// — an extension that returns `false` from `on_negotiated` is inert for
+/// the rest of the session, so its IDs must NOT appear in the public
+/// negotiated set even if both sides advertised them on the wire.
+fn negotiated_from_active(
+    active_exts: &[Arc<dyn DlepExtension>],
+    peer_extensions: &[dlep_core::ExtensionId],
+) -> Vec<dlep_core::ExtensionId> {
+    let mut out: Vec<dlep_core::ExtensionId> = active_exts
+        .iter()
+        .flat_map(|e| e.advertised_ids().iter().copied())
+        .filter(|id| peer_extensions.contains(id))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `true` if the wire `MessageType` is one the core FSM has a typed arm
+/// for. Any MessageType returning `false` here is dispatched to extensions
+/// via `on_unknown_message` in *addition* to being fed to the FSM (whose
+/// catch-all still resets the missed-heartbeat deadline).
+///
+/// DESTINATION_ANNOUNCE / DESTINATION_ANNOUNCE_RESPONSE /
+/// LINK_CHARACTERISTICS_REQUEST / LINK_CHARACTERISTICS_RESPONSE are RFC
+/// 8175 message types but the FSM has no typed arm for them (deferred);
+/// they go to extensions so a plug-in can implement them without
+/// modifying the core FSM.
+fn is_known_message_type(mt: MessageType) -> bool {
+    matches!(
+        mt,
+        MessageType::SESSION_INITIALIZATION
+            | MessageType::SESSION_INITIALIZATION_RESPONSE
+            | MessageType::SESSION_UPDATE
+            | MessageType::SESSION_UPDATE_RESPONSE
+            | MessageType::SESSION_TERMINATION
+            | MessageType::SESSION_TERMINATION_RESPONSE
+            | MessageType::DESTINATION_UP
+            | MessageType::DESTINATION_UP_RESPONSE
+            | MessageType::DESTINATION_DOWN
+            | MessageType::DESTINATION_DOWN_RESPONSE
+            | MessageType::DESTINATION_UPDATE
+            | MessageType::HEARTBEAT
+    )
+}
+
+/// Walk the active-extensions list with `on_unknown_message`. Stops at
+/// the first `ExtHandled::Handled` (extensions earlier in the list win).
+/// Returns `true` if any extension claimed the message.
+fn dispatch_unknown_message(
+    active_exts: &[Arc<dyn DlepExtension>],
+    session_id: SessionId,
+    is_router_side: bool,
+    pending_sends: &mut Vec<Message>,
+    events_tx: &EventTx,
+    message_type: MessageType,
+    items: &[DataItem],
+) -> bool {
+    for ext in active_exts {
+        let mut ctx = SessionCtx {
+            session_id,
+            is_router_side,
+            pending_sends,
+            events_tx,
+        };
+        if let ExtHandled::Handled = ext.on_unknown_message(message_type, items, &mut ctx) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk the active-extensions list with `on_unknown_data_item` for every
+/// `DataItem::Unknown` variant in the message. Stops at first `Handled`
+/// per item. Side effects accumulate into `pending_sends` / `events_tx`.
+fn dispatch_unknown_items(
+    active_exts: &[Arc<dyn DlepExtension>],
+    session_id: SessionId,
+    is_router_side: bool,
+    pending_sends: &mut Vec<Message>,
+    events_tx: &EventTx,
+    in_message: MessageType,
+    items: &[DataItem],
+) {
+    for item in items {
+        let DataItem::Unknown(raw) = item else {
+            continue;
+        };
+        for ext in active_exts {
+            let mut ctx = SessionCtx {
+                session_id,
+                is_router_side,
+                pending_sends,
+                events_tx,
+            };
+            if let ExtHandled::Handled = ext.on_unknown_data_item(in_message, raw, &mut ctx) {
+                break;
+            }
+        }
+    }
+}
+
+fn dispatch_session_state(
+    active_exts: &[Arc<dyn DlepExtension>],
+    session_id: SessionId,
+    is_router_side: bool,
+    pending_sends: &mut Vec<Message>,
+    events_tx: &EventTx,
+    up: bool,
+) {
+    let snap = SessionStateSnapshot { up };
+    for ext in active_exts {
+        let mut ctx = SessionCtx {
+            session_id,
+            is_router_side,
+            pending_sends,
+            events_tx,
+        };
+        ext.on_session_state(snap, &mut ctx);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_destination_state(
+    active_exts: &[Arc<dyn DlepExtension>],
+    session_id: SessionId,
+    is_router_side: bool,
+    pending_sends: &mut Vec<Message>,
+    events_tx: &EventTx,
+    mac: MacAddress,
+    up: bool,
+    metrics: Option<dlep_core::LinkMetrics>,
+    last_status: StatusCode,
+) {
+    let snap = DestinationStateSnapshot {
+        up,
+        last_status,
+        metrics,
+    };
+    for ext in active_exts {
+        let mut ctx = SessionCtx {
+            session_id,
+            is_router_side,
+            pending_sends,
+            events_tx,
+        };
+        ext.on_destination_state(mac, snap, &mut ctx);
+    }
+}
+
+/// Encode and write every extension-queued message in `pending_sends` to
+/// `writer`. On the first encode or write error, returns Err with the
+/// remaining (un-iterated) messages **discarded** via `Drain`'s `Drop` —
+/// callers must treat the post-failure session as terminating, since the
+/// truncated queue cannot be recovered.
+async fn flush_pending_sends(
+    pending_sends: &mut Vec<Message>,
+    writer: &mut WriteHalf<Box<dyn Transport>>,
+) -> Result<(), DaemonError> {
+    for msg in pending_sends.drain(..) {
+        let bytes = msg.encode()?;
+        writer.write_all(&bytes).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

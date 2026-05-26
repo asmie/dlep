@@ -12,6 +12,7 @@ pub mod error;
 pub mod ids;
 pub mod mac;
 pub mod message;
+pub mod metrics;
 pub mod signal;
 pub mod status;
 
@@ -20,6 +21,7 @@ pub use error::{CodecError, ExpectedLen};
 pub use ids::{DataItemType, ExtensionId, MessageType, SignalType};
 pub use mac::MacAddress;
 pub use message::Message;
+pub use metrics::LinkMetrics;
 pub use signal::Signal;
 pub use status::StatusCode;
 

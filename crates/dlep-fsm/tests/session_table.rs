@@ -192,7 +192,7 @@ fn router_session_init_pending_to_in_session_on_success_response() {
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::SessionUp)))
+            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::SessionUp { .. })))
     );
     assert_eq!(
         fsm.peer_heartbeat_interval,
@@ -210,7 +210,7 @@ fn router_session_init_pending_to_terminated_on_terminate_status() {
     assert_eq!(fsm.state(), RouterSessionState::InSession);
     assert!(matches!(
         actions.last().unwrap(),
-        FsmAction::Emit(EmittedEvent::SessionUp)
+        FsmAction::Emit(EmittedEvent::SessionUp { .. })
     ));
 
     let mut fsm = router_at(RouterSessionState::SessionInitPending);
@@ -537,7 +537,7 @@ fn modem_awaiting_session_init_to_in_session_on_session_init_message() {
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::SessionUp)))
+            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::SessionUp { .. })))
     );
     assert_eq!(
         fsm.peer_heartbeat_interval,

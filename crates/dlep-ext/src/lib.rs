@@ -12,12 +12,34 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use dlep_core::{DataItem, ExtensionId, MacAddress, Message, MessageType, RawDataItem, StatusCode};
+use dlep_core::{
+    DataItem, ExtensionId, LinkMetrics, MacAddress, Message, MessageType, RawDataItem, StatusCode,
+};
 
 /// Opaque session identifier produced by the runtime. `Copy`-cheap for
-/// passing into hooks.
+/// passing into hooks. The runtime mints these per-daemon (not
+/// process-wide), so two daemons sharing one process have independent
+/// id-spaces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SessionId(pub u64);
+
+/// Which side of the DLEP protocol a session is on. Set explicitly by the
+/// daemon when spawning a session task so extensions can reason about
+/// directionality without deriving it from the initial FSM event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Role {
+    Router,
+    Modem,
+}
+
+impl Role {
+    pub fn is_router(self) -> bool {
+        matches!(self, Role::Router)
+    }
+    pub fn is_modem(self) -> bool {
+        matches!(self, Role::Modem)
+    }
+}
 
 /// Context handed to every hook. Extensions may queue outbound messages and
 /// emit opaque application-level events, but cannot mutate FSM state.
@@ -44,7 +66,14 @@ pub struct SessionStateSnapshot {
 #[derive(Clone, Copy, Debug)]
 pub struct DestinationStateSnapshot {
     pub up: bool,
+    /// Last status the FSM saw for this destination. `SUCCESS` on `Up`;
+    /// the inbound reason on `Down`.
     pub last_status: StatusCode,
+    /// Wire-reported link metrics. `Some(_)` on `Up`; `None` on `Down`
+    /// (RFC 8175's `Destination_Down` carries no metric Data Items).
+    /// Extensions that want richer per-destination context (addresses,
+    /// subnets) should subscribe to `DaemonEvent::Destination` directly.
+    pub metrics: Option<LinkMetrics>,
 }
 
 /// Extension plug-in trait. All hooks have default empty implementations so a
