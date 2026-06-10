@@ -100,6 +100,10 @@ async fn main() -> Result<()> {
 
     match mode {
         DiscoveryMode::Static => {
+            anyhow::ensure!(
+                !static_peers.is_empty(),
+                "mode = \"static\" requires at least one entry in static_peers"
+            );
             for peer in &static_peers {
                 daemon
                     .connect_static(*peer)
@@ -126,9 +130,11 @@ async fn main() -> Result<()> {
 /// them (deduplicated by address) and log session lifecycle.
 async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent>) {
     let mut connected: HashSet<SocketAddr> = HashSet::new();
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return,
+            _ = &mut ctrl_c => return,
             evt = events.recv() => match evt {
                 Ok(DaemonEvent::PeerDiscovered(peer)) => {
                     if !connected.insert(peer.addr) {
@@ -136,7 +142,7 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                     }
                     tracing::info!(addr = %peer.addr, "modem discovered; connecting");
                     if let Err(e) = daemon.connect_static(peer.addr).await {
-                        tracing::warn!(addr = %peer.addr, "connect failed: {e}");
+                        tracing::warn!(addr = %peer.addr, error = %e, "connect failed");
                         connected.remove(&peer.addr);
                     }
                 }
