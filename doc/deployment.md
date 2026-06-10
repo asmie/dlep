@@ -79,6 +79,8 @@ edit with `--check-config`.
 | top level (router) | `static_peers` | `[]` | modem `addr:port` list for static mode |
 | top level | `peer_description` | binary name | Peer Type data item text |
 | `[network]` | `interface` | none | discovery interface override |
+| `[network]` | `discovery_v4_group` | `224.0.0.117` | IPv4 discovery multicast group |
+| `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (reserved; discovery is IPv4-only today) |
 | `[network]` | `discovery_port` | `854` | UDP discovery port |
 | `[network]` | `tcp_port` | `854` | TCP/TLS session port |
 | `[network]` | `bind_addr` | `0.0.0.0` | modem listener bind address |
@@ -89,6 +91,8 @@ edit with `--check-config`.
 | `[tls]` | `require_client_cert` | `false` | modem requires router client certs |
 | `[timers]` | `heartbeat_interval_ms` | `60000` | RFC 8175 heartbeat interval |
 | `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval |
+| `[timers]` | `session_init_timeout_ms` | `5000` | deadline for Session Initialization Response |
+| `[timers]` | `termination_timeout_ms` | `1000` | deadline for Session Termination Response |
 
 CLI flags override the file: `--interface`, `--no-tls`, `--cert`, `--key`,
 `--ca-bundle`, and (router) `--peer ADDR` (repeatable; implies static mode).
@@ -149,12 +153,13 @@ trace|debug|info|warn|error` or the `DLEP_LOG` env var (add
 |---|---|
 | `tls.ca_bundle is required when use_tls = true` | Router with TLS on but no trust roots. Set `[tls] ca_bundle` or pass `--ca-bundle`. |
 | `tls.cert is required on the modem (server) side…` | Modem with TLS on but no identity. Set `[tls] cert` + `key`. |
+| `tls.key is required on the modem (server) side…` | Modem with a cert but no private key. Set `[tls] key`. |
 | `tls.require_client_cert = true requires tls.ca_bundle` | The modem can't verify client certs without roots. |
 | `tls.cert and tls.key must be set together; only … is set` | One half of the identity is missing (check both TOML and CLI overrides). |
 | `failed to read TLS material from <path>` | Path wrong, or the service user can't read it (keys should be `root:dlep` mode `0640`; is the path under the unit's `ReadOnlyPaths`?). |
 | `<path> contains no PEM certificates` | File exists but isn't PEM (`openssl x509 -in <path> -noout` to check). |
 | `rustls rejected the TLS material from …` | Cert/key mismatch or corrupt PEM payload; the message names the field and file. |
-| `use_tls = true requires RouterBuilder::with_rustls_client(...)` | Library embedder didn't supply a rustls config — binaries never hit this. |
+| `use_tls = true requires RouterBuilder::with_rustls_client(...)` / `…ModemBuilder::with_rustls_server(...)` | Library embedder didn't supply a rustls config — binaries never hit this. |
 | TLS handshake fails with certificate errors | Modem cert SAN doesn't contain the IP the router dialed, or peers disagree about the CA. |
 | `M6 discovery only supports v4 bind_addr` | Discovery mode with an IPv6 `bind_addr` passes `--check-config` but fails at startup; use an IPv4 `bind_addr` or static mode. |
 | Discovery finds nothing | Peers more than one hop apart (GTSM), multicast blocked, or wrong `interface`. Try static mode (`--peer`) to isolate. |
