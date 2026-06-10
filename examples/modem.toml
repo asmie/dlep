@@ -1,0 +1,30 @@
+# dlep-modem example configuration.
+# Copy to /etc/dlep/modem.toml and adjust paths and addresses.
+# See doc/deployment.md for the full walkthrough.
+
+# Free-text description sent in the Peer Type data item.
+peer_description = "dlep-modem"
+
+[network]
+# Address the TCP listener binds to; 0.0.0.0 means all interfaces.
+bind_addr = "0.0.0.0"
+# DLEP well-known port is 854 (UDP for discovery, TCP for the session).
+# Ports below 1024 need CAP_NET_BIND_SERVICE — see doc/deployment.md.
+discovery_port = 854
+tcp_port = 854
+# TLS is on by default per the RFC's security guidance. With use_tls = true
+# the [tls] section below is required.
+use_tls = true
+
+[tls]
+# Server certificate + key presented to routers (required with TLS).
+# The certificate's SAN must contain the IP routers connect to.
+cert = "/etc/dlep/pki/modem.pem"
+key = "/etc/dlep/pki/modem.key"
+# Require routers to present a client certificate signed by this CA
+# (mutual TLS — recommended).
+require_client_cert = true
+ca_bundle = "/etc/dlep/pki/ca.pem"
+
+[timers]
+heartbeat_interval_ms = 60000

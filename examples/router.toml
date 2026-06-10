@@ -1,0 +1,35 @@
+# dlep-router example configuration.
+# Copy to /etc/dlep/router.toml and adjust paths and addresses.
+# See doc/deployment.md for the full walkthrough.
+
+# How the router finds its modem:
+#   "discovery" — RFC 8175 UDP multicast Peer Discovery (default)
+#   "static"    — connect directly to the addresses in static_peers
+mode = "discovery"
+# static_peers = ["192.0.2.10:854"]
+
+# Free-text description sent in the Peer Type data item.
+peer_description = "dlep-router"
+
+[network]
+# Interface used for multicast discovery. Omit to use bind_addr's default.
+# interface = "eth0"
+# DLEP well-known port is 854 (UDP for discovery, TCP for the session).
+# Ports below 1024 need CAP_NET_BIND_SERVICE — see doc/deployment.md.
+discovery_port = 854
+tcp_port = 854
+# TLS is on by default per the RFC's security guidance. With use_tls = true
+# the [tls] section below is required.
+use_tls = true
+
+[tls]
+# CA bundle used to verify the modem's certificate (required with TLS).
+ca_bundle = "/etc/dlep/pki/ca.pem"
+# Client certificate + key presented to the modem. Required if the modem
+# sets require_client_cert = true; omit both for server-only TLS.
+cert = "/etc/dlep/pki/router.pem"
+key = "/etc/dlep/pki/router.key"
+
+[timers]
+heartbeat_interval_ms = 60000
+discovery_interval_ms = 5000

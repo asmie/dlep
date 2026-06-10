@@ -1,0 +1,25 @@
+[Unit]
+Description=DLEP modem-side daemon (RFC 8175)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/dlep-modem --config /etc/dlep/modem.toml
+Restart=on-failure
+RestartSec=2
+
+# Port 854 is privileged; grant only the bind capability.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/dlep
+
+[Install]
+WantedBy=multi-user.target
