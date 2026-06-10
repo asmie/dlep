@@ -14,10 +14,15 @@ pub mod runtime;
 pub mod session;
 pub mod tls;
 
-pub use cli::{ConfigLoadError, load_toml_config};
-pub use config::{ModemConfig, NetworkConfig, RouterConfig, SharedConfig, TimersConfig, TlsConfig};
+pub use cli::{
+    ConfigCheckError, ConfigLoadError, check_modem_config, check_router_config, load_toml_config,
+};
+pub use config::{
+    DiscoveryMode, ModemConfig, NetworkConfig, RouterConfig, SharedConfig, TimersConfig, TlsConfig,
+};
 pub use events::{
     DaemonEvent, DestinationEvent, DestinationId, LinkMetrics, MetricsEvent, PeerInfo,
 };
 pub use modem::{ModemBuilder, ModemDaemon};
 pub use router::{RouterBuilder, RouterDaemon};
+pub use tls::TlsSetupError;
