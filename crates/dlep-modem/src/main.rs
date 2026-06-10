@@ -62,6 +62,8 @@ async fn main() -> Result<()> {
     tracing::info!(
         peer = %config.peer_description,
         tls = config.shared.network.use_tls,
+        interface = ?config.shared.network.interface,
+        port = config.shared.network.tcp_port,
         "starting dlep-modem"
     );
 

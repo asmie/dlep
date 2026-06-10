@@ -139,16 +139,25 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 
 ### 4.6 `dlep-router` and `dlep-modem`
 
-Thin binaries (~70 lines each). Each one:
+Thin binaries. Each one:
 
-1. Parses CLI flags via `clap` (`--config`, `--interface`, `--log-level`, `--no-tls`).
-2. Initialises `tracing-subscriber` (with a stderr warning if the requested log level is invalid).
-3. Loads configuration via `dlep_daemon::load_toml_config`.
-4. Applies CLI overrides (`apply_overrides`).
-5. Builds and spawns the daemon.
-6. Awaits SIGINT, then calls `daemon.shutdown().await`.
-
-The two binaries differ only in their `Daemon` / `Config` types and in CLI doc strings.
+1. Parses CLI flags via `clap` (`--config`, `--interface`, `--log-level`,
+   `--no-tls`, `--cert`, `--key`, `--ca-bundle`, `--check-config`; the
+   router also takes repeatable `--peer ADDR`, which implies static mode).
+2. Initialises `tracing-subscriber` (with a stderr warning if the requested
+   log level is invalid).
+3. Loads configuration via `dlep_daemon::load_toml_config` and applies CLI
+   overrides (`apply_overrides`).
+4. With `--check-config`: runs `check_router_config` / `check_modem_config`
+   (TOML shape, static peers, TLS material) and exits.
+5. When `use_tls` is on, builds the rustls config from the `[tls]` section
+   via `dlep_daemon::tls::{client_config, server_config}` and hands it to
+   the builder.
+6. Builds and spawns the daemon. The router then starts discovery (or
+   connects to its static peers) and runs an event loop that connects to
+   modems as `PeerDiscovered` arrives (deduplicated by address) and logs
+   session lifecycle; the modem's accept loop starts on `spawn`.
+7. Awaits SIGINT, then calls `daemon.shutdown().await`.
 
 ---
 
@@ -322,7 +331,7 @@ The intended order of further work is:
 6. UDP multicast discovery, including GTSM cmsg handling. **Done (M6)** — IPv4 multicast group join, `socket2`-built UDP sockets with TTL=255 outbound (GTSM), cmsg-based inbound TTL extraction via `nix::recvmsg`, router + modem discovery FSMs, and the `discovery_loopback_finds_modem_and_establishes_session` integration test. The router is an *active probe* (sends `Peer_Discovery` to the well-known group from an ephemeral source port; does **not** join the group) — the modem is the only group member and replies with unicast `Peer_Offer` to the discovery's source. Modem-side discovery socket bind is best-effort: a bind failure logs a warning and the modem still spawns (the daemon stays usable for direct `connect_static` callers). Follow-ups: IPv6 discovery, `OfferBurst` retries, decoupling `discovery_v4_group` membership from `bind_addr` so production deployments can pick the interface independently of the TCP bind.
 7. TLS via tokio-rustls, then flip the `use_tls` default. **Done (M7)** — `tokio_rustls::TlsConnector` / `TlsAcceptor` wired through `Connector::tls(client_cfg)` / `Acceptor::tls(listener, server_cfg)` factory constructors with private fields; `Transport` implemented for both `tokio_rustls::{client,server}::TlsStream<TcpStream>`; `NetworkConfig::default().use_tls` flipped to `true`; `with_rustls_client(...)` / `with_rustls_server(...)` becomes the required setup step when TLS is on (spawn fails fast otherwise). Cert verification uses `ServerName::IpAddress` derived from the connect target's IP. Verified by the `tls_session_establishes_and_carries_destination_lifecycle` integration test covering handshake plus a destination Up/Down round-trip. **Known follow-up**: `ModemSessionFsm::AppDropDestination` silently no-ops if the preceding `Destination_Up` transaction is still pending; the M7 TLS test mitigates with a 50 ms sleep but a real fix (queue the drop, or surface a busy error) is needed before production. Follow-ups: mutual TLS (client certs), DNS-based `ServerName` resolution, custom certificate verifier hooks, fixing the `AppDropDestination` race.
 8. Wire the extension plug-in API and round-trip a private-use ID through a test-only extension. **Done (M8)** — `ExtensionRegistry` is now plumbed from `RouterBuilder`/`ModemBuilder` into each session task; `SessionConfig.advertised_extensions` is populated from `registry.advertised()` and shows up in the `ExtensionsSupported` data item of `Session Initialization` / `Session Initialization Response`; both FSMs capture the peer's advertised IDs into `peer_extensions` and surface them via `EmittedEvent::SessionUp { peer_extensions }`; the daemon computes `negotiated_extensions = advertised_local ∩ peer_extensions` for `DaemonEvent::SessionUp`. The session task routes inbound messages with an unknown `MessageType` through `on_unknown_message`, dispatches `DataItem::Unknown` items inside known messages through `on_unknown_data_item`, and drives `on_session_state` / `on_destination_state` on lifecycle transitions. Verified by the `private_use_extension_round_trips_session_init_and_unknown_message` integration test (Private-Use `ExtensionId(0xF000)` + `MessageType(0xF000)`). Follow-ups: extension-driven Session Termination, per-extension config plumbing, extensions over the UDP discovery socket, and an "ask FSM to terminate" hook.
-9. Polish the CLI binaries and document deployment.
+9. Polish the CLI binaries and document deployment. **Done (M9)** — the binaries build rustls configs from the TOML `[tls]` section via `dlep_daemon::tls::{client_config, server_config}`: the router requires `ca_bundle` (private PKI; no system-roots fallback) and presents `cert`+`key` as its mTLS identity when set; the modem requires `cert`+`key` and, with `require_client_cert = true`, enforces client certificates through `WebPkiClientVerifier` — closing the mutual-TLS follow-up from M7. New flags: `--cert` / `--key` / `--ca-bundle` overrides, `--check-config` (validates TOML shape, static peers and TLS material via `check_router_config` / `check_modem_config`, then exits), and the router's repeatable `--peer` (implies static mode). The router binary gained its missing run loop: static peers connect at startup, discovery mode auto-connects on `PeerDiscovered` (deduplicated by address). `NetworkConfig` is now `#[serde(default)]` so partial `[network]` sections parse, and the `[network]`/`[tls]`/`[timers]` sections reject unknown keys. Deployment guide at `doc/deployment.md` (private-CA openssl walkthrough, port-854 privileges, firewall/GTSM, systemd) plus working artifacts in `examples/` (TOML configs, hardened systemd units with a static `dlep` user). Verified by the `mtls_session_requires_and_accepts_client_certificate` / `mtls_modem_rejects_client_without_certificate` integration tests and an end-to-end smoke run with openssl-issued certificates. Follow-ups: `--tcp-port`/`--bind-addr` overrides, shell completions, packaging, reconnect-on-drop for the router's run loop.
 
 ---
 
@@ -331,6 +340,6 @@ The intended order of further work is:
 - **Extension-set negotiation semantics.** RFC 8175 §11.6 phrases the negotiated set ambiguously; cross-reference with the LL-DLEP reference implementation when wiring this.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.
 - **Per-segment TTL on TCP.** Out of scope; we accept the GTSM-on-UDP-only stance documented above. If a deployment needs it, that is an XDP/eBPF concern.
-- **Privileged binding to port 854.** Port 854 is below 1024 and requires `CAP_NET_BIND_SERVICE` on Linux, or running behind an unprivileged user with `setcap cap_net_bind_service=+ep` on the binary, or a systemd unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE`. Document this in the deployment guide once it exists.
+- **Privileged binding to port 854.** Port 854 is below 1024 and requires `CAP_NET_BIND_SERVICE` on Linux, or running behind an unprivileged user with `setcap cap_net_bind_service=+ep` on the binary, or a systemd unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE`. Documented in `doc/deployment.md` §4 (M9).
 - **IPv4 vs IPv6.** Wire encoding handles both from day one (`Ipv4ConnectionPoint` / `Ipv6ConnectionPoint` etc.). Transport-layer dual-stack support arrives in milestone 6 alongside multicast discovery.
 - **M4 follow-up: missed-deadline integration test.** The negative-path scenario "peer completes Session Init, then goes silent ⇒ session terminates with `TIMED_OUT` after `2 × interval`" is covered at the FSM-table level (`router_in_session_to_terminating_on_missed_deadline` and the modem analogue) and indirectly by the loopback heartbeat keepalive test, but no integration test drives a real TCP peer that selectively goes silent. Building one requires a partial-DLEP fake-peer harness (~80–120 LOC: hand-encode Init / Init Response, manage a `tokio::net::TcpListener`, race a `tokio::time::sleep` against the missed-deadline). Tracked here so it doesn't get lost.

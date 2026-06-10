@@ -12,11 +12,13 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 
 [RFC 8175]: https://www.rfc-editor.org/rfc/rfc8175
 
-> **Status: early.** The crate layout, public API surface, FSM enums, codec
-> skeleton, configuration, CI and CLI are in place. Most function bodies are
-> stubs marked with `TODO (Mn)` referencing the milestone they belong to. See
+> **Status: all nine milestones complete.** Wire codec, both state
+> machines, TCP + TLS (mutual TLS supported) transport, UDP multicast
+> discovery with GTSM, destinations & metrics, the extension plug-in API,
+> and deployable CLI binaries. See
 > [§9 of `doc/architecture.md`](doc/architecture.md#9-implementation-status-high-level)
-> for the current milestone breakdown.
+> for the milestone log and remaining follow-ups, and
+> [`doc/deployment.md`](doc/deployment.md) for deployment.
 
 ## Goals
 
