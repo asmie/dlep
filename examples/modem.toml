@@ -1,6 +1,9 @@
 # dlep-modem example configuration.
 # Copy to /etc/dlep/modem.toml and adjust paths and addresses.
 # See doc/deployment.md for the full walkthrough.
+#
+# Note: misspelled keys are silently ignored at the top level — validate
+# edits with `dlep-modem --config <file> --check-config` (or dlep-router).
 
 # Free-text description sent in the Peer Type data item.
 peer_description = "dlep-modem"

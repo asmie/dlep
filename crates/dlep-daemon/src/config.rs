@@ -5,7 +5,7 @@ use dlep_core::{DEFAULT_PORT, DISCOVERY_IPV4_GROUP, DISCOVERY_IPV6_GROUP};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
     pub interface: Option<String>,
     pub discovery_v4_group: Ipv4Addr,
@@ -51,6 +51,7 @@ impl Default for NetworkConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
@@ -60,6 +61,7 @@ pub struct TlsConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimersConfig {
     #[serde(default = "default_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u32,
@@ -191,5 +193,17 @@ mod tests {
         assert!(matches!(router.mode, DiscoveryMode::Discovery));
         let modem: ModemConfig = toml::from_str("").expect("empty modem config");
         assert_eq!(modem.peer_description, "dlep-modem");
+    }
+
+    #[test]
+    fn typo_inside_section_is_rejected() {
+        let err = toml::from_str::<RouterConfig>(
+            r#"
+            [network]
+            bind_adddr = "0.0.0.0"
+            "#,
+        )
+        .expect_err("typo'd key inside [network] must be rejected");
+        assert!(err.to_string().contains("bind_adddr"), "got: {err}");
     }
 }
