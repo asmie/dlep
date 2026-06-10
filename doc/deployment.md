@@ -162,5 +162,6 @@ trace|debug|info|warn|error` or the `DLEP_LOG` env var (add
 | `use_tls = true requires RouterBuilder::with_rustls_client(...)` / `…ModemBuilder::with_rustls_server(...)` | Library embedder didn't supply a rustls config — binaries never hit this. |
 | TLS handshake fails with certificate errors | Modem cert SAN doesn't contain the IP the router dialed, or peers disagree about the CA. |
 | `M6 discovery only supports v4 bind_addr` | Discovery mode with an IPv6 `bind_addr` passes `--check-config` but fails at startup; use an IPv4 `bind_addr` or static mode. |
+| Session drops and never re-establishes | The router does not yet reconnect after `SessionDown` (tracked follow-up); restart `dlep-router` to re-pair. |
 | Discovery finds nothing | Peers more than one hop apart (GTSM), multicast blocked, or wrong `interface`. Try static mode (`--peer`) to isolate. |
 | `permission denied` binding port 854 | See §4. |

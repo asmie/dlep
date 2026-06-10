@@ -194,3 +194,68 @@ fn apply_overrides(cfg: &mut RouterConfig, cli: &Cli) {
         cfg.static_peers.extend(cli.peer.iter().copied());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use dlep_daemon::DiscoveryMode;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("dlep-router").chain(args.iter().copied()))
+            .expect("CLI args parse")
+    }
+
+    #[test]
+    fn peer_flag_forces_static_mode_and_appends() {
+        let cli = parse(&["--peer", "192.0.2.1:854", "--peer", "192.0.2.2:854"]);
+        let mut cfg = RouterConfig::default();
+        apply_overrides(&mut cfg, &cli);
+        assert!(matches!(cfg.mode, DiscoveryMode::Static));
+        assert_eq!(
+            cfg.static_peers,
+            vec![
+                "192.0.2.1:854".parse().unwrap(),
+                "192.0.2.2:854".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn tls_path_flags_override_toml_section() {
+        let cli = parse(&[
+            "--ca-bundle",
+            "/x/ca.pem",
+            "--cert",
+            "/x/c.pem",
+            "--key",
+            "/x/k.pem",
+        ]);
+        let mut cfg = RouterConfig::default();
+        apply_overrides(&mut cfg, &cli);
+        assert_eq!(
+            cfg.shared.tls.ca_bundle.as_deref(),
+            Some(std::path::Path::new("/x/ca.pem"))
+        );
+        assert_eq!(
+            cfg.shared.tls.cert.as_deref(),
+            Some(std::path::Path::new("/x/c.pem"))
+        );
+        assert_eq!(
+            cfg.shared.tls.key.as_deref(),
+            Some(std::path::Path::new("/x/k.pem"))
+        );
+    }
+
+    #[test]
+    fn no_tls_flag_disables_tls_and_defaults_leave_config_untouched() {
+        let cli = parse(&["--no-tls"]);
+        let mut cfg = RouterConfig::default();
+        apply_overrides(&mut cfg, &cli);
+        assert!(!cfg.shared.network.use_tls);
+        assert!(matches!(cfg.mode, DiscoveryMode::Discovery));
+        assert!(cfg.static_peers.is_empty());
+        assert!(cfg.shared.tls.cert.is_none());
+    }
+}
