@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use dlep_daemon::{ModemConfig, ModemDaemon, load_toml_config};
+use dlep_daemon::{ModemConfig, ModemDaemon, check_modem_config, load_toml_config};
 use tracing_subscriber::EnvFilter;
 
 /// DLEP (RFC 8175) modem-side daemon.
@@ -24,6 +24,24 @@ struct Cli {
     /// Disable TLS — development only.
     #[arg(long)]
     no_tls: bool,
+
+    /// PEM server certificate presented to routers (overrides [tls] cert).
+    #[arg(long, value_name = "PATH")]
+    cert: Option<PathBuf>,
+
+    /// PEM private key for --cert (overrides [tls] key).
+    #[arg(long, value_name = "PATH")]
+    key: Option<PathBuf>,
+
+    /// PEM bundle of CA certificates used to verify router client
+    /// certificates when require_client_cert is set
+    /// (overrides [tls] ca_bundle).
+    #[arg(long, value_name = "PATH")]
+    ca_bundle: Option<PathBuf>,
+
+    /// Validate the configuration (including TLS material) and exit.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -33,7 +51,13 @@ async fn main() -> Result<()> {
 
     let mut config: ModemConfig =
         load_toml_config(cli.config.as_deref()).context("loading modem configuration")?;
-    apply_overrides(&mut config, cli.interface, cli.no_tls);
+    apply_overrides(&mut config, &cli);
+
+    if cli.check_config {
+        check_modem_config(&config).context("configuration check failed")?;
+        println!("configuration OK");
+        return Ok(());
+    }
 
     tracing::info!(
         peer = %config.peer_description,
@@ -41,8 +65,20 @@ async fn main() -> Result<()> {
         "starting dlep-modem"
     );
 
-    let daemon = ModemDaemon::builder()
-        .config(config)
+    let tls = if config.shared.network.use_tls {
+        Some(
+            dlep_daemon::tls::server_config(&config.shared.tls)
+                .context("building TLS server configuration")?,
+        )
+    } else {
+        None
+    };
+
+    let mut builder = ModemDaemon::builder().config(config);
+    if let Some(tls) = tls {
+        builder = builder.with_rustls_server(tls);
+    }
+    let daemon = builder
         .spawn()
         .await
         .context("failed to start modem daemon")?;
@@ -64,11 +100,20 @@ fn init_tracing(requested: &str) {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-fn apply_overrides(cfg: &mut ModemConfig, interface: Option<String>, no_tls: bool) {
-    if let Some(iface) = interface {
-        cfg.shared.network.interface = Some(iface);
+fn apply_overrides(cfg: &mut ModemConfig, cli: &Cli) {
+    if let Some(iface) = &cli.interface {
+        cfg.shared.network.interface = Some(iface.clone());
     }
-    if no_tls {
+    if cli.no_tls {
         cfg.shared.network.use_tls = false;
+    }
+    if let Some(path) = &cli.cert {
+        cfg.shared.tls.cert = Some(path.clone());
+    }
+    if let Some(path) = &cli.key {
+        cfg.shared.tls.key = Some(path.clone());
+    }
+    if let Some(path) = &cli.ca_bundle {
+        cfg.shared.tls.ca_bundle = Some(path.clone());
     }
 }
