@@ -41,6 +41,10 @@ pub mod test_helpers {
         pub cert_der: CertificateDer<'static>,
         pub key_der: PrivateKeyDer<'static>,
         pub roots: RootCertStore,
+        /// PEM renderings of `cert_der` / `key_der`, for tests that exercise
+        /// the file-loading path (`load_certs` / `load_private_key`).
+        pub cert_pem: String,
+        pub key_pem: String,
     }
 
     /// Generate a self-signed cert for the given IP. The cert's SAN
@@ -51,6 +55,9 @@ pub mod test_helpers {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("rcgen params");
         params.subject_alt_names = vec![SanType::IpAddress(ip)];
         let cert = params.self_signed(&key).expect("rcgen self-sign");
+
+        let cert_pem = cert.pem();
+        let key_pem = key.serialize_pem();
 
         let cert_der = CertificateDer::from(cert.der().to_vec());
         let key_pkcs8 = PrivatePkcs8KeyDer::from(key.serialize_der());
@@ -63,6 +70,8 @@ pub mod test_helpers {
             cert_der,
             key_der,
             roots,
+            cert_pem,
+            key_pem,
         }
     }
 
@@ -87,6 +96,39 @@ pub mod test_helpers {
                 .expect("ServerConfig build"),
         )
     }
+
+    /// Build a `ServerConfig` that presents `cert`+`key` and REQUIRES the
+    /// client to present a certificate chaining to `client_roots`.
+    pub fn server_config_requiring_client_certs(
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        client_roots: RootCertStore,
+    ) -> Arc<ServerConfig> {
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .expect("client cert verifier");
+        Arc::new(
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(vec![cert], key)
+                .expect("ServerConfig build"),
+        )
+    }
+
+    /// Build a `ClientConfig` that trusts `roots` and presents `cert`+`key`
+    /// as its client identity (mutual TLS).
+    pub fn client_config_with_identity(
+        roots: RootCertStore,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> Arc<ClientConfig> {
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(vec![cert], key)
+                .expect("ClientConfig with identity"),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +143,31 @@ mod tests {
         // Sanity: the helpers produce non-panicking configs.
         let _server = server_config_for(pki.cert_der.clone(), pki.key_der.clone_key());
         let _client = client_config_for(pki.roots);
+    }
+
+    #[test]
+    fn test_pki_exposes_loadable_pem() {
+        let pki = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut reader = std::io::BufReader::new(pki.cert_pem.as_bytes());
+        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<_, _>>()
+            .expect("cert_pem parses");
+        assert_eq!(certs.len(), 1);
+        let mut reader = std::io::BufReader::new(pki.key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut reader).expect("key_pem parses");
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn mtls_helper_configs_build() {
+        let server = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let client = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let _server_cfg = server_config_requiring_client_certs(
+            server.cert_der.clone(),
+            server.key_der.clone_key(),
+            client.roots.clone(),
+        );
+        let _client_cfg =
+            client_config_with_identity(server.roots, client.cert_der, client.key_der);
     }
 }
