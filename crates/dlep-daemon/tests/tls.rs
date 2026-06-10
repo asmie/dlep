@@ -8,7 +8,10 @@ use dlep_daemon::{
     DaemonEvent, DestinationEvent, DestinationId, LinkMetrics, ModemConfig, ModemDaemon,
     NetworkConfig, RouterConfig, RouterDaemon, SharedConfig,
 };
-use dlep_net::tls::test_helpers::{client_config_for, self_signed_for_ip, server_config_for};
+use dlep_net::tls::test_helpers::{
+    client_config_for, client_config_with_identity, self_signed_for_ip, server_config_for,
+    server_config_requiring_client_certs,
+};
 use tokio::sync::broadcast::Receiver;
 use tokio::time::timeout;
 
@@ -156,6 +159,90 @@ async fn tls_session_establishes_and_carries_destination_lifecycle() {
         .drop_destination(id, StatusCode::SHUTTING_DOWN)
         .await
         .expect("drop_destination over TLS");
+    let _ = await_destination_event(
+        &mut router_events,
+        |d| matches!(d, DestinationEvent::Down { id: got, .. } if *got == id),
+    )
+    .await;
+
+    router.shutdown().await.expect("router shutdown");
+    await_session_down(&mut router_events).await;
+    await_session_down(&mut modem_events).await;
+    modem.shutdown().await.expect("modem shutdown");
+}
+
+#[tokio::test]
+async fn mtls_session_requires_and_accepts_client_certificate() {
+    // Two identities: the modem's server cert (trusted by the router) and
+    // the router's client cert (trusted by the modem's client verifier).
+    let server_pki = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let client_pki = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    let server_cfg = server_config_requiring_client_certs(
+        server_pki.cert_der,
+        server_pki.key_der,
+        client_pki.roots,
+    );
+    let client_cfg =
+        client_config_with_identity(server_pki.roots, client_pki.cert_der, client_pki.key_der);
+
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .with_rustls_server(server_cfg)
+        .spawn()
+        .await
+        .expect("modem spawn");
+    let modem_addr = modem.local_addr();
+    let mut modem_events = modem.subscribe();
+
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .with_rustls_client(client_cfg)
+        .spawn()
+        .await
+        .expect("router spawn");
+    let mut router_events = router.subscribe();
+
+    router
+        .connect_static(modem_addr)
+        .await
+        .expect("router connect_static (mTLS)");
+
+    await_session_up(&mut router_events).await;
+    await_session_up(&mut modem_events).await;
+
+    // Destination round-trip across the mTLS session.
+    let mac = MacAddress::new_eui48([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    let id = DestinationId(mac);
+    let metrics = LinkMetrics {
+        max_data_rate_rx_bps: 1_000_000_000,
+        max_data_rate_tx_bps: 1_000_000_000,
+        current_data_rate_rx_bps: 500_000_000,
+        current_data_rate_tx_bps: 500_000_000,
+        latency: Duration::from_micros(2_500),
+        resources: 90,
+        rlq_rx: 100,
+        rlq_tx: 100,
+        mtu: 1500,
+    };
+
+    modem
+        .add_destination(id, metrics)
+        .await
+        .expect("add_destination over mTLS");
+    let _ = await_destination_event(
+        &mut router_events,
+        |d| matches!(d, DestinationEvent::Up { id: got, .. } if *got == id),
+    )
+    .await;
+
+    // Same AppDropDestination race mitigation as the M7 test above.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    modem
+        .drop_destination(id, StatusCode::SHUTTING_DOWN)
+        .await
+        .expect("drop_destination over mTLS");
     let _ = await_destination_event(
         &mut router_events,
         |d| matches!(d, DestinationEvent::Down { id: got, .. } if *got == id),
