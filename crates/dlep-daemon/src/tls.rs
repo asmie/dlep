@@ -347,12 +347,30 @@ pub(crate) mod tests {
         )
         .expect("write bogus pem");
         let tls = TlsConfig {
-            ca_bundle: Some(bogus),
+            ca_bundle: Some(bogus.clone()),
             ..TlsConfig::default()
         };
-        assert!(matches!(
-            client_config(&tls).unwrap_err(),
-            TlsSetupError::Rustls { .. }
-        ));
+        match client_config(&tls).unwrap_err() {
+            TlsSetupError::Rustls { field, path, .. } => {
+                assert_eq!(field, "tls.ca_bundle");
+                assert_eq!(path, bogus);
+            }
+            other => panic!("expected Rustls error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn server_config_with_unused_ca_bundle_still_builds() {
+        // ca_bundle without require_client_cert is warned about (see
+        // server_config) but must not fail the build.
+        let server = write_pki();
+        let client = write_pki();
+        let tls = TlsConfig {
+            cert: Some(server.cert.clone()),
+            key: Some(server.key.clone()),
+            ca_bundle: Some(client.cert.clone()),
+            require_client_cert: false,
+        };
+        server_config(&tls).expect("server config with ignored ca_bundle");
     }
 }
