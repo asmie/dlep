@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use dlep_net::ServerConfig;
 use dlep_net::tls::{load_certs, load_private_key};
+use dlep_net::{ClientConfig, ServerConfig};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{VerifierBuilderError, WebPkiClientVerifier};
@@ -40,8 +40,13 @@ pub enum TlsSetupError {
     },
     #[error("{path} contains no PEM certificates")]
     EmptyPem { path: PathBuf },
-    #[error("rustls rejected the TLS material: {0}")]
-    Rustls(#[from] rustls::Error),
+    #[error("rustls rejected the TLS material from {field} ({path}): {source}")]
+    Rustls {
+        field: &'static str,
+        path: PathBuf,
+        #[source]
+        source: rustls::Error,
+    },
     #[error("failed to build the client-certificate verifier: {0}")]
     Verifier(#[from] VerifierBuilderError),
 }
@@ -69,9 +74,50 @@ fn key_from(path: &Path) -> Result<PrivateKeyDer<'static>, TlsSetupError> {
 fn root_store_from(path: &Path) -> Result<RootCertStore, TlsSetupError> {
     let mut roots = RootCertStore::empty();
     for cert in certs_from(path)? {
-        roots.add(cert)?;
+        roots.add(cert).map_err(|source| TlsSetupError::Rustls {
+            field: "tls.ca_bundle",
+            path: path.to_path_buf(),
+            source,
+        })?;
     }
     Ok(roots)
+}
+
+/// Build the router-side `ClientConfig` from `[tls]` paths.
+///
+/// `ca_bundle` is required (private PKI; no system-roots fallback). When
+/// `cert` + `key` are both set they are presented as the client identity
+/// for mutual TLS; setting only one of them is an error.
+pub fn client_config(tls: &TlsConfig) -> Result<Arc<ClientConfig>, TlsSetupError> {
+    let ca = tls
+        .ca_bundle
+        .as_deref()
+        .ok_or(TlsSetupError::MissingCaBundle)?;
+    let roots = root_store_from(ca)?;
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let config = match (tls.cert.as_deref(), tls.key.as_deref()) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = certs_from(cert_path)?;
+            let key = key_from(key_path)?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|source| TlsSetupError::Rustls {
+                    field: "tls.cert/tls.key",
+                    path: cert_path.to_path_buf(),
+                    source,
+                })?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        (Some(_), None) => {
+            return Err(TlsSetupError::IncompleteClientIdentity {
+                present: "tls.cert",
+            });
+        }
+        (None, Some(_)) => {
+            return Err(TlsSetupError::IncompleteClientIdentity { present: "tls.key" });
+        }
+    };
+    Ok(Arc::new(config))
 }
 
 /// Build the modem-side `ServerConfig` from `[tls]` paths.
@@ -92,9 +138,21 @@ pub fn server_config(tls: &TlsConfig) -> Result<Arc<ServerConfig>, TlsSetupError
         let verifier = WebPkiClientVerifier::builder(Arc::new(root_store_from(ca)?)).build()?;
         ServerConfig::builder().with_client_cert_verifier(verifier)
     } else {
+        if tls.ca_bundle.is_some() {
+            tracing::warn!(
+                "tls.ca_bundle is set but tls.require_client_cert = false; \
+                 client certificates will NOT be required"
+            );
+        }
         ServerConfig::builder().with_no_client_auth()
     };
-    Ok(Arc::new(builder.with_single_cert(certs, key)?))
+    Ok(Arc::new(builder.with_single_cert(certs, key).map_err(
+        |source| TlsSetupError::Rustls {
+            field: "tls.cert/tls.key",
+            path: cert_path.to_path_buf(),
+            source,
+        },
+    )?))
 }
 
 // `pub(crate)` so cli.rs's tests can reuse `write_pki` (a private `mod
@@ -217,6 +275,84 @@ pub(crate) mod tests {
         assert!(matches!(
             server_config(&tls).unwrap_err(),
             TlsSetupError::EmptyPem { .. }
+        ));
+    }
+
+    #[test]
+    fn client_config_requires_ca_bundle() {
+        let tls = TlsConfig::default();
+        assert!(matches!(
+            client_config(&tls).unwrap_err(),
+            TlsSetupError::MissingCaBundle
+        ));
+    }
+
+    #[test]
+    fn client_config_builds_with_trust_roots_only() {
+        let pki = write_pki();
+        let tls = TlsConfig {
+            ca_bundle: Some(pki.cert.clone()),
+            ..TlsConfig::default()
+        };
+        client_config(&tls).expect("client config");
+    }
+
+    #[test]
+    fn client_config_with_identity_builds() {
+        let server = write_pki();
+        let client = write_pki();
+        let tls = TlsConfig {
+            ca_bundle: Some(server.cert.clone()),
+            cert: Some(client.cert.clone()),
+            key: Some(client.key.clone()),
+            ..TlsConfig::default()
+        };
+        client_config(&tls).expect("mTLS client config");
+    }
+
+    #[test]
+    fn client_config_with_partial_identity_is_rejected() {
+        let pki = write_pki();
+        let cert_only = TlsConfig {
+            ca_bundle: Some(pki.cert.clone()),
+            cert: Some(pki.cert.clone()),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            client_config(&cert_only).unwrap_err(),
+            TlsSetupError::IncompleteClientIdentity {
+                present: "tls.cert"
+            }
+        ));
+        let key_only = TlsConfig {
+            ca_bundle: Some(pki.cert.clone()),
+            key: Some(pki.key.clone()),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            client_config(&key_only).unwrap_err(),
+            TlsSetupError::IncompleteClientIdentity { present: "tls.key" }
+        ));
+    }
+
+    #[test]
+    fn garbage_certificate_reports_rustls_error() {
+        // Valid PEM framing around base64 of non-DER bytes: parses at the
+        // pemfile layer, rejected by rustls when added to the root store.
+        let pki = write_pki();
+        let bogus = pki._dir.path().join("bogus.pem");
+        std::fs::write(
+            &bogus,
+            "-----BEGIN CERTIFICATE-----\naGVsbG8gd29ybGQ=\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write bogus pem");
+        let tls = TlsConfig {
+            ca_bundle: Some(bogus),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            client_config(&tls).unwrap_err(),
+            TlsSetupError::Rustls { .. }
         ));
     }
 }
