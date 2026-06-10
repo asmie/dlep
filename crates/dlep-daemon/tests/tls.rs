@@ -1,4 +1,4 @@
-//! TLS loopback integration test for M7.
+//! TLS and mTLS loopback integration tests (M7, M9).
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -252,5 +252,60 @@ async fn mtls_session_requires_and_accepts_client_certificate() {
     router.shutdown().await.expect("router shutdown");
     await_session_down(&mut router_events).await;
     await_session_down(&mut modem_events).await;
+    modem.shutdown().await.expect("modem shutdown");
+}
+
+#[tokio::test]
+async fn mtls_modem_rejects_client_without_certificate() {
+    let server_pki = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let client_pki = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    // Modem requires client certs; router presents none.
+    let server_cfg = server_config_requiring_client_certs(
+        server_pki.cert_der,
+        server_pki.key_der,
+        client_pki.roots,
+    );
+    let client_cfg = client_config_for(server_pki.roots);
+
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .with_rustls_server(server_cfg)
+        .spawn()
+        .await
+        .expect("modem spawn");
+    let modem_addr = modem.local_addr();
+    let mut modem_events = modem.subscribe();
+
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .with_rustls_client(client_cfg)
+        .spawn()
+        .await
+        .expect("router spawn");
+
+    // Under TLS 1.3 the client side may believe the handshake succeeded
+    // before the server rejects the missing certificate, so connect_static
+    // is allowed to return Ok here; the session must still never come up.
+    let _ = router.connect_static(modem_addr).await;
+
+    let no_session_up = async {
+        loop {
+            match modem_events.recv().await {
+                Ok(DaemonEvent::SessionUp { .. }) => return false,
+                Ok(_) => continue,
+                Err(_) => return true,
+            }
+        }
+    };
+    let result = timeout(STEP_TIMEOUT, no_session_up).await;
+    match result {
+        // Timed out without seeing SessionUp: the modem held the line.
+        Err(_) => {}
+        Ok(true) => {} // channel closed without SessionUp — also a pass
+        Ok(false) => panic!("modem accepted a session from a client without a certificate"),
+    }
+
+    router.shutdown().await.expect("router shutdown");
     modem.shutdown().await.expect("modem shutdown");
 }
