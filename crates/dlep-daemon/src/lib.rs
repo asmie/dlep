@@ -12,6 +12,7 @@ pub mod modem;
 pub mod router;
 pub mod runtime;
 pub mod session;
+pub mod tls;
 
 pub use cli::{ConfigLoadError, load_toml_config};
 pub use config::{ModemConfig, NetworkConfig, RouterConfig, SharedConfig, TimersConfig, TlsConfig};
