@@ -5,6 +5,7 @@ use dlep_core::{DEFAULT_PORT, DISCOVERY_IPV4_GROUP, DISCOVERY_IPV6_GROUP};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct NetworkConfig {
     pub interface: Option<String>,
     pub discovery_v4_group: Ipv4Addr,
@@ -163,4 +164,32 @@ fn default_router_peer_description() -> String {
 
 fn default_modem_peer_description() -> String {
     "dlep-modem".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_network_section_uses_defaults() {
+        let cfg: RouterConfig = toml::from_str(
+            r#"
+            [network]
+            use_tls = false
+            "#,
+        )
+        .expect("partial [network] section must parse");
+        assert!(!cfg.shared.network.use_tls);
+        assert_eq!(cfg.shared.network.tcp_port, DEFAULT_PORT);
+        assert_eq!(cfg.shared.network.discovery_v4_group, DISCOVERY_IPV4_GROUP);
+    }
+
+    #[test]
+    fn empty_config_parses_to_defaults() {
+        let router: RouterConfig = toml::from_str("").expect("empty router config");
+        assert!(router.shared.network.use_tls);
+        assert!(matches!(router.mode, DiscoveryMode::Discovery));
+        let modem: ModemConfig = toml::from_str("").expect("empty modem config");
+        assert_eq!(modem.peer_description, "dlep-modem");
+    }
 }
