@@ -384,6 +384,12 @@ pub async fn run_session<F: SessionFsm>(
                     Some(SessionCommand::DropDestination { mac, reason }) => {
                         FsmEvent::AppDropDestination { mac, reason }
                     }
+                    Some(SessionCommand::SessionUpdate { metrics }) => {
+                        FsmEvent::AppSessionUpdate { metrics }
+                    }
+                    Some(SessionCommand::AnnounceDestination { mac }) => {
+                        FsmEvent::AppAnnounceDestination { mac }
+                    }
                     None => {
                         // Daemon dropped the channel without an explicit
                         // Shutdown command. Treat as a one-shot signal:
@@ -645,7 +651,10 @@ fn translate_emitted(
                 negotiated_extensions: negotiated,
             })
         }
-        EmittedEvent::SessionDown(reason) => Some(DaemonEvent::SessionDown { reason: *reason }),
+        EmittedEvent::SessionDown(reason) => Some(DaemonEvent::SessionDown {
+            peer: peer.clone(),
+            reason: *reason,
+        }),
         EmittedEvent::PeerDiscovered {
             addr,
             peer_description,
@@ -679,6 +688,16 @@ fn translate_emitted(
                 reason: *reason,
             }))
         }
+        EmittedEvent::DestinationAnnounced { mac } => {
+            Some(DaemonEvent::Destination(DestinationEvent::Announced {
+                id: DestinationId(*mac),
+            }))
+        }
+        EmittedEvent::SessionMetricsUpdate { metrics } => {
+            Some(DaemonEvent::Metrics(crate::events::MetricsEvent {
+                session_wide: *metrics,
+            }))
+        }
     }
 }
 
@@ -710,7 +729,6 @@ fn negotiated_from_active(
 /// via `on_unknown_message` in *addition* to being fed to the FSM (whose
 /// catch-all still resets the missed-heartbeat deadline).
 ///
-/// DESTINATION_ANNOUNCE / DESTINATION_ANNOUNCE_RESPONSE /
 /// LINK_CHARACTERISTICS_REQUEST / LINK_CHARACTERISTICS_RESPONSE are RFC
 /// 8175 message types but the FSM has no typed arm for them (deferred);
 /// they go to extensions so a plug-in can implement them without
@@ -726,6 +744,8 @@ fn is_known_message_type(mt: MessageType) -> bool {
             | MessageType::SESSION_TERMINATION_RESPONSE
             | MessageType::DESTINATION_UP
             | MessageType::DESTINATION_UP_RESPONSE
+            | MessageType::DESTINATION_ANNOUNCE
+            | MessageType::DESTINATION_ANNOUNCE_RESPONSE
             | MessageType::DESTINATION_DOWN
             | MessageType::DESTINATION_DOWN_RESPONSE
             | MessageType::DESTINATION_UPDATE

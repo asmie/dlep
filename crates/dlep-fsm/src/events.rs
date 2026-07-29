@@ -66,6 +66,12 @@ pub enum FsmEvent {
     AppAnnounceDestination {
         mac: MacAddress,
     },
+    /// Push session-wide metric changes to the peer via a Session Update
+    /// Message (RFC 8175 §12.7). Either participant may originate one —
+    /// the RFC scopes it to "a DLEP participant", not to a single role.
+    AppSessionUpdate {
+        metrics: LinkMetrics,
+    },
     AppRequestLinkCharacteristics {
         mac: MacAddress,
     },
@@ -134,5 +140,16 @@ pub enum EmittedEvent {
     DestinationUpdate {
         mac: MacAddress,
         metrics: LinkMetrics,
+    },
+    /// Session-wide metric change the peer reported in a Session Update
+    /// Message (RFC 8175 §12.7). Distinct from `DestinationUpdate`, which
+    /// is scoped to one destination MAC.
+    SessionMetricsUpdate {
+        metrics: LinkMetrics,
+    },
+    /// The router asked us (the modem) to report on a destination it is
+    /// interested in — inbound Destination Announce (RFC 8175 §12.13).
+    DestinationAnnounced {
+        mac: MacAddress,
     },
 }

@@ -222,7 +222,7 @@ async fn heartbeat_keepalive_over_loopback() {
 fn assert_no_session_down(rx: &mut Receiver<DaemonEvent>) {
     loop {
         match rx.try_recv() {
-            Ok(DaemonEvent::SessionDown { reason }) => {
+            Ok(DaemonEvent::SessionDown { reason, .. }) => {
                 panic!("unexpected SessionDown({reason:?}) during keepalive window");
             }
             Ok(_) => continue, // ignore other events
@@ -388,4 +388,151 @@ async fn destination_round_trip_over_loopback() {
     await_session_down(&mut router_events).await;
     await_session_down(&mut modem_events).await;
     modem.shutdown().await.expect("modem shutdown");
+}
+
+/// Wait for a `DaemonEvent::Metrics`, returning its session-wide metrics.
+async fn await_session_metrics(rx: &mut Receiver<DaemonEvent>) -> LinkMetrics {
+    loop {
+        let evt = timeout(STEP_TIMEOUT, rx.recv())
+            .await
+            .expect("timed out waiting for Metrics")
+            .expect("event channel closed");
+        if let DaemonEvent::Metrics(m) = evt {
+            return m.session_wide;
+        }
+    }
+}
+
+/// RFC 8175 §12.7: a modem-originated Session Update must reach the router
+/// and surface as session-wide metrics.
+///
+/// This test deliberately asserts a single round trip. The mandatory §12.8
+/// Response frees the sender's session-level transaction slot, but the
+/// originating side emits no public event when it arrives, so there is no
+/// race-free way to observe it from here — waiting on the *router's* Metrics
+/// event says nothing about whether the modem has processed the Response
+/// yet. The open→close transaction lifecycle is pinned deterministically in
+/// `dlep-fsm/tests/session_table.rs`
+/// (`modem_in_session_session_update_opens_then_closes_session_transaction`).
+#[tokio::test]
+async fn session_update_round_trip_surfaces_session_wide_metrics() {
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .spawn()
+        .await
+        .expect("modem spawn");
+    let modem_addr = modem.local_addr();
+    let mut modem_events = modem.subscribe();
+
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .spawn()
+        .await
+        .expect("router spawn");
+    let mut router_events = router.subscribe();
+
+    router
+        .connect_static(modem_addr)
+        .await
+        .expect("router connect_static");
+    await_session_up(&mut router_events).await;
+    await_session_up(&mut modem_events).await;
+
+    let mut m = sample_metrics();
+    m.current_data_rate_tx_bps = 42_000_000;
+    modem
+        .update_session_metrics(m)
+        .await
+        .expect("update_session_metrics");
+    let got = await_session_metrics(&mut router_events).await;
+    assert_eq!(got.current_data_rate_tx_bps, 42_000_000);
+
+    router.shutdown().await.expect("router shutdown");
+    modem.shutdown().await.expect("modem shutdown");
+}
+
+/// RFC 8175 §12.13: Destination Announce is router-originated and must reach
+/// the modem as a `DestinationEvent::Announced`.
+///
+/// As with the Session Update test above, the mandatory §12.14 Response is
+/// not asserted here — the router emits nothing when it arrives. The
+/// per-destination transaction open→close cycle is pinned in
+/// `dlep-fsm/tests/session_table.rs`
+/// (`router_in_session_announce_opens_then_closes_destination_transaction`).
+#[tokio::test]
+async fn router_announce_destination_is_acknowledged_by_modem() {
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .spawn()
+        .await
+        .expect("modem spawn");
+    let modem_addr = modem.local_addr();
+    let mut modem_events = modem.subscribe();
+
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .spawn()
+        .await
+        .expect("router spawn");
+    let mut router_events = router.subscribe();
+
+    router
+        .connect_static(modem_addr)
+        .await
+        .expect("router connect_static");
+    await_session_up(&mut router_events).await;
+    await_session_up(&mut modem_events).await;
+
+    let id = DestinationId(MacAddress::new_eui48([0x02, 0, 0, 0, 0, 0x09]));
+
+    router
+        .announce_destination(id)
+        .await
+        .expect("announce_destination");
+    await_destination_event(
+        &mut modem_events,
+        |d| matches!(d, DestinationEvent::Announced { id: got } if *got == id),
+    )
+    .await;
+
+    router.shutdown().await.expect("router shutdown");
+    modem.shutdown().await.expect("modem shutdown");
+}
+
+/// A subscriber must be able to tell *which* peer went down — without this
+/// the router binary cannot evict the dead peer and reconnect.
+#[tokio::test]
+async fn session_down_identifies_the_peer() {
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .spawn()
+        .await
+        .expect("modem spawn");
+    let modem_addr = modem.local_addr();
+
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .spawn()
+        .await
+        .expect("router spawn");
+    let mut router_events = router.subscribe();
+
+    router
+        .connect_static(modem_addr)
+        .await
+        .expect("router connect_static");
+    await_session_up(&mut router_events).await;
+
+    modem.shutdown().await.expect("modem shutdown");
+
+    loop {
+        let evt = timeout(STEP_TIMEOUT, router_events.recv())
+            .await
+            .expect("timed out waiting for SessionDown")
+            .expect("event channel closed");
+        if let DaemonEvent::SessionDown { peer, .. } = evt {
+            assert_eq!(peer.addr, modem_addr, "SessionDown must name the peer");
+            return;
+        }
+    }
 }

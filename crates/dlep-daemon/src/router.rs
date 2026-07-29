@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::config::{NetworkConfig, RouterConfig, TimersConfig};
-use crate::events::PeerInfo;
+use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, new_event_channel,
 };
@@ -161,6 +161,34 @@ impl RouterDaemon {
 
         self.session_cmds.lock().await.push(cmd_tx);
         self.tasks.lock().await.push(handle);
+        Ok(())
+    }
+
+    /// Declare interest in a destination the modem has not reported, via a
+    /// Destination Announce Message (RFC 8175 §12.13 — router-originated).
+    /// The modem MUST answer with a Destination Announce Response (§12.14).
+    pub async fn announce_destination(&self, id: DestinationId) -> Result<(), DaemonError> {
+        self.fanout(SessionCommand::AnnounceDestination { mac: id.0 })
+            .await
+    }
+
+    /// Push session-wide metric changes to every connected modem via a
+    /// Session Update Message (RFC 8175 §12.7).
+    pub async fn update_session_metrics(&self, metrics: LinkMetrics) -> Result<(), DaemonError> {
+        self.fanout(SessionCommand::SessionUpdate { metrics }).await
+    }
+
+    /// Fan a command to every active session. Snapshot the sender list under
+    /// the lock so we don't hold the mutex across `await`; a session that
+    /// already exited and dropped its receiver is not the caller's problem.
+    async fn fanout(&self, cmd: SessionCommand) -> Result<(), DaemonError> {
+        let senders: Vec<_> = {
+            let guard = self.session_cmds.lock().await;
+            guard.clone()
+        };
+        for tx in senders {
+            let _ = tx.send(cmd.clone()).await;
+        }
         Ok(())
     }
 

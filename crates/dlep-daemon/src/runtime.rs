@@ -31,6 +31,12 @@ pub enum SessionCommand {
     },
     /// Modem-side: drop a destination at the peer router.
     DropDestination { mac: MacAddress, reason: StatusCode },
+    /// Either side: push session-wide metric changes via a Session Update
+    /// Message (RFC 8175 §12.7).
+    SessionUpdate { metrics: LinkMetrics },
+    /// Router-side: declare interest in a destination the modem has not
+    /// reported, via Destination Announce (RFC 8175 §12.13).
+    AnnounceDestination { mac: MacAddress },
 }
 
 /// Broadcast buffer size for public `DaemonEvent`s. When a subscriber lags

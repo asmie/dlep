@@ -6,10 +6,12 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_destination_down_response, build_destination_up_response, build_heartbeat,
-    build_session_termination, build_session_termination_response, extract_destination_addrs,
-    extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
-    extract_link_metrics, extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    SessionConfig, build_destination_announce, build_destination_down_response,
+    build_destination_up_response, build_heartbeat, build_session_termination,
+    build_session_termination_response, build_session_update, build_session_update_response,
+    extract_destination_addrs, extract_destination_mac, extract_extensions_supported,
+    extract_heartbeat_interval, extract_link_metrics, extract_status, heartbeat_reset_action,
+    local_heartbeat_interval,
 };
 use crate::timers::{TimerId, TimerKind};
 use crate::transaction::TransactionTracker;
@@ -309,6 +311,52 @@ impl RouterSessionFsm {
                 }
                 actions
             }
+            // Session_Update: RFC 8175 §12.7 — session-wide metric / L3
+            // address change from the peer. §12.8 makes the response
+            // MANDATORY ("MUST be sent ... when a Session Update Message is
+            // received"), so we always answer, even when the message carried
+            // no metrics we could parse. Emit the session-wide metrics only
+            // when present.
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::SESSION_UPDATE =>
+            {
+                let mut actions = vec![FsmAction::SendMessage(build_session_update_response(
+                    StatusCode::SUCCESS,
+                ))];
+                if let Some(metrics) = extract_link_metrics(&msg) {
+                    actions.push(FsmAction::Emit(EmittedEvent::SessionMetricsUpdate {
+                        metrics,
+                    }));
+                }
+                if let Some(reset) =
+                    heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                {
+                    actions.push(reset);
+                }
+                actions
+            }
+            // Peer answered our Session_Update — free the session-level
+            // transaction slot (RFC 8175 §12.8).
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::SESSION_UPDATE_RESPONSE =>
+            {
+                self.tx.close_session();
+                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    .into_iter()
+                    .collect()
+            }
+            // Modem answered our Destination_Announce (RFC 8175 §12.14) —
+            // free the per-destination transaction slot.
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_ANNOUNCE_RESPONSE =>
+            {
+                if let Some(mac) = extract_destination_mac(&msg) {
+                    self.tx.close_destination(&mac);
+                }
+                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    .into_iter()
+                    .collect()
+            }
             // Catch-all for any other successfully decoded message in
             // InSession (Heartbeat, future Destination_*, etc.) — RFC 8175
             // §11.2 says any received message resets the missed-heartbeat
@@ -342,6 +390,31 @@ impl RouterSessionFsm {
                         periodic: false,
                     },
                 ]
+            }
+            // InSession: app pushes session-wide metric changes to the modem
+            // (RFC 8175 §12.7). Occupies the single session-level
+            // transaction slot until the Response arrives.
+            (RouterSessionState::InSession, FsmEvent::AppSessionUpdate { metrics }) => {
+                use crate::transaction::RequestKind;
+                if self.tx.open_session(RequestKind::SessionUpdate).is_err() {
+                    tracing::debug!("session_update while another session request is pending");
+                    return Vec::new();
+                }
+                vec![FsmAction::SendMessage(build_session_update(&metrics))]
+            }
+            // InSession: app declares interest in a destination the modem
+            // has not reported (RFC 8175 §12.13). Router-originated only.
+            (RouterSessionState::InSession, FsmEvent::AppAnnounceDestination { mac }) => {
+                use crate::transaction::RequestKind;
+                if self
+                    .tx
+                    .open_destination(mac, RequestKind::DestinationAnnounce)
+                    .is_err()
+                {
+                    tracing::debug!(?mac, "announce_destination while another tx pending");
+                    return Vec::new();
+                }
+                vec![FsmAction::SendMessage(build_destination_announce(mac))]
             }
             (RouterSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
                 self.state = RouterSessionState::Terminating;

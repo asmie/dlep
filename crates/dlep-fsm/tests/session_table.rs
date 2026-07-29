@@ -1139,3 +1139,231 @@ fn router_in_session_destination_down_responds_and_emits() {
     )));
     assert!(!fsm.destinations.contains_key(&dest_mac()));
 }
+
+// --- Session Update / Session Update Response (RFC 8175 §12.7-12.8) -------
+//
+// §12.7: "A Session Update Message MAY be sent by a DLEP participant, on a
+// session-wide basis, to indicate local Layer 3 address changes and/or
+// metric changes." — so both roles both send and receive it.
+// §12.8: "A Session Update Response Message MUST be sent by a DLEP
+// participant when a Session Update Message is received."
+
+fn make_session_update(metrics: &LinkMetrics) -> dlep_core::Message {
+    dlep_core::Message::new(MessageType::SESSION_UPDATE)
+        .with_item(DataItem::MaxDataRateReceive(metrics.max_data_rate_rx_bps))
+        .with_item(DataItem::MaxDataRateTransmit(metrics.max_data_rate_tx_bps))
+        .with_item(DataItem::CurrentDataRateReceive(
+            metrics.current_data_rate_rx_bps,
+        ))
+        .with_item(DataItem::CurrentDataRateTransmit(
+            metrics.current_data_rate_tx_bps,
+        ))
+        .with_item(DataItem::Latency(metrics.latency))
+        .with_item(DataItem::Resources(metrics.resources))
+        .with_item(DataItem::RelativeLinkQualityReceive(metrics.rlq_rx))
+        .with_item(DataItem::RelativeLinkQualityTransmit(metrics.rlq_tx))
+        .with_item(DataItem::Mtu(metrics.mtu))
+}
+
+/// Pull the first `SendMessage` of the given type out of an action batch.
+fn find_sent(actions: &[FsmAction], ty: MessageType) -> &dlep_core::Message {
+    actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(m) if m.message_type == ty => Some(m),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a SendMessage({ty:?}) in {actions:?}"))
+}
+
+fn has_status(msg: &dlep_core::Message, want: StatusCode) -> bool {
+    msg.data_items
+        .iter()
+        .any(|i| matches!(i, DataItem::Status { code, .. } if *code == want))
+}
+
+#[test]
+fn router_in_session_session_update_must_send_response() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_session_update(
+        &sample_metrics_dest(),
+    )));
+    assert_eq!(fsm.state(), RouterSessionState::InSession);
+    let resp = find_sent(&actions, MessageType::SESSION_UPDATE_RESPONSE);
+    assert!(has_status(resp, StatusCode::SUCCESS));
+}
+
+#[test]
+fn modem_in_session_session_update_must_send_response() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_session_update(
+        &sample_metrics_dest(),
+    )));
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    let resp = find_sent(&actions, MessageType::SESSION_UPDATE_RESPONSE);
+    assert!(has_status(resp, StatusCode::SUCCESS));
+}
+
+#[test]
+fn router_in_session_session_update_emits_session_wide_metrics() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_session_update(
+        &sample_metrics_dest(),
+    )));
+    let emitted = actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::Emit(EmittedEvent::SessionMetricsUpdate { metrics }) => Some(metrics),
+            _ => None,
+        })
+        .expect("expected Emit(SessionMetricsUpdate)");
+    assert_eq!(emitted.current_data_rate_rx_bps, 500_000);
+    assert_eq!(emitted.mtu, 1500);
+}
+
+#[test]
+fn router_in_session_session_update_resets_missed_heartbeat_deadline() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_session_update(
+        &sample_metrics_dest(),
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. })),
+        "RFC 8175 §11.2: any received message resets the deadline"
+    );
+}
+
+#[test]
+fn modem_in_session_app_session_update_sends_session_update() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::AppSessionUpdate {
+        metrics: sample_metrics_dest(),
+    });
+    let sent = find_sent(&actions, MessageType::SESSION_UPDATE);
+    let parsed = dlep_fsm::session_common::extract_link_metrics(sent).expect("metrics present");
+    assert_eq!(parsed.current_data_rate_tx_bps, 500_000);
+}
+
+#[test]
+fn router_in_session_app_session_update_sends_session_update() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let actions = fsm.step(FsmEvent::AppSessionUpdate {
+        metrics: sample_metrics_dest(),
+    });
+    find_sent(&actions, MessageType::SESSION_UPDATE);
+}
+
+#[test]
+fn modem_in_session_session_update_opens_then_closes_session_transaction() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let _ = fsm.step(FsmEvent::AppSessionUpdate {
+        metrics: sample_metrics_dest(),
+    });
+    assert!(
+        fsm.tx.session_busy(),
+        "outbound Session Update must occupy the session-level transaction slot"
+    );
+    let _ = fsm.step(FsmEvent::RecvMessage(make_simple(
+        MessageType::SESSION_UPDATE_RESPONSE,
+    )));
+    assert!(
+        !fsm.tx.session_busy(),
+        "Session Update Response must free the slot"
+    );
+}
+
+#[test]
+fn modem_in_session_second_app_session_update_is_dropped_while_pending() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let first = fsm.step(FsmEvent::AppSessionUpdate {
+        metrics: sample_metrics_dest(),
+    });
+    assert_eq!(action_count_send_message(&first), 1);
+    let second = fsm.step(FsmEvent::AppSessionUpdate {
+        metrics: sample_metrics_dest(),
+    });
+    assert_eq!(
+        action_count_send_message(&second),
+        0,
+        "RFC 8175 allows only one in-flight session-level request"
+    );
+}
+
+// --- Destination Announce (RFC 8175 §12.13-12.14) -------------------------
+//
+// §12.13: "Destination Announce Messages MAY be sent by a router" —
+// router → modem, never the reverse.
+// §12.14: "A modem MUST send a Destination Announce Response Message when a
+// Destination Announce Message is received."
+
+fn make_destination_announce(mac: MacAddress) -> dlep_core::Message {
+    dlep_core::Message::new(MessageType::DESTINATION_ANNOUNCE).with_item(DataItem::MacAddress(mac))
+}
+
+#[test]
+fn router_in_session_app_announce_destination_sends_announce() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let actions = fsm.step(FsmEvent::AppAnnounceDestination { mac: dest_mac() });
+    let sent = find_sent(&actions, MessageType::DESTINATION_ANNOUNCE);
+    assert_eq!(
+        dlep_fsm::session_common::extract_destination_mac(sent),
+        Some(dest_mac())
+    );
+}
+
+#[test]
+fn modem_in_session_destination_announce_must_send_response() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_destination_announce(dest_mac())));
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    let resp = find_sent(&actions, MessageType::DESTINATION_ANNOUNCE_RESPONSE);
+    assert_eq!(
+        dlep_fsm::session_common::extract_destination_mac(resp),
+        Some(dest_mac())
+    );
+    assert!(has_status(resp, StatusCode::SUCCESS));
+}
+
+#[test]
+fn modem_in_session_destination_announce_emits_announced() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_destination_announce(dest_mac())));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        FsmAction::Emit(EmittedEvent::DestinationAnnounced { mac }) if *mac == dest_mac()
+    )));
+}
+
+#[test]
+fn router_in_session_announce_opens_then_closes_destination_transaction() {
+    let mut fsm = router_at(RouterSessionState::InSession);
+    let _ = fsm.step(FsmEvent::AppAnnounceDestination { mac: dest_mac() });
+    assert!(fsm.tx.destination_busy(&dest_mac()));
+    let resp = dlep_core::Message::new(MessageType::DESTINATION_ANNOUNCE_RESPONSE)
+        .with_item(DataItem::MacAddress(dest_mac()))
+        .with_item(DataItem::Status {
+            code: StatusCode::SUCCESS,
+            text: String::new(),
+        });
+    let _ = fsm.step(FsmEvent::RecvMessage(resp));
+    assert!(
+        !fsm.tx.destination_busy(&dest_mac()),
+        "Destination Announce Response must free the per-destination slot"
+    );
+}
+
+#[test]
+fn modem_in_session_destination_announce_without_mac_is_dropped_leniently() {
+    let mut fsm = modem_at(ModemSessionState::InSession);
+    let actions = fsm.step(FsmEvent::RecvMessage(make_simple(
+        MessageType::DESTINATION_ANNOUNCE,
+    )));
+    assert_eq!(fsm.state(), ModemSessionState::InSession);
+    assert_eq!(
+        action_count_send_message(&actions),
+        0,
+        "no MAC to answer for; stay lenient like Destination_Update"
+    );
+}

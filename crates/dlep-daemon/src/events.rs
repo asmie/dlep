@@ -65,6 +65,10 @@ pub enum DaemonEvent {
         negotiated_extensions: Vec<ExtensionId>,
     },
     SessionDown {
+        /// Which peer's session ended. Required so a multi-session embedder
+        /// (one router, several modems) can attribute the drop — and so a
+        /// run loop can evict the dead peer and reconnect.
+        peer: PeerInfo,
         reason: StatusCode,
     },
     Destination(DestinationEvent),
@@ -84,8 +88,9 @@ impl fmt::Debug for DaemonEvent {
                 .field("peer", peer)
                 .field("negotiated_extensions", negotiated_extensions)
                 .finish(),
-            Self::SessionDown { reason } => f
+            Self::SessionDown { peer, reason } => f
                 .debug_struct("SessionDown")
+                .field("peer", peer)
                 .field("reason", reason)
                 .finish(),
             Self::Destination(e) => f.debug_tuple("Destination").field(e).finish(),

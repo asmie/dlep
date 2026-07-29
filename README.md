@@ -12,13 +12,18 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 
 [RFC 8175]: https://www.rfc-editor.org/rfc/rfc8175
 
-> **Status: all nine milestones complete.** Wire codec, both state
-> machines, TCP + TLS (mutual TLS supported) transport, UDP multicast
-> discovery with GTSM, destinations & metrics, the extension plug-in API,
-> and deployable CLI binaries. See
+> **Status: ten milestones complete.** Wire codec, both state machines,
+> TCP + TLS (mutual TLS supported) transport, UDP multicast discovery with
+> GTSM, destinations & metrics, `Session Update` and `Destination Announce`,
+> the extension plug-in API, and deployable CLI binaries with
+> reconnect-on-drop. See
 > [§9 of `doc/architecture.md`](doc/architecture.md#9-implementation-status-high-level)
 > for the milestone log and remaining follow-ups, and
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
+>
+> Not yet implemented: IPv6 discovery transport, `Link Characteristics
+> Request`/`Response`, and configurable session-wide metrics (the modem
+> still advertises placeholders in `Session Initialization Response`).
 
 ## Goals
 
@@ -129,8 +134,14 @@ daemon.shutdown().await?;
 ```
 
 The modem-side API is symmetric, with
-`add_destination` / `update_destination` / `drop_destination` /
-`announce_destination` in place of `start_discovery` / `connect_static`.
+`add_destination` / `update_destination` / `drop_destination` in place of
+`start_discovery` / `connect_static`.
+
+Both handles also expose `update_session_metrics` (session-wide metric
+changes via `Session Update`, RFC 8175 §12.7 — either participant may send
+one). `announce_destination` is **router-side only**: RFC 8175 §12.13 makes
+`Destination Announce` a router-originated message, which the modem answers
+and surfaces to its application as `DestinationEvent::Announced`.
 
 ## Documentation
 

@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -126,15 +127,56 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Drive the daemon until Ctrl-C: connect to modems as discovery finds
-/// them (deduplicated by address) and log session lifecycle.
+/// Drive the daemon until Ctrl-C: connect to modems as discovery finds them,
+/// log session lifecycle, and re-dial peers whose session dropped.
+///
+/// `connected` tracks addresses with an active or in-flight session, so the
+/// discovery path and the reconnect path never dial the same modem twice.
+/// A dropped peer is removed from it — without that, the dedup check would
+/// permanently suppress re-connection to a modem that restarted.
 async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent>) {
     let mut connected: HashSet<SocketAddr> = HashSet::new();
+    let mut reconnect = ReconnectQueue::default();
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
+        // Wake at the earliest pending reconnect deadline; park forever when
+        // nothing is queued so an idle router doesn't spin.
+        let next_due = reconnect.next_due();
+        let retry_tick = async move {
+            match next_due {
+                Some(at) => tokio::time::sleep_until(at.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(retry_tick);
+
         tokio::select! {
             _ = &mut ctrl_c => return,
+            _ = &mut retry_tick => {
+                for peer in reconnect.take_due(Instant::now()) {
+                    if connected.contains(&peer) {
+                        // Discovery already re-established this one.
+                        reconnect.forget(&peer);
+                        continue;
+                    }
+                    tracing::info!(addr = %peer, "reconnecting to modem");
+                    match daemon.connect_static(peer).await {
+                        Ok(()) => {
+                            connected.insert(peer);
+                            // Drop it from the queue so a deadline firing
+                            // before SessionUp can't open a second session.
+                            reconnect.forget(&peer);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                addr = %peer, error = %e,
+                                "reconnect failed; will retry with backoff"
+                            );
+                        }
+                    }
+                }
+            }
             evt = events.recv() => match evt {
                 Ok(DaemonEvent::PeerDiscovered(peer)) => {
                     if !connected.insert(peer.addr) {
@@ -144,13 +186,22 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                     if let Err(e) = daemon.connect_static(peer.addr).await {
                         tracing::warn!(addr = %peer.addr, error = %e, "connect failed");
                         connected.remove(&peer.addr);
+                        reconnect.schedule(peer.addr, Instant::now());
+                    } else {
+                        reconnect.forget(&peer.addr);
                     }
                 }
                 Ok(DaemonEvent::SessionUp { peer, .. }) => {
                     tracing::info!(addr = %peer.addr, tls = peer.is_tls, "session up");
+                    connected.insert(peer.addr);
+                    // Session established: the next drop is a fresh incident
+                    // and should retry at the base delay, not a grown one.
+                    reconnect.forget(&peer.addr);
                 }
-                Ok(DaemonEvent::SessionDown { reason }) => {
-                    tracing::info!(?reason, "session down");
+                Ok(DaemonEvent::SessionDown { peer, reason }) => {
+                    tracing::info!(addr = %peer.addr, ?reason, "session down; scheduling reconnect");
+                    connected.remove(&peer.addr);
+                    reconnect.schedule(peer.addr, Instant::now());
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(skipped)) => {
@@ -159,6 +210,79 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                 Err(RecvError::Closed) => return,
             },
         }
+    }
+}
+
+/// Delay before the first reconnect attempt after a session drops.
+const RECONNECT_BASE: Duration = Duration::from_secs(1);
+/// Ceiling for the exponential backoff, so a modem that stays down is retried
+/// at a steady low rate rather than never or in a hot loop.
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// Peers whose session dropped and that we intend to dial again, each with an
+/// exponentially-growing delay.
+///
+/// The clock is passed in rather than read from `Instant::now()` internally so
+/// the scheduling logic is unit-testable without sleeping.
+#[derive(Debug, Default)]
+struct ReconnectQueue {
+    entries: HashMap<SocketAddr, ReconnectEntry>,
+}
+
+#[derive(Debug)]
+struct ReconnectEntry {
+    /// Attempts already handed out by `take_due`.
+    attempts: u32,
+    due: Instant,
+}
+
+impl ReconnectQueue {
+    /// `attempts` = retries already made; 0 yields the base delay.
+    fn backoff_for(attempts: u32) -> Duration {
+        // `checked_shl`-free: cap the shift before it can overflow, then clamp.
+        let shift = attempts.min(16);
+        RECONNECT_BASE
+            .saturating_mul(1u32 << shift)
+            .min(RECONNECT_MAX)
+    }
+
+    /// Queue a dropped peer. A peer already queued keeps its accumulated
+    /// backoff, so a flapping modem cannot rewind itself to the base delay by
+    /// dropping repeatedly.
+    fn schedule(&mut self, addr: SocketAddr, now: Instant) {
+        self.entries.entry(addr).or_insert_with(|| ReconnectEntry {
+            attempts: 0,
+            due: now + Self::backoff_for(0),
+        });
+    }
+
+    /// Hand back every peer whose delay has elapsed, re-arming each at the
+    /// next backoff step. A caller that reconnects successfully calls
+    /// [`Self::forget`]; one that fails need do nothing, since the peer is
+    /// already scheduled for another try.
+    fn take_due(&mut self, now: Instant) -> Vec<SocketAddr> {
+        let mut due: Vec<SocketAddr> = Vec::new();
+        for (addr, entry) in self.entries.iter_mut() {
+            if entry.due <= now {
+                entry.attempts = entry.attempts.saturating_add(1);
+                entry.due = now + Self::backoff_for(entry.attempts);
+                due.push(*addr);
+            }
+        }
+        // Deterministic order keeps logs and tests stable.
+        due.sort();
+        due
+    }
+
+    /// Stop retrying a peer — call on `SessionUp` so the next drop starts a
+    /// fresh backoff sequence.
+    fn forget(&mut self, addr: &SocketAddr) {
+        self.entries.remove(addr);
+    }
+
+    /// Earliest pending deadline, for sizing the event loop's sleep.
+    fn next_due(&self) -> Option<Instant> {
+        self.entries.values().map(|e| e.due).min()
     }
 }
 
@@ -257,5 +381,98 @@ mod tests {
         assert!(matches!(cfg.mode, DiscoveryMode::Discovery));
         assert!(cfg.static_peers.is_empty());
         assert!(cfg.shared.tls.cert.is_none());
+    }
+
+    // --- ReconnectQueue ---------------------------------------------------
+
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, n], 854))
+    }
+
+    #[test]
+    fn backoff_doubles_from_base_and_saturates_at_cap() {
+        assert_eq!(ReconnectQueue::backoff_for(0), RECONNECT_BASE);
+        assert_eq!(ReconnectQueue::backoff_for(1), Duration::from_secs(2));
+        assert_eq!(ReconnectQueue::backoff_for(2), Duration::from_secs(4));
+        assert_eq!(ReconnectQueue::backoff_for(3), Duration::from_secs(8));
+        // Far past the cap, and past what shifting a u32 could hold.
+        assert_eq!(ReconnectQueue::backoff_for(50), RECONNECT_MAX);
+        assert_eq!(ReconnectQueue::backoff_for(u32::MAX), RECONNECT_MAX);
+    }
+
+    #[test]
+    fn peer_is_not_due_until_the_backoff_elapses() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        q.schedule(addr(1), now);
+        assert!(q.take_due(now).is_empty(), "must wait out the backoff");
+        assert_eq!(
+            q.take_due(now + RECONNECT_BASE),
+            vec![addr(1)],
+            "due once the base backoff elapses"
+        );
+    }
+
+    #[test]
+    fn taking_a_peer_rearms_it_with_a_longer_backoff() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        q.schedule(addr(1), now);
+
+        let first = now + RECONNECT_BASE;
+        assert_eq!(q.take_due(first), vec![addr(1)]);
+        // A failed attempt leaves the peer queued, but at 2× the delay.
+        assert!(
+            q.take_due(first + RECONNECT_BASE).is_empty(),
+            "second attempt must not fire after only one base interval"
+        );
+        assert_eq!(q.take_due(first + Duration::from_secs(2)), vec![addr(1)]);
+    }
+
+    #[test]
+    fn forget_stops_further_retries() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        q.schedule(addr(1), now);
+        q.forget(&addr(1));
+        assert!(q.take_due(now + Duration::from_secs(600)).is_empty());
+        assert!(q.next_due().is_none());
+    }
+
+    #[test]
+    fn rescheduling_a_queued_peer_does_not_reset_its_backoff() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        q.schedule(addr(1), now);
+        let first = now + RECONNECT_BASE;
+        assert_eq!(q.take_due(first), vec![addr(1)]);
+
+        // A flapping peer that drops again must not rewind to the base delay.
+        q.schedule(addr(1), first);
+        assert!(q.take_due(first + RECONNECT_BASE).is_empty());
+    }
+
+    #[test]
+    fn a_peer_reconnected_then_dropped_again_restarts_at_the_base_delay() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        q.schedule(addr(1), now);
+        let first = now + RECONNECT_BASE;
+        assert_eq!(q.take_due(first), vec![addr(1)]);
+        // Session came back up, so the queue forgets the peer entirely...
+        q.forget(&addr(1));
+        // ...and a later drop is a fresh incident, not attempt #2.
+        q.schedule(addr(1), first);
+        assert_eq!(q.take_due(first + RECONNECT_BASE), vec![addr(1)]);
+    }
+
+    #[test]
+    fn next_due_reports_the_earliest_deadline() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        assert!(q.next_due().is_none());
+        q.schedule(addr(1), now + Duration::from_secs(10));
+        q.schedule(addr(2), now);
+        assert_eq!(q.next_due(), Some(now + RECONNECT_BASE));
     }
 }

@@ -73,6 +73,42 @@ pub fn build_session_termination_response() -> Message {
     Message::new(MessageType::SESSION_TERMINATION_RESPONSE)
 }
 
+/// Build a `Session_Update` message (RFC 8175 §12.7). Carries session-wide
+/// metrics. The RFC also allows Layer 3 address changes in this message; we
+/// only originate the metric form, and are lenient about what we accept.
+pub fn build_session_update(metrics: &LinkMetrics) -> Message {
+    push_metric_items(Message::new(MessageType::SESSION_UPDATE), metrics)
+}
+
+/// Build a `Session_Update_Response` (RFC 8175 §12.8). The RFC makes this
+/// response mandatory on receipt of a Session Update, and specifies a Status
+/// Data Item as its payload.
+pub fn build_session_update_response(status: StatusCode) -> Message {
+    Message::new(MessageType::SESSION_UPDATE_RESPONSE).with_item(DataItem::Status {
+        code: status,
+        text: String::new(),
+    })
+}
+
+/// Build a `Destination_Announce` (RFC 8175 §12.13). Router → modem only:
+/// "Destination Announce Messages MAY be sent by a router to announce such
+/// an interest" in a destination the modem has not reported.
+pub fn build_destination_announce(mac: MacAddress) -> Message {
+    Message::new(MessageType::DESTINATION_ANNOUNCE).with_item(DataItem::MacAddress(mac))
+}
+
+/// Build a `Destination_Announce_Response` (RFC 8175 §12.14). Modem → router,
+/// and mandatory: "A modem MUST send a Destination Announce Response Message
+/// when a Destination Announce Message is received."
+pub fn build_destination_announce_response(mac: MacAddress, status: StatusCode) -> Message {
+    Message::new(MessageType::DESTINATION_ANNOUNCE_RESPONSE)
+        .with_item(DataItem::MacAddress(mac))
+        .with_item(DataItem::Status {
+            code: status,
+            text: String::new(),
+        })
+}
+
 pub fn extract_status(msg: &Message) -> Option<StatusCode> {
     msg.data_items.iter().find_map(|item| match item {
         DataItem::Status { code, .. } => Some(*code),

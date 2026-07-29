@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use dlep_core::{MacAddress, StatusCode};
+use dlep_core::StatusCode;
 use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
 use dlep_fsm::session_modem::ModemSessionFsm;
 use dlep_net::{Acceptor, ServerConfig};
@@ -79,10 +79,12 @@ impl ModemDaemon {
             .await
     }
 
-    pub async fn announce_destination(&self, mac: MacAddress) -> Result<(), DaemonError> {
-        // Destination_Announce is out of M5 scope; tracked as future work.
-        let _ = mac;
-        Ok(())
+    /// Push session-wide metric changes to every connected router via a
+    /// Session Update Message (RFC 8175 §12.7). These are the session-level
+    /// defaults, distinct from the per-destination metrics carried by
+    /// [`Self::update_destination`].
+    pub async fn update_session_metrics(&self, metrics: LinkMetrics) -> Result<(), DaemonError> {
+        self.fanout(SessionCommand::SessionUpdate { metrics }).await
     }
 
     /// Fan a command to every active session. Snapshot the sender list under
