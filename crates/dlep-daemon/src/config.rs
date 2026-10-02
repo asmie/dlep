@@ -230,6 +230,8 @@ pub enum DiscoveryMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(from = "RouterConfigFile")]
 pub struct RouterConfig {
+    #[serde(default)]
+    pub limits: RouterLimits,
     #[serde(flatten)]
     pub shared: SharedConfig,
     #[serde(default)]
@@ -243,11 +245,44 @@ pub struct RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
+            limits: RouterLimits::default(),
             shared: SharedConfig::default(),
             mode: DiscoveryMode::default(),
             static_peers: Vec::new(),
             peer_description: default_router_peer_description(),
         }
+    }
+}
+
+/// Router admission and retained discovery history limits. Static peer history
+/// is bounded by the configured peer list and does not consume discovered slots.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouterLimits {
+    pub max_sessions: usize,
+    pub max_discovered_peers: usize,
+    pub peer_retention_secs: u32,
+}
+
+impl Default for RouterLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: 64,
+            max_discovered_peers: 256,
+            peer_retention_secs: 300,
+        }
+    }
+}
+
+impl RouterLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_sessions == 0 || self.max_sessions > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err("max_sessions must be positive and within semaphore capacity".into());
+        }
+        if self.max_discovered_peers == 0 || self.peer_retention_secs == 0 {
+            return Err("max_discovered_peers and peer_retention_secs must be positive".into());
+        }
+        Ok(())
     }
 }
 
@@ -324,6 +359,8 @@ impl Default for ModemConfig {
 #[serde(deny_unknown_fields)]
 struct RouterConfigFile {
     #[serde(default)]
+    limits: RouterLimits,
+    #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
     tls: TlsConfig,
@@ -340,6 +377,7 @@ struct RouterConfigFile {
 impl From<RouterConfigFile> for RouterConfig {
     fn from(file: RouterConfigFile) -> Self {
         Self {
+            limits: file.limits,
             shared: SharedConfig {
                 network: file.network,
                 tls: file.tls,

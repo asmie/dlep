@@ -164,6 +164,7 @@ async fn run_event_loop(
     events: &mut Receiver<DaemonEvent>,
     static_peers: &[SocketAddr],
 ) {
+    let pinned: HashSet<_> = static_peers.iter().copied().collect();
     let mut connected: HashSet<SocketAddr> = HashSet::new();
     let mut reconnect = ReconnectQueue::default();
     let mut attempts = ConnectAttempts::default();
@@ -175,8 +176,17 @@ async fn run_event_loop(
         // Read current state before acting on offers or retry deadlines. The
         // initial snapshot also covers sessions that ended during startup.
         if refresh || states.has_changed().unwrap_or(false) {
+            let snapshot = states.borrow_and_update().clone();
+            prune_reconnect_state(
+                &snapshot,
+                &pinned,
+                &mut establishments,
+                &mut connected,
+                &mut reconnect,
+            );
+            attempts.retain_retries(|peer| snapshot.contains_key(peer) || pinned.contains(peer));
             reconcile_connections(
-                &states.borrow_and_update(),
+                &snapshot,
                 &mut establishments,
                 &mut connected,
                 &mut reconnect,
@@ -189,17 +199,21 @@ async fn run_event_loop(
         for peer in attempts.endpoints() {
             reconnect.suspend(peer);
         }
-        while attempts.capacity() > 0 {
+        let mut startup_capacity = attempts.capacity().min(daemon.connection_capacity());
+        while startup_capacity > 0 {
             let Some(peer) = startup.pop_front() else {
                 break;
             };
-            if !connected.contains(&peer) && !reconnect.contains(&peer) {
-                attempts.start_static(daemon, peer);
+            if !connected.contains(&peer)
+                && !reconnect.contains(&peer)
+                && attempts.start_static(daemon, peer)
+            {
+                startup_capacity -= 1;
             }
         }
         // Leave excess due peers queued without advancing their attempt count.
         // A full pool waits for completion rather than spinning on past deadlines.
-        let next_due = if attempts.capacity() > 0 {
+        let next_due = if attempts.capacity() > 0 && daemon.connection_capacity() > 0 {
             reconnect.next_due()
         } else {
             None
@@ -213,6 +227,7 @@ async fn run_event_loop(
         tokio::pin!(retry_tick);
 
         tokio::select! {
+            _ = daemon.wait_for_connection_capacity(), if daemon.connection_capacity() == 0 => {}
             changed = states.changed() => {
                 if changed.is_err() { return; }
                 refresh = true;
@@ -236,7 +251,7 @@ async fn run_event_loop(
                 }
             }
             _ = &mut retry_tick => {
-                for peer in reconnect.take_due_limited(Instant::now(), attempts.capacity()) {
+                for peer in reconnect.take_due_limited(Instant::now(), attempts.capacity().min(daemon.connection_capacity())) {
                     reconnect.suspend(&peer);
                     if connected.contains(&peer) || attempts.contains(&peer) { continue; }
                     tracing::info!(addr = %peer, "reconnecting to modem");
@@ -245,6 +260,7 @@ async fn run_event_loop(
             }
             evt = events.recv() => match evt {
                 Ok(DaemonEvent::PeerDiscovered(mut offer)) => {
+                    if daemon.connection_capacity() == 0 { continue; }
                     if offer.endpoints.iter().any(|e| connected.contains(&e.addr) || attempts.contains(&e.addr)) { continue; }
                     // The retry queue owns endpoints with a failure history.
                     // Repeated offers must not bypass their backoff; new
@@ -269,6 +285,22 @@ async fn run_event_loop(
             },
         }
     }
+}
+
+/// Expiry/eviction is authoritative for discovered peers. Static endpoints
+/// with no successful TCP connection still need retry state outside the snapshot.
+fn prune_reconnect_state(
+    states: &HashMap<SocketAddr, PeerConnectionState>,
+    pinned: &HashSet<SocketAddr>,
+    establishments: &mut HashMap<SocketAddr, u64>,
+    connected: &mut HashSet<SocketAddr>,
+    reconnect: &mut ReconnectQueue,
+) {
+    establishments.retain(|peer, _| states.contains_key(peer));
+    connected.retain(|peer| states.contains_key(peer));
+    reconnect
+        .entries
+        .retain(|peer, _| states.contains_key(peer) || pinned.contains(peer));
 }
 
 /// Reconcile retained state, never replay potentially stale broadcast events.
@@ -442,6 +474,34 @@ mod tests {
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("dlep-router").chain(args.iter().copied()))
             .expect("CLI args parse")
+    }
+
+    #[test]
+    fn eviction_bounds_all_retry_maps_and_preserves_static_peers_without_snapshots() {
+        let now = Instant::now();
+        let mut reconnect = ReconnectQueue::default();
+        let mut seen = HashMap::new();
+        let mut connected = HashSet::new();
+        let pinned = HashSet::from([addr(1)]);
+        reconnect.schedule(addr(1), now);
+        for port in 2..1002 {
+            let peer = SocketAddr::from(([192, 0, 2, 2], port));
+            let states = HashMap::from([(peer, PeerConnectionState::default())]);
+            prune_reconnect_state(&states, &pinned, &mut seen, &mut connected, &mut reconnect);
+            reconcile_connections(&states, &mut seen, &mut connected, &mut reconnect, now);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(reconnect.entries.len(), 2);
+            assert!(reconnect.contains(&addr(1)));
+        }
+        prune_reconnect_state(
+            &HashMap::new(),
+            &pinned,
+            &mut seen,
+            &mut connected,
+            &mut reconnect,
+        );
+        assert!(seen.is_empty() && connected.is_empty());
+        assert_eq!(reconnect.take_due(now + RECONNECT_BASE), vec![addr(1)]);
     }
 
     #[test]
@@ -738,6 +798,124 @@ mod reconnect_runtime_tests {
     };
 
     const WAIT: Duration = Duration::from_secs(3);
+
+    #[tokio::test]
+    async fn session_capacity_defers_static_peers_until_disconnect() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        first.set_ttl(255).unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        second.set_ttl(255).unwrap();
+        let peers = vec![first.local_addr().unwrap(), second.local_addr().unwrap()];
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        config.limits.max_sessions = 1;
+        config.static_peers = peers.clone();
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(config)
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let driver_daemon = daemon.clone();
+        let mut events = daemon.subscribe();
+        let driver = tokio::spawn(async move {
+            run_event_loop(&driver_daemon, &mut driver_daemon.subscribe(), &peers).await;
+        });
+        let (mut peer, _) = timeout(WAIT, first.accept()).await.unwrap().unwrap();
+        initialize(&mut peer, false).await;
+        lifecycle(&mut events, true).await;
+        assert!(
+            timeout(Duration::from_millis(200), second.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(daemon.connection_capacity(), 0);
+        drop(peer);
+        // A static peer deferred at capacity must be admitted after cleanup,
+        // without a new offer or a lifecycle broadcast replay.
+        let (mut replacement, _) = timeout(WAIT, second.accept()).await.unwrap().unwrap();
+        initialize(&mut replacement, false).await;
+        lifecycle(&mut events, true).await;
+        assert_eq!(daemon.connection_capacity(), 0);
+        driver.abort();
+        let _ = driver.await;
+        drop(replacement);
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_discovered_peer_stops_retrying_until_a_fresh_offer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        config.limits.peer_retention_secs = 1;
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(config)
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let mut states = daemon.connection_states();
+        let mut events = daemon.subscribe();
+        daemon.connect_static(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        initialize(&mut peer, false).await;
+        lifecycle(&mut events, true).await;
+        let driver_daemon = daemon.clone();
+        let (offers, mut event_feed) = tokio::sync::broadcast::channel(16);
+        let driver = tokio::spawn(async move {
+            run_event_loop(&driver_daemon, &mut event_feed, &[]).await;
+        });
+        drop(listener);
+        drop(peer);
+        lifecycle(&mut events, false).await;
+        // Failed connection retries cannot refresh the retention window.
+        // The event loop receives no lifecycle broadcasts, only its snapshots.
+        timeout(WAIT, async {
+            while states.borrow_and_update().contains_key(&addr) {
+                states.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let listener = TcpListener::bind(addr).await.unwrap();
+        listener.set_ttl(255).unwrap();
+        assert!(
+            timeout(Duration::from_millis(3200), listener.accept())
+                .await
+                .is_err()
+        );
+        offers
+            .send(DaemonEvent::PeerDiscovered(PeerOffer {
+                endpoints: vec![OfferEndpoint {
+                    addr,
+                    use_tls: false,
+                }],
+                peer_description: None,
+            }))
+            .unwrap();
+        let (mut peer, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        initialize(&mut peer, false).await;
+        lifecycle(&mut events, true).await;
+        driver.abort();
+        let _ = driver.await;
+        drop(peer);
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
 
     async fn read_message(peer: &mut TcpStream) -> Message {
         timeout(WAIT, async {

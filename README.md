@@ -272,7 +272,12 @@ handling responsive. Unavailable static peers stay queued for retry; queued
 peers wait when all slots are occupied, and discovery can retry on later offers.
 Reconnect decisions use `RouterDaemon::connection_states()`, a retained state
 feed independent of the lossy public event broadcast. Missing `SessionUp` or
-`SessionDown` events therefore cannot prevent reconnection or backoff reset.
+`SessionDown` events therefore cannot prevent reconnection or backoff reset
+while a peer remains retained. Router limits default to 64 connections/sessions,
+256 discovered endpoints, and 300 seconds of inactive discovery history. Static
+peers stay eligible for retries; expired/evicted discovered peers require a fresh
+offer or explicit connection request. See [router limits](doc/deployment.md#3-configuration)
+for configuration and snapshot-consumer requirements.
 
 `[network].interface` / `--interface` selects discovery group membership,
 multicast egress, unicast reply source, and accepted ingress interface. For

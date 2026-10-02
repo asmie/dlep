@@ -82,6 +82,20 @@ impl<'a> ConnectAttempts<'a> {
         true
     }
 
+    /// Cancel retries whose discovered-peer history expired or was evicted.
+    /// Fresh offers (retry_peer=None) have no retained entry until connected.
+    pub fn retain_retries(&mut self, keep: impl Fn(&SocketAddr) -> bool) {
+        self.attempts.retain(|attempt| {
+            let retain = attempt.retry_peer.as_ref().is_none_or(&keep);
+            if !retain {
+                for endpoint in &attempt.endpoints {
+                    self.reserved.remove(endpoint);
+                }
+            }
+            retain
+        });
+    }
+
     pub async fn next(&mut self) -> Completion {
         // At most eight futures are polled on a wake. Each future registers
         // this task's waker; no extra task or unbounded work queue is needed.
@@ -112,6 +126,30 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::sync::oneshot;
+
+    #[test]
+    fn evicted_retries_are_cancelled_but_static_and_new_offers_survive() {
+        let a = "127.0.0.1:1".parse().unwrap();
+        let b = "127.0.0.1:2".parse().unwrap();
+        let c = "127.0.0.1:3".parse().unwrap();
+        let mut attempts = ConnectAttempts::default();
+        let (tx, rx) = oneshot::channel::<()>();
+        assert!(attempts.insert(
+            vec![a],
+            Some(a),
+            Box::pin(async move {
+                let _ = rx.await;
+                Ok(a)
+            })
+        ));
+        assert!(attempts.insert(vec![b], Some(b), Box::pin(std::future::pending())));
+        assert!(attempts.insert(vec![c], None, Box::pin(std::future::pending())));
+        attempts.retain_retries(|peer| *peer == b);
+        assert!(tx.is_closed());
+        assert!(!attempts.contains(&a));
+        assert!(attempts.contains(&b) && attempts.contains(&c));
+        assert_eq!(attempts.capacity(), MAX_CONNECT_ATTEMPTS - 2);
+    }
 
     #[tokio::test]
     async fn bounded_attempts_poll_past_stalled_peers_and_cancel_on_drop() {

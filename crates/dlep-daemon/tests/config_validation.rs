@@ -4,6 +4,42 @@ use dlep_daemon::{
 };
 
 #[tokio::test]
+async fn router_limits_are_validated_by_config_checks_and_startup() {
+    for settings in [
+        "max_sessions=0",
+        "max_discovered_peers=0",
+        "peer_retention_secs=0",
+    ] {
+        let config: RouterConfig =
+            toml::from_str(&format!("[network]\nuse_tls=false\n[limits]\n{settings}")).unwrap();
+        assert!(matches!(
+            check_router_config(&config),
+            Err(ConfigCheckError::Limits(_))
+        ));
+        assert!(matches!(
+            RouterDaemon::builder().config(config).spawn().await,
+            Err(DaemonError::Config(_))
+        ));
+    }
+    let config: RouterConfig = toml::from_str("[network]\nuse_tls=false\n[limits]\nmax_sessions=2\nmax_discovered_peers=3\npeer_retention_secs=4").unwrap();
+    check_router_config(&config).unwrap();
+    let config: RouterConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(config.limits.max_sessions, 2);
+    assert_eq!(config.limits.max_discovered_peers, 3);
+    assert_eq!(config.limits.peer_retention_secs, 4);
+    assert!(toml::from_str::<RouterConfig>("[limits]\nmax_session=1").is_err());
+    assert!(toml::from_str::<ModemConfig>("[limits]\nmax_sessions=1").is_err());
+    RouterDaemon::builder()
+        .config(config)
+        .spawn()
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn timer_checks_and_builders_reject_the_same_invalid_values() {
     for (field, value) in [
         ("heartbeat_interval_ms", 0),

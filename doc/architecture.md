@@ -672,7 +672,15 @@ incompatible local commands and terminate on incompatible received MAC items.
 Extension dispatch and queued writes enforce the same policy. Tests cover both
 formats, every core destination message, removal of the last destination,
 reconnection, configuration parsing, and extension bypass paths.
-R3–R4 remain open and take precedence over broad completion statements above.
+R3 (router resource limits) is now fixed. Configurable budgets bound concurrent
+TCP/TLS attempts plus sessions and non-static endpoint history. Oldest inactive
+entries are evicted under pressure; inactive entries expire without failed retries
+extending retention. Configured static peers remain retained, and active sessions
+are protected. Registry generations survive eviction/re-admission; the event loop
+prunes matching retry state and cancels stale attempts without relying on lifecycle
+broadcasts. Tests cover endpoint churn, expiry, cancellation, capacity recovery,
+static-peer deferral, rediscovery, and existing lag/backoff behavior.
+R4 remains open and takes precedence over broad completion statements above.
 Each follow-up remains a separate commit checkpoint.
 
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.

@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::config::{NetworkConfig, RouterConfig, TimersConfig};
-use crate::connections::{ConnectionTracker, ConnectionTx, PeerConnectionState};
+use crate::connections::{ConnectionRegistry, HistoryReaper, PeerConnectionState};
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
@@ -27,7 +27,9 @@ type SessionTaskHandle = JoinHandle<Result<(), DaemonError>>;
 /// background task handles.
 pub struct RouterDaemon {
     events_tx: EventTx,
-    connections: ConnectionTx,
+    connections: Arc<ConnectionRegistry>,
+    session_slots: Arc<tokio::sync::Semaphore>,
+    _history_reaper: HistoryReaper,
     timers: TimersConfig,
     network: NetworkConfig,
     /// Per-active-session command channels, used to fan out shutdown.
@@ -59,10 +61,28 @@ impl RouterDaemon {
     /// `subscribe()`, this feed cannot lag or lose the latest lifecycle state.
     /// Changes may coalesce; `establishment_count` preserves successful
     /// initializations even when a session is already closed when read.
+    /// Inactive non-static entries expire or are evicted under history pressure.
+    /// Subscribers must discard retry state for endpoints removed from snapshots;
+    /// the generation stays unique even when eviction and re-admission coalesce.
     /// Read the initial snapshot as well as subsequent changes. Drop watch
     /// borrow guards before awaiting to avoid blocking session state updates.
     pub fn connection_states(&self) -> watch::Receiver<HashMap<SocketAddr, PeerConnectionState>> {
         self.connections.subscribe()
+    }
+
+    /// Connections being established and registered sessions share this budget.
+    pub fn connection_capacity(&self) -> usize {
+        self.session_slots.available_permits()
+    }
+
+    /// Wait without retaining a slot. Drivers must still handle admission races.
+    pub async fn wait_for_connection_capacity(&self) {
+        drop(
+            self.session_slots
+                .acquire()
+                .await
+                .expect("session budget stays open"),
+        );
     }
 
     pub async fn start_discovery(&self) -> Result<(), DaemonError> {
@@ -130,6 +150,11 @@ impl RouterDaemon {
     /// registration drops the pending transport; spawned sessions are always
     /// registered for graceful shutdown before this future can yield again.
     pub async fn connect_static(&self, peer: SocketAddr) -> Result<(), DaemonError> {
+        let permit = self
+            .session_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DaemonError::SessionLimitReached)?;
         let connector = if self.network.use_tls {
             let cfg = self.client_tls.clone().ok_or_else(|| {
                 DaemonError::Config(
@@ -161,8 +186,8 @@ impl RouterDaemon {
         let events_tx = self.events_tx.clone();
         let mut commands = self.session_cmds.lock().await;
         let mut tasks = self.tasks.lock().await;
-        let tracker = ConnectionTracker::new(self.connections.clone(), peer_info.addr);
-        let handle = tokio::spawn(run_session_tracked(
+        let tracker = self.connections.register(peer_info.addr)?;
+        let session = run_session_tracked(
             fsm,
             transport,
             dlep_fsm::FsmEvent::TcpConnected,
@@ -173,7 +198,11 @@ impl RouterDaemon {
             Role::Router,
             self.session_id_counter.clone(),
             Some(tracker),
-        ));
+        );
+        let handle = tokio::spawn(async move {
+            let _permit = permit;
+            session.await
+        });
 
         commands.retain(|tx| !tx.is_closed());
         commands.push(cmd_tx);
@@ -366,10 +395,15 @@ impl RouterBuilder {
             .network
             .validate_discovery_interface()
             .map_err(|e| DaemonError::Config(e.to_string()))?;
+        cfg.limits.validate().map_err(DaemonError::Config)?;
+        let connections = ConnectionRegistry::new(cfg.limits.clone(), &cfg.static_peers);
+        let reaper = connections.reap_periodically();
         let (events_tx, _events_rx) = new_event_channel();
         Ok(RouterDaemon {
             events_tx,
-            connections: watch::channel(HashMap::new()).0,
+            connections,
+            session_slots: Arc::new(tokio::sync::Semaphore::new(cfg.limits.max_sessions)),
+            _history_reaper: reaper,
             timers: cfg.shared.timers.clone(),
             network: cfg.shared.network.clone(),
             session_cmds: Arc::new(Mutex::new(Vec::new())),
@@ -400,6 +434,94 @@ mod cancellation_tests {
             .spawn()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_limit_refuses_connections_and_abort_reclaims_the_slot() {
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        config.limits.max_sessions = 1;
+        let daemon = RouterDaemon::builder()
+            .config(config)
+            .spawn()
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let addr = listener.local_addr().unwrap();
+        daemon.connect_static(addr).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            daemon.connect_static(addr).await,
+            Err(DaemonError::SessionLimitReached)
+        ));
+        assert_eq!(daemon.connection_capacity(), 0);
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let task = daemon.tasks.lock().await.pop().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        timeout(
+            Duration::from_secs(1),
+            daemon.wait_for_connection_capacity(),
+        )
+        .await
+        .unwrap();
+        daemon.connect_static(addr).await.unwrap();
+        let (_replacement, _) = listener.accept().await.unwrap();
+        assert_eq!(
+            daemon.connection_states().borrow()[&addr].active_sessions,
+            1
+        );
+        let task = daemon.tasks.lock().await.pop().unwrap();
+        task.abort();
+        let _ = task.await;
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn budget_covers_stalled_tls_and_releases_on_cancellation_and_connect_error() {
+        use dlep_net::tls::test_helpers::{client_config_for, self_signed_for_ip};
+        let mut config = RouterConfig::default();
+        config.limits.max_sessions = 1;
+        let pki = self_signed_for_ip("127.0.0.1".parse().unwrap());
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(config)
+                .with_rustls_client(client_config_for(pki.roots))
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connecting = daemon.clone();
+        let task = tokio::spawn(async move { connecting.connect_static(addr).await });
+        let (_peer, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            daemon.connect_static(addr).await,
+            Err(DaemonError::SessionLimitReached)
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(daemon.connection_capacity(), 1);
+        assert!(daemon.connection_states().borrow().is_empty());
+        drop(listener);
+        assert!(daemon.connect_static(addr).await.is_err());
+        assert_eq!(daemon.connection_capacity(), 1);
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

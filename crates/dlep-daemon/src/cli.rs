@@ -46,6 +46,8 @@ where
 /// Errors surfaced by `--check-config` style validation.
 #[derive(Debug, Error)]
 pub enum ConfigCheckError {
+    #[error("invalid router limits: {0}")]
+    Limits(String),
     #[error("invalid timers: {0}")]
     Timers(String),
     #[error("invalid discovery interface: {0}")]
@@ -61,6 +63,7 @@ pub enum ConfigCheckError {
 /// Validate a router configuration without starting the daemon: TLS
 /// material must load when `use_tls` is on, and static mode needs peers.
 pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
+    cfg.limits.validate().map_err(ConfigCheckError::Limits)?;
     cfg.shared
         .timers
         .validate()

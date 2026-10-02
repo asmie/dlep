@@ -170,6 +170,10 @@ pub const COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// Errors returned from the public daemon API.
 #[derive(Debug, Error)]
 pub enum DaemonError {
+    #[error("router connection/session limit reached")]
+    SessionLimitReached,
+    #[error("router discovered-peer history is full of active peers")]
+    PeerHistoryFull,
     #[error("no matching live session")]
     NoMatchingSession,
     #[error("command was not accepted by every session: {0:?}")]

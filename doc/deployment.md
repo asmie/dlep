@@ -84,6 +84,9 @@ metrics, and TLS material as well.
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |
 | top level (router) | `static_peers` | `[]` | modem `addr:port` list for static mode |
 | top level | `peer_description` | binary name | Peer Type data item text |
+| `[limits]` (router) | `max_sessions` | `64` | positive bound on TCP/TLS attempts plus registered sessions |
+| `[limits]` (router) | `max_discovered_peers` | `256` | positive bound on retained non-static endpoints, including active peers |
+| `[limits]` (router) | `peer_retention_secs` | `300` | positive retention window for inactive non-static peers; failed retries do not refresh it |
 | `[network]` | `interface` | none | Discovery interface name: membership, sending, and receive filtering |
 | `[network]` | `mac_address_format` | `"eui48"` | Destination MAC format: `"eui48"` or `"eui64"`; must match the modem's router-facing link |
 | `[network]` | `discovery_v4_group` | `224.0.0.117` | IPv4 discovery multicast group |
@@ -183,6 +186,29 @@ dlep-modem  --config /etc/dlep/modem.toml  --check-config
 mode has peers, any explicit discovery interface is usable on this host, modem
 metric values and timers pass validation, and all TLS material loads. This does
 not open sockets or check GTSM capabilities, firewall rules, or peer reachability.
+
+Router `[limits]` values are checked by `--check-config` and daemon startup.
+The session budget is reserved before opening TCP and held through TLS,
+initialization, session operation, and cleanup; cancellation and failures release
+it. The binary defers static peers and retry deadlines while the budget is full.
+Library callers receive `SessionLimitReached` and may retry after capacity returns.
+
+The peer-history budget includes active and inactive endpoints absent from
+`static_peers`. New endpoints evict the oldest inactive entry when full; active
+entries are never evicted. If all retained entries are active, admission returns
+`PeerHistoryFull`. Inactive discovered peers expire after `peer_retention_secs`,
+with cleanup at least once a second. Successful initialization resets the window,
+which starts at disconnect; failed initialization and TCP/TLS retries do not
+extend it. Initial unsuccessful sessions start the window at registration.
+Expired or evicted peers stop retrying until a new discovery offer or explicit
+connection request. Configured static peers never expire or consume discovered
+history slots; their storage is bounded by the configured list. These limits do
+not require a static-peer count smaller than the session budget.
+
+`connection_states()` subscribers must discard retry records for removed
+non-static endpoints. The `establishment_count` field is now an opaque daemon-wide
+establishment generation, not a per-endpoint arithmetic count: compare it for
+change, so eviction/re-admission coalesced into one snapshot still resets backoff.
 
 Timer limits are checked by `--check-config` and by both daemon builders before
 opening sockets. Heartbeat and discovery intervals below 1000 ms are rejected

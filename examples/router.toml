@@ -14,6 +14,14 @@ mode = "discovery"
 # Free-text description sent in the Peer Type data item.
 peer_description = "dlep-router"
 
+[limits]
+# Includes TCP/TLS attempts, initialization, established sessions, and shutdown.
+max_sessions = 64
+# Static peers are retained separately and never evicted from retry history.
+max_discovered_peers = 256
+# Failed retries do not extend this window. Fresh discovery can rediscover peers.
+peer_retention_secs = 300
+
 [network]
 # Match the modem's router-facing link: "eui48" (default) or "eui64".
 mac_address_format = "eui48"
