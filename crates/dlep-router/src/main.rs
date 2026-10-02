@@ -70,6 +70,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let mut shutdown =
+        dlep_daemon::shutdown::ShutdownSignals::new().context("registering shutdown signals")?;
+
     tracing::info!(
         interface = ?config.shared.network.interface,
         tls = config.shared.network.use_tls,
@@ -99,13 +102,35 @@ async fn main() -> Result<()> {
         .context("failed to start router daemon")?;
     let mut events = daemon.subscribe();
 
+    // Race the entire connection/event driver, including startup, against
+    // shutdown. Inline TCP/TLS attempts must not delay signal handling.
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.recv() => Ok(()),
+        result = run(&daemon, &mut events, mode, &static_peers) => result,
+    };
+
+    tracing::info!("shutdown requested");
+    daemon
+        .shutdown()
+        .await
+        .context("shutting down router daemon")?;
+    result
+}
+
+async fn run(
+    daemon: &RouterDaemon,
+    events: &mut Receiver<DaemonEvent>,
+    mode: DiscoveryMode,
+    static_peers: &[SocketAddr],
+) -> Result<()> {
     match mode {
         DiscoveryMode::Static => {
             anyhow::ensure!(
                 !static_peers.is_empty(),
                 "mode = \"static\" requires at least one entry in static_peers"
             );
-            for peer in &static_peers {
+            for peer in static_peers {
                 daemon
                     .connect_static(*peer)
                     .await
@@ -120,14 +145,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    run_event_loop(&daemon, &mut events).await;
-
-    tracing::info!("shutdown requested");
-    daemon.shutdown().await?;
+    run_event_loop(daemon, events).await;
     Ok(())
 }
 
-/// Drive the daemon until Ctrl-C: connect to modems as discovery finds them,
+/// Connect to modems as discovery finds them,
 /// log session lifecycle, and re-dial peers whose session dropped.
 ///
 /// `connected` tracks addresses with an active or in-flight session, so the
@@ -137,8 +159,6 @@ async fn main() -> Result<()> {
 async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent>) {
     let mut connected: HashSet<SocketAddr> = HashSet::new();
     let mut reconnect = ReconnectQueue::default();
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
     loop {
         // Wake at the earliest pending reconnect deadline; park forever when
         // nothing is queued so an idle router doesn't spin.
@@ -152,7 +172,6 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
         tokio::pin!(retry_tick);
 
         tokio::select! {
-            _ = &mut ctrl_c => return,
             _ = &mut retry_tick => {
                 for peer in reconnect.take_due(Instant::now()) {
                     if connected.contains(&peer) {

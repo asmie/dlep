@@ -6,7 +6,7 @@ use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
 use dlep_fsm::session_modem::ModemSessionFsm;
 use dlep_net::{Acceptor, ServerConfig};
 use tokio::net::TcpSocket;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -29,7 +29,7 @@ pub struct ModemDaemon {
     /// First entry is the listen task; subsequent entries are per-session.
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     listen_task: JoinHandle<()>,
-    stopping: Arc<std::sync::atomic::AtomicBool>,
+    stopping: watch::Sender<bool>,
     discovery_shutdown: Mutex<Option<mpsc::Sender<()>>>,
     discovery_task: Mutex<Option<JoinHandle<Result<(), DaemonError>>>>,
     extensions: ExtensionRegistry,
@@ -185,8 +185,7 @@ impl ModemDaemon {
     }
 
     pub async fn shutdown(self) -> Result<(), DaemonError> {
-        self.stopping
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.stopping.send_replace(true);
         // Stop the discovery task first so it doesn't try to reply to a
         // late Peer_Discovery after the TCP machinery is gone.
         if let Some(tx) = self.discovery_shutdown.lock().await.take() {
@@ -306,7 +305,7 @@ impl ModemBuilder {
                 None => (None, None),
             };
 
-        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stopping, stop_rx) = watch::channel(false);
         let listen_task = tokio::spawn(modem_accept_loop(
             acceptor,
             events_tx.clone(),
@@ -317,7 +316,7 @@ impl ModemBuilder {
             tasks.clone(),
             extensions_for_accept,
             session_id_counter.clone(),
-            stopping.clone(),
+            stop_rx,
         ));
 
         Ok(ModemDaemon {
@@ -380,7 +379,7 @@ async fn modem_accept_loop(
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     extensions: ExtensionRegistry,
     session_id_counter: SessionIdCounter,
-    stopping: Arc<std::sync::atomic::AtomicBool>,
+    stopping: watch::Receiver<bool>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
@@ -401,10 +400,21 @@ async fn modem_accept_loop(
         let peer_description = peer_description.clone();
         let counter = session_id_counter.clone();
         let commands = session_cmds.clone();
-        let stopping = stopping.clone();
+        let mut stopping = stopping.clone();
+        let mut running = tasks.lock().await;
         let handle = tokio::spawn(async move {
             let _permit = permit;
-            let transport = match pending.handshake().await {
+            if *stopping.borrow() {
+                return;
+            }
+            // Shutdown cancels handshakes without waiting for their deadline.
+            // Established sessions below still perform protocol termination.
+            let handshake = tokio::select! {
+                biased;
+                _ = stopping.changed() => return,
+                result = pending.handshake() => result,
+            };
+            let transport = match handshake {
                 Ok(t) => t,
                 Err(e) => {
                     warn!("modem handshake failed: {e}");
@@ -427,7 +437,7 @@ async fn modem_accept_loop(
             let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
             {
                 let mut senders = commands.lock().await;
-                if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                if *stopping.borrow() {
                     return;
                 }
                 senders.retain(|s| !s.is_closed());
@@ -450,7 +460,6 @@ async fn modem_accept_loop(
             }
             commands.lock().await.retain(|s| !s.is_closed());
         });
-        let mut running = tasks.lock().await;
         running.retain(|h| !h.is_finished());
         running.push(handle);
     }

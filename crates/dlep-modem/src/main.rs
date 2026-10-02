@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let mut shutdown =
+        dlep_daemon::shutdown::ShutdownSignals::new().context("registering shutdown signals")?;
+
     tracing::info!(
         peer = %config.peer_description,
         tls = config.shared.network.use_tls,
@@ -85,7 +88,7 @@ async fn main() -> Result<()> {
         .await
         .context("failed to start modem daemon")?;
 
-    tokio::signal::ctrl_c().await?;
+    shutdown.recv().await;
     tracing::info!("shutdown requested");
     daemon.shutdown().await?;
     Ok(())

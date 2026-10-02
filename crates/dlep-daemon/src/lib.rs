@@ -12,6 +12,7 @@ pub mod modem;
 pub mod router;
 pub mod runtime;
 pub mod session;
+pub mod shutdown;
 pub mod tls;
 
 pub use cli::{

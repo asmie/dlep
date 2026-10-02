@@ -215,6 +215,15 @@ Same for `dlep-router.service`. Log verbosity: `--log-level
 trace|debug|info|warn|error` or the `DLEP_LOG` env var (add
 `Environment=DLEP_LOG=debug` to the unit).
 
+Both binaries handle SIGTERM (`systemctl stop`) and SIGINT (Ctrl-C). They stop
+new work and send Session Termination with Shutting Down status to established
+peers, then wait for the responses or `termination_timeout_ms`. Repeated stop
+signals leave that exchange running. Incomplete TLS handshakes are cancelled;
+the router also interrupts TCP/TLS connection attempts during startup, discovery,
+and reconnection. The example units use `KillSignal=SIGTERM` explicitly.
+Keep systemd's `TimeoutStopSec` longer than the configured termination timeout
+plus the transport write timeout (5 seconds), allowing scheduling overhead.
+
 ## 7. Troubleshooting
 
 | Symptom | Cause / fix |

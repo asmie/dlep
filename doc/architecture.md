@@ -136,6 +136,7 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 | `session.rs` | The `SessionFsm` trait that the runtime drives, with blanket impls for the router and modem session FSMs. |
 | `router.rs`, `modem.rs` | `RouterDaemon` / `ModemDaemon` handles plus their builders. Builders take a `Config`, optional rustls config, and any number of extensions. |
 | `cli.rs` | Shared CLI helpers used by both binaries: `load_toml_config<T>(Option<&Path>)` and `ConfigLoadError`. |
+| `shutdown.rs` | Opt-in SIGINT/SIGTERM registration shared by the binaries; registering before networking retains shutdown requests during startup. Embedders manage their own signal policy. |
 | `lib.rs` | The public re-export surface. |
 
 ### 4.6 `dlep-router` and `dlep-modem`
@@ -158,7 +159,10 @@ Thin binaries. Each one:
    connects to its static peers) and runs an event loop that connects to
    modems as `PeerDiscovered` arrives (deduplicated by address) and logs
    session lifecycle; the modem's accept loop starts on `spawn`.
-7. Awaits SIGINT, then calls `daemon.shutdown().await`.
+7. Registers SIGINT/SIGTERM before opening networking resources and calls
+   `daemon.shutdown().await` on either signal. The router races shutdown against
+   its entire startup/event driver, including inline TCP/TLS connection attempts.
+   Driver errors also pass through cleanup before being returned.
 
 ---
 
@@ -478,6 +482,18 @@ The order of work was:
     configuration validation, wildcard and concrete address discovery through
     session establishment, fallback offers, and startup failure cleanup. The
     test namespace supplies link-local and unique-local IPv6 addresses.
+
+18. Graceful process shutdown. **Done** — both binaries handle SIGINT and SIGTERM
+    through the existing Session Termination exchange. The modem broadcasts
+    shutdown to unfinished TLS handshakes while established sessions finish
+    their protocol exchange. Router connection and discovery tasks acquire
+    registry locks before spawning, so cancellation cannot leave a task outside
+    shutdown's registry. Repeated signals do not bypass graceful termination.
+
+    Subprocess tests signal the actual binaries and verify Shutting Down on the
+    wire, acknowledgement handling, termination timeout, clean exit status, and
+    prompt shutdown during stalled TLS. Cancellation tests exercise blocked
+    registration for both router sessions and discovery tasks.
 
 ---
 

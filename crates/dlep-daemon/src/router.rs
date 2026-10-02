@@ -70,6 +70,9 @@ impl RouterDaemon {
             discovery_interval: Duration::from_millis(self.timers.discovery_interval_ms.into()),
         });
 
+        // Acquire both registry locks before spawning. Cancellation must not
+        // leave a running task that shutdown cannot find and join.
+        let mut task_slot = self.discovery_task.lock().await;
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let events_tx = self.events_tx.clone();
         let handle = tokio::spawn(async move {
@@ -84,7 +87,7 @@ impl RouterDaemon {
         });
 
         *slot = Some(shutdown_tx);
-        *self.discovery_task.lock().await = Some(handle);
+        *task_slot = Some(handle);
         Ok(())
     }
 
@@ -110,7 +113,9 @@ impl RouterDaemon {
 
     /// Open a session against a known modem address. The TCP connection is
     /// established before this function returns; the session task then runs
-    /// independently until shutdown or peer disconnect.
+    /// independently until shutdown or peer disconnect. Cancellation before
+    /// registration drops the pending transport; spawned sessions are always
+    /// registered for graceful shutdown before this future can yield again.
     pub async fn connect_static(&self, peer: SocketAddr) -> Result<(), DaemonError> {
         let connector = if self.network.use_tls {
             let cfg = self.client_tls.clone().ok_or_else(|| {
@@ -140,6 +145,8 @@ impl RouterDaemon {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let events_tx = self.events_tx.clone();
+        let mut commands = self.session_cmds.lock().await;
+        let mut tasks = self.tasks.lock().await;
         let handle = tokio::spawn(run_session(
             fsm,
             transport,
@@ -152,10 +159,8 @@ impl RouterDaemon {
             self.session_id_counter.clone(),
         ));
 
-        let mut commands = self.session_cmds.lock().await;
         commands.retain(|tx| !tx.is_closed());
         commands.push(cmd_tx);
-        let mut tasks = self.tasks.lock().await;
         tasks.retain(|task| !task.is_finished());
         tasks.push(handle);
         Ok(())
@@ -355,5 +360,72 @@ impl RouterBuilder {
             client_tls: self.client_tls,
             extensions: self.extensions,
         })
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
+
+    async fn router() -> RouterDaemon {
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        config.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
+        config.shared.network.discovery_port = 0;
+        RouterDaemon::builder()
+            .config(config)
+            .spawn()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_connection_never_leaves_an_unregistered_session() {
+        let daemon = router().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let held = daemon.tasks.lock().await;
+        let (result, accepted) = tokio::join!(
+            timeout(
+                Duration::from_millis(100),
+                daemon.connect_static(listener.local_addr().unwrap())
+            ),
+            timeout(Duration::from_secs(2), listener.accept()),
+        );
+        assert!(
+            result.is_err(),
+            "connection must wait for registration lock"
+        );
+        let (mut peer, _) = accepted.unwrap().unwrap();
+        // Cancelling before registration closes the transport without starting
+        // a DLEP session that shutdown could not join.
+        assert_eq!(
+            timeout(Duration::from_secs(2), peer.read(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(held);
+        assert!(daemon.session_cmds.lock().await.is_empty());
+        assert!(daemon.tasks.lock().await.is_empty());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_discovery_never_leaves_an_unregistered_task() {
+        let daemon = router().await;
+        let held = daemon.discovery_task.lock().await;
+        assert!(
+            timeout(Duration::from_millis(30), daemon.start_discovery())
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert!(daemon.discovery_shutdown.lock().await.is_none());
+        assert!(daemon.discovery_task.lock().await.is_none());
+        daemon.shutdown().await.unwrap();
     }
 }

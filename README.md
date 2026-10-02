@@ -288,6 +288,10 @@ This grants capabilities only inside the temporary namespace, without changing
 binary capabilities or the host network. See the CI workflow for the privileged
 namespace alternative on systems that restrict user namespaces.
 
+The standalone daemons handle SIGTERM (`systemctl stop`) and SIGINT (Ctrl-C)
+with a graceful DLEP Session Termination exchange. Pending connection attempts
+and incomplete TLS handshakes are cancelled during shutdown.
+
 ## Documentation
 
 - [`doc/architecture.md`](doc/architecture.md) — full architecture document:

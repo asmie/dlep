@@ -20,3 +20,10 @@ toml.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+dlep-core.workspace = true
+dlep-fsm.workspace = true
+dlep-net = { workspace = true, features = ["test-helpers"] }
+tempfile.workspace = true
+nix = { workspace = true, features = ["signal"] }
