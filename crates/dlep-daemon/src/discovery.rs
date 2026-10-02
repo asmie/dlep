@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::events::{DaemonEvent, PeerInfo};
+use crate::events::{DaemonEvent, PeerOffer};
 use crate::runtime::{DaemonError, EventTx};
 
 /// Trait shared by the two discovery FSMs so the runtime can drive either
@@ -100,20 +100,20 @@ pub async fn run_discovery<F: DiscoveryFsm>(
 
     if let Some(event) = initial_event {
         let actions = fsm.step(event);
-        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx).await?;
+        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None).await?;
     }
 
     loop {
         tokio::select! {
-            res = socket.recv() => {
+            res = socket.recv_with_local() => {
                 match res {
-                    Ok((signal, from, ttl)) => {
+                    Ok((signal, from, ttl, local)) => {
                         if !gtsm::is_gtsm_valid(ttl) {
                             debug!(?from, ttl, "dropping non-GTSM discovery datagram");
                             continue;
                         }
                         let actions = fsm.step(FsmEvent::RecvSignal { signal, from });
-                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx).await?;
+                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local)).await?;
                     }
                     Err(e) => {
                         warn!("discovery recv error: {e}");
@@ -124,13 +124,13 @@ pub async fn run_discovery<F: DiscoveryFsm>(
             }
             Some((id, kind)) = timer_rx.recv() => {
                 let actions = fsm.step(FsmEvent::TimerExpired(id, kind));
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx).await?;
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None).await?;
             }
             Some(()) = shutdown_rx.recv() => {
                 let actions = fsm.step(FsmEvent::AppShutdown {
                     reason: dlep_core::StatusCode::SHUTTING_DOWN,
                 });
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx).await?;
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None).await?;
                 return Ok(());
             }
         }
@@ -143,16 +143,28 @@ async fn process_actions(
     events_tx: &EventTx,
     timers: &mut DiscoveryTimers,
     timer_tx: &mpsc::Sender<(TimerId, TimerKind)>,
+    local: Option<std::net::Ipv4Addr>,
 ) -> Result<(), DaemonError> {
     for action in actions {
         match action {
-            FsmAction::SendSignal { signal, target } => match target {
+            FsmAction::SendSignal { mut signal, target } => match target {
                 SendTarget::DiscoveryGroup => {
                     if let Err(e) = socket.send_to_group(&signal).await {
                         warn!("discovery send_to_group failed: {e}");
                     }
                 }
                 SendTarget::Unicast(addr) => {
+                    // IP_PKTINFO identifies the receiving interface's local
+                    // unicast address even when the TCP listener binds ANY.
+                    if let Some(local) = local {
+                        for item in &mut signal.data_items {
+                            if let dlep_core::DataItem::Ipv4ConnectionPoint { addr, .. } = item {
+                                if addr.is_unspecified() {
+                                    *addr = local;
+                                }
+                            }
+                        }
+                    }
                     if let Err(e) = socket.send_unicast(&signal, addr).await {
                         warn!(?addr, "discovery send_unicast failed: {e}");
                     }
@@ -205,12 +217,10 @@ async fn process_actions(
 fn translate(emitted: EmittedEvent) -> Option<DaemonEvent> {
     match emitted {
         EmittedEvent::PeerDiscovered {
-            addr,
+            endpoints,
             peer_description,
-            use_tls,
-        } => Some(DaemonEvent::PeerDiscovered(PeerInfo {
-            addr,
-            is_tls: use_tls,
+        } => Some(DaemonEvent::PeerDiscovered(PeerOffer {
+            endpoints,
             peer_description,
         })),
         _ => None,

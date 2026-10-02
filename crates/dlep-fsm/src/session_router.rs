@@ -5,16 +5,18 @@ use dlep_core::data_item::PeerFlags;
 use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
+use crate::session_common::merge_link_metrics;
 use crate::session_common::{
     SessionConfig, build_destination_announce, build_destination_down_response,
     build_destination_up_response, build_heartbeat, build_session_termination,
-    build_session_termination_response, build_session_update, build_session_update_response,
-    extract_destination_addrs, extract_destination_mac, extract_extensions_supported,
-    extract_heartbeat_interval, extract_link_metrics, extract_status, heartbeat_reset_action,
-    local_heartbeat_interval,
+    build_session_termination_response, build_session_update_response, extract_destination_addrs,
+    extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
+    extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::timers::{TimerId, TimerKind};
 use crate::transaction::TransactionTracker;
+use crate::validation::{validate_message, validate_transaction};
+use dlep_core::LinkMetrics;
 
 /// Stable timer IDs. Each session has at most one of each kind in flight,
 /// so fixed IDs are sufficient.
@@ -46,12 +48,11 @@ pub struct RouterSessionFsm {
     pub state: RouterSessionState,
     pub tx: TransactionTracker,
     pub destinations: HashMap<MacAddress, DestinationState>,
+    pub session_metrics: LinkMetrics,
     config: SessionConfig,
-    /// Peer's announced heartbeat interval, captured from the Heartbeat
-    /// Interval Data Item in `Session Initialization Response`. `None` means
-    /// the field was absent (RFC-non-conformant peer; we are lenient at the
-    /// FSM layer). The codec rejects zero and sub-1s intervals before they
-    /// reach this state.
+    termination_reason: StatusCode,
+    /// Peer's interval, populated by a validated initialization response.
+    /// It is absent only before the handshake.
     pub peer_heartbeat_interval: Option<Duration>,
     /// Captured from the peer's `Session Initialization Response`
     /// `ExtensionsSupported` data item at the moment we transition to
@@ -64,6 +65,7 @@ pub struct RouterSessionFsm {
 #[derive(Clone, Copy, Debug)]
 pub struct DestinationState {
     pub up: bool,
+    pub metrics: LinkMetrics,
 }
 
 impl Default for RouterSessionFsm {
@@ -82,7 +84,9 @@ impl RouterSessionFsm {
             state: RouterSessionState::Closed,
             tx: TransactionTracker::default(),
             destinations: HashMap::new(),
+            session_metrics: LinkMetrics::default(),
             config,
+            termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
             peer_extensions: Vec::new(),
         }
@@ -93,6 +97,45 @@ impl RouterSessionFsm {
     }
 
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
+        if let FsmEvent::RecvMessage(msg) = &event {
+            if matches!(
+                self.state,
+                RouterSessionState::SessionInitPending | RouterSessionState::InSession
+            ) {
+                // A fatal status is echoed verbatim, including its explanation.
+                if msg.message_type != MessageType::SESSION_TERMINATION {
+                    if let Some(item) = msg.data_items.iter().find(
+                        |i| matches!(i, DataItem::Status { code, .. } if code.terminates_session()),
+                    ) {
+                        return self.protocol_error(item.clone());
+                    }
+                }
+                let initializing = self.state == RouterSessionState::SessionInitPending;
+                let checked =
+                    validate_message(msg, true, initializing, &self.config.advertised_extensions)
+                        .and_then(|()| {
+                            if initializing {
+                                return Ok(());
+                            }
+                            let known = extract_destination_mac(msg)
+                                .and_then(|mac| self.destinations.get(&mac))
+                                .is_some_and(|d| d.up);
+                            validate_transaction(msg, &self.tx, known)
+                        });
+                if let Err(code) = checked {
+                    return self.protocol_error(DataItem::Status {
+                        code,
+                        text: String::new(),
+                    });
+                }
+            }
+        }
+        if let FsmEvent::ProtocolError(code) = event {
+            return self.protocol_error(DataItem::Status {
+                code,
+                text: String::new(),
+            });
+        }
         match (self.state, event) {
             // Closed: TcpConnected fires once the runtime's connect future resolved.
             (RouterSessionState::Closed, FsmEvent::TcpConnected) => {
@@ -121,14 +164,13 @@ impl RouterSessionFsm {
                 if msg.message_type == MessageType::SESSION_INITIALIZATION_RESPONSE =>
             {
                 let status = extract_status(&msg).unwrap_or(StatusCode::SUCCESS);
-                if status.terminates_session() {
-                    self.state = RouterSessionState::Terminated;
-                    vec![
-                        FsmAction::CancelTimer(TIMER_SESSION_INIT),
-                        FsmAction::CloseTcp,
-                        FsmAction::Emit(EmittedEvent::SessionDown(status)),
-                    ]
+                if status != StatusCode::SUCCESS {
+                    self.protocol_error(DataItem::Status {
+                        code: StatusCode::UNEXPECTED_MESSAGE,
+                        text: "initialization did not succeed".into(),
+                    })
                 } else {
+                    merge_link_metrics(&msg, &mut self.session_metrics);
                     self.peer_heartbeat_interval = extract_heartbeat_interval(&msg);
                     self.peer_extensions = match extract_extensions_supported(&msg) {
                         Some(ids) => ids,
@@ -155,6 +197,9 @@ impl RouterSessionFsm {
                     }
                     actions.push(FsmAction::Emit(EmittedEvent::SessionUp {
                         peer_extensions: self.peer_extensions.clone(),
+                    }));
+                    actions.push(FsmAction::Emit(EmittedEvent::SessionMetricsUpdate {
+                        metrics: self.session_metrics,
                     }));
                     actions
                 }
@@ -211,27 +256,16 @@ impl RouterSessionFsm {
                     FsmAction::Emit(EmittedEvent::SessionDown(status)),
                 ]
             }
-            // Destination_Up: insert into the map, ACK with
-            // Destination_Up_Response { SUCCESS }, emit DestinationUp, and
-            // reset the missed-heartbeat deadline (RFC §11.2). Malformed
-            // inbound — no MAC — is symmetric to the SessionInitPending
-            // defensive arm: drop the connection rather than emit a partial
-            // event.
+            // Announce a validated destination and apply session defaults.
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_UP =>
             {
-                let Some(mac) = extract_destination_mac(&msg) else {
-                    self.state = RouterSessionState::Terminated;
-                    return vec![
-                        FsmAction::CancelTimer(TIMER_HEARTBEAT),
-                        FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED),
-                        FsmAction::CloseTcp,
-                        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA)),
-                    ];
-                };
-                let metrics = extract_link_metrics(&msg).unwrap_or_default();
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let mut metrics = self.session_metrics;
+                merge_link_metrics(&msg, &mut metrics);
                 let addrs = extract_destination_addrs(&msg);
-                self.destinations.insert(mac, DestinationState { up: true });
+                self.destinations
+                    .insert(mac, DestinationState { up: true, metrics });
                 let mut actions = vec![
                     FsmAction::SendMessage(build_destination_up_response(mac, StatusCode::SUCCESS)),
                     FsmAction::Emit(EmittedEvent::DestinationUp {
@@ -247,25 +281,17 @@ impl RouterSessionFsm {
                 }
                 actions
             }
-            // Destination_Update: RFC 8175 §11.7 — one-way notification of
-            // metric changes for an existing destination. No response message.
-            // Emit DestinationUpdate so the app can refresh its view, then
-            // reset the missed-heartbeat deadline (RFC §11.2). Malformed
-            // inbound (no MAC) is leniently dropped here — only the
-            // heartbeat-reset side-effect survives; we don't tear down the
-            // session for a metric update we can't apply.
+            // Apply only metrics present in the update.
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_UPDATE =>
             {
-                let Some(mac) = extract_destination_mac(&msg) else {
-                    return heartbeat_reset_action(
-                        TIMER_HEARTBEAT_MISSED,
-                        self.peer_heartbeat_interval,
-                    )
-                    .into_iter()
-                    .collect();
-                };
-                let metrics = extract_link_metrics(&msg).unwrap_or_default();
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let destination = self
+                    .destinations
+                    .get_mut(&mac)
+                    .expect("validated destination");
+                merge_link_metrics(&msg, &mut destination.metrics);
+                let metrics = destination.metrics;
                 let mut actions = vec![FsmAction::Emit(EmittedEvent::DestinationUpdate {
                     mac,
                     metrics,
@@ -277,24 +303,11 @@ impl RouterSessionFsm {
                 }
                 actions
             }
-            // Destination_Down: RFC 8175 §11.5 — modem-initiated teardown of
-            // a known destination. Remove the local entry, ACK with
-            // Destination_Down_Response { SUCCESS }, emit DestinationDown
-            // (carrying the *inbound* reason, not SUCCESS), and reset the
-            // missed-heartbeat deadline (RFC §11.2). Missing MAC: lenient like
-            // Update — drop quietly with only the heartbeat reset rather than
-            // tearing down the session.
+            // Remove the validated destination and acknowledge the peer.
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_DOWN =>
             {
-                let Some(mac) = extract_destination_mac(&msg) else {
-                    return heartbeat_reset_action(
-                        TIMER_HEARTBEAT_MISSED,
-                        self.peer_heartbeat_interval,
-                    )
-                    .into_iter()
-                    .collect();
-                };
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
                 let reason = extract_status(&msg).unwrap_or(StatusCode::SUCCESS);
                 self.destinations.remove(&mac);
                 let mut actions = vec![
@@ -323,7 +336,11 @@ impl RouterSessionFsm {
                 let mut actions = vec![FsmAction::SendMessage(build_session_update_response(
                     StatusCode::SUCCESS,
                 ))];
-                if let Some(metrics) = extract_link_metrics(&msg) {
+                if merge_link_metrics(&msg, &mut self.session_metrics) {
+                    for destination in self.destinations.values_mut() {
+                        merge_link_metrics(&msg, &mut destination.metrics);
+                    }
+                    let metrics = self.session_metrics;
                     actions.push(FsmAction::Emit(EmittedEvent::SessionMetricsUpdate {
                         metrics,
                     }));
@@ -350,18 +367,28 @@ impl RouterSessionFsm {
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_ANNOUNCE_RESPONSE =>
             {
-                if let Some(mac) = extract_destination_mac(&msg) {
-                    self.tx.close_destination(&mac);
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                self.tx.close_destination(&mac);
+                let mut actions = Vec::new();
+                if extract_status(&msg) == Some(StatusCode::SUCCESS) {
+                    let mut metrics = self.session_metrics;
+                    merge_link_metrics(&msg, &mut metrics);
+                    self.destinations
+                        .insert(mac, DestinationState { up: true, metrics });
+                    actions.push(FsmAction::Emit(EmittedEvent::DestinationUp {
+                        mac,
+                        metrics,
+                        addrs: extract_destination_addrs(&msg),
+                    }));
                 }
-                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
-                    .into_iter()
-                    .collect()
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
             }
-            // Catch-all for any other successfully decoded message in
-            // InSession (Heartbeat, future Destination_*, etc.) — RFC 8175
-            // §11.2 says any received message resets the missed-heartbeat
-            // deadline. Stay in InSession.
-            (RouterSessionState::InSession, FsmEvent::RecvMessage(_)) => {
+            // Negotiated extension traffic also keeps the session alive.
+            (RouterSessionState::InSession, FsmEvent::RecvExtensionMessage) => {
                 heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
                     .into_iter()
                     .collect()
@@ -391,17 +418,8 @@ impl RouterSessionFsm {
                     },
                 ]
             }
-            // InSession: app pushes session-wide metric changes to the modem
-            // (RFC 8175 §12.7). Occupies the single session-level
-            // transaction slot until the Response arrives.
-            (RouterSessionState::InSession, FsmEvent::AppSessionUpdate { metrics }) => {
-                use crate::transaction::RequestKind;
-                if self.tx.open_session(RequestKind::SessionUpdate).is_err() {
-                    tracing::debug!("session_update while another session request is pending");
-                    return Vec::new();
-                }
-                vec![FsmAction::SendMessage(build_session_update(&metrics))]
-            }
+            // Router Session Updates may carry addresses, never metrics.
+            (RouterSessionState::InSession, FsmEvent::AppSessionUpdate { .. }) => Vec::new(),
             // InSession: app declares interest in a destination the modem
             // has not reported (RFC 8175 §12.13). Router-originated only.
             (RouterSessionState::InSession, FsmEvent::AppAnnounceDestination { mac }) => {
@@ -417,6 +435,7 @@ impl RouterSessionFsm {
                 vec![FsmAction::SendMessage(build_destination_announce(mac))]
             }
             (RouterSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
+                self.termination_reason = reason;
                 self.state = RouterSessionState::Terminating;
                 vec![
                     FsmAction::CancelTimer(TIMER_HEARTBEAT),
@@ -447,7 +466,7 @@ impl RouterSessionFsm {
                 vec![
                     FsmAction::CancelTimer(TIMER_TERMINATION),
                     FsmAction::CloseTcp,
-                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::SUCCESS)),
+                    FsmAction::Emit(EmittedEvent::SessionDown(self.termination_reason)),
                 ]
             }
             (
@@ -466,7 +485,7 @@ impl RouterSessionFsm {
                 self.state = RouterSessionState::Terminated;
                 vec![
                     FsmAction::CancelTimer(TIMER_TERMINATION),
-                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::SUCCESS)),
+                    FsmAction::Emit(EmittedEvent::SessionDown(self.termination_reason)),
                 ]
             }
 
@@ -474,8 +493,51 @@ impl RouterSessionFsm {
             // in Terminated, unknown message types) — ignore for M3. M5 will
             // reject Destination_* in pre-InSession states with
             // UNEXPECTED_MESSAGE.
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::HEARTBEAT =>
+            {
+                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    .into_iter()
+                    .collect()
+            }
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(_)) => {
+                self.protocol_error(DataItem::Status {
+                    code: StatusCode::UNEXPECTED_MESSAGE,
+                    text: String::new(),
+                })
+            }
             _ => Vec::new(),
         }
+    }
+
+    fn protocol_error(&mut self, status: DataItem) -> Vec<FsmAction> {
+        let DataItem::Status { code, .. } = &status else {
+            unreachable!()
+        };
+        let code = *code;
+        if matches!(
+            self.state,
+            RouterSessionState::Terminating | RouterSessionState::Terminated
+        ) {
+            return Vec::new();
+        }
+
+        self.state = RouterSessionState::Terminating;
+        self.termination_reason = code;
+        vec![
+            FsmAction::CancelTimer(TIMER_SESSION_INIT),
+            FsmAction::CancelTimer(TIMER_HEARTBEAT),
+            FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED),
+            FsmAction::SendMessage(
+                Message::new(MessageType::SESSION_TERMINATION).with_item(status),
+            ),
+            FsmAction::StartTimer {
+                id: TIMER_TERMINATION,
+                kind: TimerKind::Termination,
+                duration: self.config.termination_timeout,
+                periodic: false,
+            },
+        ]
     }
 }
 

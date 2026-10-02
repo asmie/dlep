@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 dlep-core.workspace = true
 ipnet.workspace = true
 thiserror.workspace = true

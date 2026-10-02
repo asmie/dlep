@@ -12,6 +12,7 @@ pub mod addr;
 pub mod discovery;
 pub mod framed;
 pub mod gtsm;
+mod tcp_monitor;
 pub mod tls;
 pub mod transport;
 

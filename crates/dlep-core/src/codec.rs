@@ -245,10 +245,9 @@ impl DataItem {
     }
 
     /// Lift a parsed `RawDataItem` into a typed `DataItem`. Unknown type ids
-    /// fall through to `DataItem::Unknown`, preserving forward compatibility
-    /// (RFC 8175 §13: "implementations MUST silently discard any Data Item
-    /// they do not recognise"). Length errors and value-range errors are
-    /// reported.
+    /// fall through to `DataItem::Unknown` for negotiated extension dispatch.
+    /// The session layer rejects unclaimed items under RFC 8175 §12.1.
+    /// Length errors and value-range errors are reported here.
     ///
     /// `Ipv4AttachedSubnet` / `Ipv6AttachedSubnet` are normalized to network
     /// form here — host bits in non-canonical wire input are zeroed so the

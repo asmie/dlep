@@ -26,6 +26,13 @@ pub struct PeerInfo {
     pub peer_description: Option<String>,
 }
 
+/// Candidate endpoints from one modem offer, ordered TLS first, then IPv6.
+#[derive(Clone, Debug)]
+pub struct PeerOffer {
+    pub endpoints: Vec<dlep_fsm::discovery_common::OfferEndpoint>,
+    pub peer_description: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum DestinationEvent {
     Up {
@@ -59,20 +66,30 @@ pub struct MetricsEvent {
 /// broadcast channel needs to fan out to multiple subscribers.
 #[derive(Clone)]
 pub enum DaemonEvent {
-    PeerDiscovered(PeerInfo),
+    PeerDiscovered(PeerOffer),
     SessionUp {
+        session_id: dlep_ext::SessionId,
         peer: PeerInfo,
         negotiated_extensions: Vec<ExtensionId>,
     },
     SessionDown {
+        session_id: dlep_ext::SessionId,
         /// Which peer's session ended. Required so a multi-session embedder
         /// (one router, several modems) can attribute the drop — and so a
         /// run loop can evict the dead peer and reconnect.
         peer: PeerInfo,
         reason: StatusCode,
     },
-    Destination(DestinationEvent),
-    Metrics(MetricsEvent),
+    Destination {
+        session_id: dlep_ext::SessionId,
+        peer: PeerInfo,
+        event: DestinationEvent,
+    },
+    Metrics {
+        session_id: dlep_ext::SessionId,
+        peer: PeerInfo,
+        event: MetricsEvent,
+    },
     Extension(Arc<dyn Any + Send + Sync>),
 }
 
@@ -83,18 +100,37 @@ impl fmt::Debug for DaemonEvent {
             Self::SessionUp {
                 peer,
                 negotiated_extensions,
+                ..
             } => f
                 .debug_struct("SessionUp")
                 .field("peer", peer)
                 .field("negotiated_extensions", negotiated_extensions)
                 .finish(),
-            Self::SessionDown { peer, reason } => f
+            Self::SessionDown { peer, reason, .. } => f
                 .debug_struct("SessionDown")
                 .field("peer", peer)
                 .field("reason", reason)
                 .finish(),
-            Self::Destination(e) => f.debug_tuple("Destination").field(e).finish(),
-            Self::Metrics(e) => f.debug_tuple("Metrics").field(e).finish(),
+            Self::Destination {
+                peer,
+                session_id,
+                event,
+            } => f
+                .debug_struct("Destination")
+                .field("session_id", session_id)
+                .field("peer", peer)
+                .field("event", event)
+                .finish(),
+            Self::Metrics {
+                peer,
+                session_id,
+                event,
+            } => f
+                .debug_struct("Metrics")
+                .field("session_id", session_id)
+                .field("peer", peer)
+                .field("event", event)
+                .finish(),
             Self::Extension(_) => f.debug_tuple("Extension").field(&"<opaque>").finish(),
         }
     }

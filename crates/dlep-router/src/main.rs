@@ -178,17 +178,11 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                 }
             }
             evt = events.recv() => match evt {
-                Ok(DaemonEvent::PeerDiscovered(peer)) => {
-                    if !connected.insert(peer.addr) {
-                        continue;
-                    }
-                    tracing::info!(addr = %peer.addr, "modem discovered; connecting");
-                    if let Err(e) = daemon.connect_static(peer.addr).await {
-                        tracing::warn!(addr = %peer.addr, error = %e, "connect failed");
-                        connected.remove(&peer.addr);
-                        reconnect.schedule(peer.addr, Instant::now());
-                    } else {
-                        reconnect.forget(&peer.addr);
+                Ok(DaemonEvent::PeerDiscovered(offer)) => {
+                    if offer.endpoints.iter().any(|e| connected.contains(&e.addr)) { continue; }
+                    match daemon.connect_discovered(&offer).await {
+                        Ok(addr) => { connected.insert(addr); reconnect.forget(&addr); }
+                        Err(e) => tracing::warn!(error = %e, "offer endpoints failed; discovery will retry"),
                     }
                 }
                 Ok(DaemonEvent::SessionUp { peer, .. }) => {
@@ -198,7 +192,7 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                     // and should retry at the base delay, not a grown one.
                     reconnect.forget(&peer.addr);
                 }
-                Ok(DaemonEvent::SessionDown { peer, reason }) => {
+                Ok(DaemonEvent::SessionDown { peer, reason, .. }) => {
                     tracing::info!(addr = %peer.addr, ?reason, "session down; scheduling reconnect");
                     connected.remove(&peer.addr);
                     reconnect.schedule(peer.addr, Instant::now());

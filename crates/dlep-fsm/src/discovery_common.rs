@@ -61,6 +61,67 @@ pub struct OfferEndpoint {
     pub use_tls: bool,
 }
 
+/// Validate discovery grammar and collect endpoints in preference order.
+/// A missing Connection Point means the offer's source address at port 854.
+pub fn offer_endpoints(sig: &Signal, from: SocketAddr) -> Vec<OfferEndpoint> {
+    let mut endpoints: Vec<_> = sig
+        .data_items
+        .iter()
+        .filter_map(|item| match item {
+            DataItem::Ipv4ConnectionPoint { flags, addr, port } => Some(OfferEndpoint {
+                addr: SocketAddr::new((*addr).into(), port.unwrap_or(dlep_core::DEFAULT_PORT)),
+                use_tls: flags.use_tls,
+            }),
+            DataItem::Ipv6ConnectionPoint { flags, addr, port } => {
+                let mut endpoint =
+                    SocketAddr::new((*addr).into(), port.unwrap_or(dlep_core::DEFAULT_PORT));
+                if let (SocketAddr::V6(source), SocketAddr::V6(target)) = (from, &mut endpoint) {
+                    if addr.is_unicast_link_local() {
+                        target.set_scope_id(source.scope_id());
+                    }
+                }
+                Some(OfferEndpoint {
+                    addr: endpoint,
+                    use_tls: flags.use_tls,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    if endpoints.is_empty() {
+        let mut addr = from;
+        addr.set_port(dlep_core::DEFAULT_PORT);
+        endpoints.push(OfferEndpoint {
+            addr,
+            use_tls: false,
+        });
+    }
+    endpoints.retain(|e| {
+        !e.addr.ip().is_unspecified() && !e.addr.ip().is_multicast() && e.addr.port() != 0
+    });
+    endpoints.sort_by_key(|e| (!e.use_tls, !e.addr.is_ipv6()));
+    endpoints.dedup();
+    endpoints
+}
+
+pub fn valid_signal(signal: &Signal) -> bool {
+    let mut peer_type = false;
+    let mut seen = std::collections::HashSet::new();
+    for item in &signal.data_items {
+        match item {
+            DataItem::PeerType { .. } if !peer_type => peer_type = true,
+            DataItem::Ipv4ConnectionPoint { .. } | DataItem::Ipv6ConnectionPoint { .. }
+                if signal.signal_type == SignalType::PEER_OFFER => {}
+            _ => return false,
+        }
+        let mut bytes = bytes::BytesMut::new();
+        if item.encode(&mut bytes).is_err() || !seen.insert(bytes.to_vec()) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Extract the *first* connection point from a `Peer_Offer`. If port is
 /// absent the RFC's default DLEP port (854) is filled in. Returns `None`
 /// when no v4 or v6 connection point is present.

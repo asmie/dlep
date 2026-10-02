@@ -10,13 +10,15 @@ use crate::session_common::{
     build_destination_up, build_destination_update, build_heartbeat, build_session_termination,
     build_session_termination_response, build_session_update, build_session_update_response,
     extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
-    extract_link_metrics, extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
 };
 use crate::timers::TimerKind;
 use crate::transaction::TransactionTracker;
+use crate::validation::{validate_message, validate_transaction};
+use dlep_core::LinkMetrics;
 
 /// Placeholder link metrics advertised in Session Initialization Response.
 /// M5 wires `ModemDaemon::add_destination` to surface real values; M3 just
@@ -43,6 +45,7 @@ pub struct ModemSessionFsm {
     pub tx: TransactionTracker,
     pub destinations: HashMap<MacAddress, DestinationState>,
     config: SessionConfig,
+    termination_reason: StatusCode,
     /// Peer's announced heartbeat interval, captured from the Heartbeat
     /// Interval Data Item in `Session Initialization`. See
     /// [`super::session_router::RouterSessionFsm::peer_heartbeat_interval`]
@@ -56,9 +59,12 @@ pub struct ModemSessionFsm {
     pub peer_extensions: Vec<dlep_core::ExtensionId>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DestinationState {
     pub announced: bool,
+    pub pending_metrics: bool,
+    pub metrics: LinkMetrics,
+    pub addrs: crate::events::DestinationAddrs,
 }
 
 impl Default for ModemSessionFsm {
@@ -81,6 +87,7 @@ impl ModemSessionFsm {
             tx: TransactionTracker::default(),
             destinations: HashMap::new(),
             config,
+            termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
             peer_extensions: Vec::new(),
         }
@@ -91,6 +98,45 @@ impl ModemSessionFsm {
     }
 
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
+        if let FsmEvent::RecvMessage(msg) = &event {
+            if matches!(
+                self.state,
+                ModemSessionState::AwaitingSessionInit | ModemSessionState::InSession
+            ) {
+                // A fatal status is echoed verbatim, including its explanation.
+                if msg.message_type != MessageType::SESSION_TERMINATION {
+                    if let Some(item) = msg.data_items.iter().find(
+                        |i| matches!(i, DataItem::Status { code, .. } if code.terminates_session()),
+                    ) {
+                        return self.protocol_error(item.clone());
+                    }
+                }
+                let initializing = self.state == ModemSessionState::AwaitingSessionInit;
+                let checked =
+                    validate_message(msg, false, initializing, &self.config.advertised_extensions)
+                        .and_then(|()| {
+                            if initializing {
+                                return Ok(());
+                            }
+                            let known = extract_destination_mac(msg)
+                                .and_then(|mac| self.destinations.get(&mac))
+                                .is_some_and(|d| d.announced);
+                            validate_transaction(msg, &self.tx, known)
+                        });
+                if let Err(code) = checked {
+                    return self.protocol_error(DataItem::Status {
+                        code,
+                        text: String::new(),
+                    });
+                }
+            }
+        }
+        if let FsmEvent::ProtocolError(code) = event {
+            return self.protocol_error(DataItem::Status {
+                code,
+                text: String::new(),
+            });
+        }
         match (self.state, event) {
             // Listening: a TCP connection arrived. Arm the Session Init deadline.
             (ModemSessionState::Listening, FsmEvent::TcpAccepted) => {
@@ -211,6 +257,9 @@ impl ModemSessionFsm {
                 },
             ) => {
                 use crate::transaction::RequestKind;
+                if self.destinations.contains_key(&mac) {
+                    return Vec::new();
+                }
                 if self
                     .tx
                     .open_destination(mac, RequestKind::DestinationUp)
@@ -219,21 +268,27 @@ impl ModemSessionFsm {
                     tracing::debug!(?mac, "duplicate add_destination while Up pending");
                     return Vec::new();
                 }
-                self.destinations
-                    .entry(mac)
-                    .or_insert(DestinationState { announced: false });
+                self.destinations.insert(
+                    mac,
+                    DestinationState {
+                        announced: false,
+                        pending_metrics: false,
+                        metrics,
+                        addrs: addrs.clone(),
+                    },
+                );
                 vec![FsmAction::SendMessage(build_destination_up(
                     mac, &metrics, &addrs,
                 ))]
             }
             // InSession: router replied to our Destination_Up. Close the
             // per-destination transaction. On Success flip `announced`; on
-            // any non-Success status drop the local entry so a future
-            // add_destination(mac) is a clean retry. RFC 8175 §11.2: every
-            // received message resets the missed-heartbeat deadline.
+            // any non-Success status stop updates, retaining modem knowledge
+            // so the router may subsequently request Destination Announce.
             (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_UP_RESPONSE =>
             {
+                let mut actions = Vec::new();
                 let mac = extract_destination_mac(&msg);
                 let status = extract_status(&msg).unwrap_or(StatusCode::SUCCESS);
                 if let Some(mac) = mac {
@@ -241,16 +296,25 @@ impl ModemSessionFsm {
                     if status == StatusCode::SUCCESS {
                         if let Some(d) = self.destinations.get_mut(&mac) {
                             d.announced = true;
+                            if d.pending_metrics {
+                                actions.push(FsmAction::SendMessage(build_destination_update(
+                                    mac, &d.metrics,
+                                )));
+                                d.pending_metrics = false;
+                            }
                         }
                     } else {
-                        // Router rejected. Drop locally so a later
-                        // add_destination for the same MAC is a clean retry.
-                        self.destinations.remove(&mac);
+                        // Retain knowledge, but respect the router's refusal.
+                        if let Some(d) = self.destinations.get_mut(&mac) {
+                            d.announced = false;
+                        }
                     }
                 }
-                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
-                    .into_iter()
-                    .collect()
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
             }
             // InSession: app asks us to advertise an updated metric set for
             // an existing destination. RFC 8175 §11.7 — Destination_Update is
@@ -258,8 +322,12 @@ impl ModemSessionFsm {
             // log+drop (symmetric to the Up dedup-guard) so we never advertise
             // an Update for a destination the router never saw an Up for.
             (ModemSessionState::InSession, FsmEvent::AppUpdateMetrics { mac, metrics }) => {
-                if !self.destinations.contains_key(&mac) {
-                    tracing::debug!(?mac, "update_metrics for unknown destination; ignoring");
+                let Some(destination) = self.destinations.get_mut(&mac) else {
+                    return Vec::new();
+                };
+                destination.metrics = metrics;
+                if !destination.announced || self.tx.destination_busy(&mac) {
+                    destination.pending_metrics = true;
                     return Vec::new();
                 }
                 vec![FsmAction::SendMessage(build_destination_update(
@@ -275,6 +343,10 @@ impl ModemSessionFsm {
                 use crate::transaction::RequestKind;
                 if !self.destinations.contains_key(&mac) {
                     tracing::debug!(?mac, "drop_destination for unknown destination; ignoring");
+                    return Vec::new();
+                }
+                if !self.destinations[&mac].announced && !self.tx.destination_busy(&mac) {
+                    self.destinations.remove(&mac);
                     return Vec::new();
                 }
                 if self
@@ -311,11 +383,6 @@ impl ModemSessionFsm {
                 let mut actions = vec![FsmAction::SendMessage(build_session_update_response(
                     StatusCode::SUCCESS,
                 ))];
-                if let Some(metrics) = extract_link_metrics(&msg) {
-                    actions.push(FsmAction::Emit(EmittedEvent::SessionMetricsUpdate {
-                        metrics,
-                    }));
-                }
                 if let Some(reset) =
                     heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
                 {
@@ -332,33 +399,27 @@ impl ModemSessionFsm {
                     .into_iter()
                     .collect()
             }
-            // Destination_Announce: RFC 8175 §12.13 — the router is telling
-            // us it wants to reach `mac`. §12.14: "A modem MUST send a
-            // Destination Announce Response Message when a Destination
-            // Announce Message is received." Emit the request to the app so
-            // it can decide whether to follow up with a Destination_Up.
-            //
-            // A message with no MAC is dropped leniently (only the heartbeat
-            // reset survives) — same stance as Destination_Update: there is
-            // no MAC to key the mandatory response on, and tearing the
-            // session down over one malformed advisory message is harsher
-            // than the RFC requires.
+            // Announce succeeds only when the modem has destination data.
+            // Retained destinations declined earlier by this router can be
+            // reactivated, with their latest metrics and addresses.
             (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_ANNOUNCE =>
             {
-                let Some(mac) = extract_destination_mac(&msg) else {
-                    return heartbeat_reset_action(
-                        TIMER_HEARTBEAT_MISSED,
-                        self.peer_heartbeat_interval,
-                    )
-                    .into_iter()
-                    .collect();
-                };
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let mut response =
+                    build_destination_announce_response(mac, StatusCode::REQUEST_DENIED);
+                if let Some(destination) = self.destinations.get_mut(&mac) {
+                    response = build_destination_up(mac, &destination.metrics, &destination.addrs);
+                    response.message_type = MessageType::DESTINATION_ANNOUNCE_RESPONSE;
+                    response.data_items.push(DataItem::Status {
+                        code: StatusCode::SUCCESS,
+                        text: String::new(),
+                    });
+                    destination.announced = true;
+                    destination.pending_metrics = false;
+                }
                 let mut actions = vec![
-                    FsmAction::SendMessage(build_destination_announce_response(
-                        mac,
-                        StatusCode::SUCCESS,
-                    )),
+                    FsmAction::SendMessage(response),
                     FsmAction::Emit(EmittedEvent::DestinationAnnounced { mac }),
                 ];
                 if let Some(reset) =
@@ -368,10 +429,8 @@ impl ModemSessionFsm {
                 }
                 actions
             }
-            // Catch-all for any other successfully decoded message —
-            // RFC 8175 §11.2 says any received message resets the
-            // missed-heartbeat deadline.
-            (ModemSessionState::InSession, FsmEvent::RecvMessage(_)) => {
+            // Negotiated extension traffic also keeps the session alive.
+            (ModemSessionState::InSession, FsmEvent::RecvExtensionMessage) => {
                 heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
                     .into_iter()
                     .collect()
@@ -407,6 +466,7 @@ impl ModemSessionFsm {
                 vec![FsmAction::SendMessage(build_session_update(&metrics))]
             }
             (ModemSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
+                self.termination_reason = reason;
                 self.state = ModemSessionState::Terminating;
                 vec![
                     FsmAction::CancelTimer(TIMER_HEARTBEAT),
@@ -437,7 +497,7 @@ impl ModemSessionFsm {
                 vec![
                     FsmAction::CancelTimer(TIMER_TERMINATION),
                     FsmAction::CloseTcp,
-                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::SUCCESS)),
+                    FsmAction::Emit(EmittedEvent::SessionDown(self.termination_reason)),
                 ]
             }
             (ModemSessionState::Terminating, FsmEvent::TimerExpired(_, TimerKind::Termination)) => {
@@ -451,12 +511,62 @@ impl ModemSessionFsm {
                 self.state = ModemSessionState::Terminated;
                 vec![
                     FsmAction::CancelTimer(TIMER_TERMINATION),
-                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::SUCCESS)),
+                    FsmAction::Emit(EmittedEvent::SessionDown(self.termination_reason)),
                 ]
             }
 
+            (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::HEARTBEAT =>
+            {
+                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
+                    .into_iter()
+                    .collect()
+            }
+            (ModemSessionState::InSession, FsmEvent::RecvMessage(_)) => {
+                self.protocol_error(DataItem::Status {
+                    code: StatusCode::UNEXPECTED_MESSAGE,
+                    text: String::new(),
+                })
+            }
             _ => Vec::new(),
         }
+    }
+
+    fn protocol_error(&mut self, status: DataItem) -> Vec<FsmAction> {
+        let DataItem::Status { code, .. } = &status else {
+            unreachable!()
+        };
+        let code = *code;
+        if matches!(
+            self.state,
+            ModemSessionState::Terminating | ModemSessionState::Terminated
+        ) {
+            return Vec::new();
+        }
+        if self.state == ModemSessionState::AwaitingSessionInit {
+            self.state = ModemSessionState::Terminated;
+            return vec![
+                FsmAction::CancelTimer(TIMER_SESSION_INIT),
+                FsmAction::CloseTcp,
+                FsmAction::Emit(EmittedEvent::SessionDown(code)),
+            ];
+        }
+        self.state = ModemSessionState::Terminating;
+        self.termination_reason = code;
+        vec![
+            FsmAction::CancelTimer(TIMER_SESSION_INIT),
+            FsmAction::CancelTimer(TIMER_HEARTBEAT),
+            FsmAction::CancelTimer(TIMER_HEARTBEAT_MISSED),
+            FsmAction::SendMessage(
+                Message::new(MessageType::SESSION_TERMINATION).with_item(status),
+            ),
+            FsmAction::StartTimer {
+                id: TIMER_TERMINATION,
+                kind: TimerKind::Termination,
+                duration: self.config.termination_timeout,
+                periodic: false,
+            },
+        ]
     }
 }
 

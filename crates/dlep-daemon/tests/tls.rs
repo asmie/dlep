@@ -79,7 +79,7 @@ where
             .await
             .expect("timed out waiting for destination event")
             .expect("event channel closed");
-        if let DaemonEvent::Destination(d) = evt {
+        if let DaemonEvent::Destination { event: d, .. } = evt {
             if pred(&d) {
                 return d;
             }

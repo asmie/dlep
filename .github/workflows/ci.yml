@@ -38,4 +38,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets --locked
-      - run: cargo test --workspace --locked
+      # Strict TCP GTSM tests need CAP_NET_RAW. Keep capabilities and network
+      # changes inside a temporary namespace, using the already built suite.
+      - name: Test with strict GTSM in an isolated network namespace
+        run: |
+          sudo env "PATH=$PATH" "RUSTUP_HOME=$HOME/.rustup" "CARGO_HOME=$HOME/.cargo" \
+            unshare --net sh -c '
+              set -e
+              ip link set lo up
+              ip link add dlep-test type dummy
+              ip addr add 192.0.2.1/24 dev dlep-test
+              ip link set dlep-test up multicast on
+              ip route add default dev dlep-test
+              cargo test --workspace --locked --offline
+            '

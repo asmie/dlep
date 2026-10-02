@@ -19,7 +19,7 @@ pub struct PendingRequest {
     pub kind: RequestKind,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestKind {
     SessionUpdate,
     SessionTermination,

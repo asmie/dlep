@@ -14,6 +14,64 @@ use socket2::Socket;
 /// Threshold TTL/HopLimit: packets with a lower value must be dropped.
 pub const REQUIRED_TTL: u8 = 255;
 
+/// Configure TCP before connect/listen, including the SYN/SYN-ACK. Linux
+/// rejects segments below the minimum in the kernel, before delivery to TCP.
+/// The transport's privileged packet monitor resets established connections
+/// on rejected segments, because the TCP stream API does not report them.
+pub fn configure_tcp<F: std::os::fd::AsFd>(sock: &F, is_v6: bool, enforce: bool) -> io::Result<()> {
+    let socket = socket2::SockRef::from(sock);
+    if is_v6 {
+        socket.set_unicast_hops_v6(REQUIRED_TTL.into())?;
+        // A dual-stack listener also sends IPv4 SYN-ACKs on this socket.
+        socket.set_ttl(REQUIRED_TTL.into())?;
+    } else {
+        socket.set_ttl(REQUIRED_TTL.into())?;
+    }
+    if enforce {
+        set_minimum_ttl(sock, is_v6)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_minimum_ttl<F: std::os::fd::AsFd>(sock: &F, is_v6: bool) -> io::Result<()> {
+    use nix::libc;
+    use std::os::fd::AsRawFd;
+    let value = libc::c_int::from(REQUIRED_TTL);
+    let (level, option) = if is_v6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_MINHOPCOUNT)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_MINTTL)
+    };
+    // SAFETY: the borrowed fd remains live, and the option takes a pointer
+    // to a c_int of the supplied size. setsockopt does not retain it.
+    let result = unsafe {
+        libc::setsockopt(
+            sock.as_fd().as_raw_fd(),
+            level,
+            option,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // IPv4-mapped connections accepted by a dual-stack listener use IP_MINTTL.
+    if is_v6 {
+        set_minimum_ttl(sock, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_minimum_ttl<F: std::os::fd::AsFd>(_sock: &F, _is_v6: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TCP minimum TTL enforcement requires Linux",
+    ))
+}
+
 /// Set TTL/HopLimit = 255 on a freshly built `socket2::Socket`. Covers
 /// unicast and multicast TTLs for both v4 and v6 sockets; the caller
 /// passes whichever family the socket was created with.

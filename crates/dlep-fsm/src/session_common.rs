@@ -75,7 +75,7 @@ pub fn build_session_termination_response() -> Message {
 
 /// Build a `Session_Update` message (RFC 8175 §12.7). Carries session-wide
 /// metrics. The RFC also allows Layer 3 address changes in this message; we
-/// only originate the metric form, and are lenient about what we accept.
+/// originate this metric form only on the modem.
 pub fn build_session_update(metrics: &LinkMetrics) -> Message {
     push_metric_items(Message::new(MessageType::SESSION_UPDATE), metrics)
 }
@@ -234,13 +234,10 @@ pub fn build_destination_update(mac: MacAddress, metrics: &LinkMetrics) -> Messa
 }
 
 /// Build a `Destination_Down` message (RFC 8175 §11.5).
-pub fn build_destination_down(mac: MacAddress, reason: StatusCode) -> Message {
-    Message::new(MessageType::DESTINATION_DOWN)
-        .with_item(DataItem::MacAddress(mac))
-        .with_item(DataItem::Status {
-            code: reason,
-            text: String::new(),
-        })
+pub fn build_destination_down(mac: MacAddress, _reason: StatusCode) -> Message {
+    // Status is not allowed in Destination Down (§12.15). The API reason
+    // remains local; only session termination carries a teardown reason.
+    Message::new(MessageType::DESTINATION_DOWN).with_item(DataItem::MacAddress(mac))
 }
 
 /// Build a `Destination_Down_Response` (RFC 8175 §11.6).
@@ -261,14 +258,17 @@ pub fn extract_destination_mac(msg: &Message) -> Option<MacAddress> {
     })
 }
 
-/// Pull the nine metric Data Items into a `LinkMetrics`. Missing fields
-/// stay at their `Default` value; the RFC requires all of them in
-/// `Destination_Up`, but we are lenient on receive (out-of-spec peers
-/// shouldn't crash a router). Returns `None` only when no metric Data Item
-/// is present at all.
+/// Extract explicitly supplied metrics into a zero-initialized value. Use
+/// `merge_link_metrics` when applying a delta to existing session/destination
+/// defaults; a zero here is not a presence indicator.
 pub fn extract_link_metrics(msg: &Message) -> Option<LinkMetrics> {
-    let mut found = false;
     let mut m = LinkMetrics::default();
+    merge_link_metrics(msg, &mut m).then_some(m)
+}
+
+/// Apply only explicitly supplied fields, preserving all other values.
+pub fn merge_link_metrics(msg: &Message, m: &mut LinkMetrics) -> bool {
+    let mut found = false;
     for item in &msg.data_items {
         match item {
             DataItem::MaxDataRateReceive(v) => {
@@ -310,7 +310,7 @@ pub fn extract_link_metrics(msg: &Message) -> Option<LinkMetrics> {
             _ => {}
         }
     }
-    found.then_some(m)
+    found
 }
 
 /// Collect every `Ipv4Address` / `Ipv6Address` / `Ipv4AttachedSubnet` /
@@ -403,7 +403,7 @@ mod tests {
         let msg = build_destination_down(mac(), StatusCode::SHUTTING_DOWN);
         assert_eq!(msg.message_type, MessageType::DESTINATION_DOWN);
         assert_eq!(extract_destination_mac(&msg), Some(mac()));
-        assert_eq!(extract_status(&msg), Some(StatusCode::SHUTTING_DOWN));
+        assert_eq!(extract_status(&msg), None);
 
         let resp = build_destination_down_response(mac(), StatusCode::SUCCESS);
         assert_eq!(resp.message_type, MessageType::DESTINATION_DOWN_RESPONSE);

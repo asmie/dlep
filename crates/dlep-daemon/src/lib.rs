@@ -21,7 +21,7 @@ pub use config::{
     DiscoveryMode, ModemConfig, NetworkConfig, RouterConfig, SharedConfig, TimersConfig, TlsConfig,
 };
 pub use events::{
-    DaemonEvent, DestinationEvent, DestinationId, LinkMetrics, MetricsEvent, PeerInfo,
+    DaemonEvent, DestinationEvent, DestinationId, LinkMetrics, MetricsEvent, PeerInfo, PeerOffer,
 };
 pub use modem::{ModemBuilder, ModemDaemon};
 pub use router::{RouterBuilder, RouterDaemon};

@@ -85,7 +85,7 @@ edit with `--check-config`.
 | `[network]` | `tcp_port` | `854` | TCP/TLS session port |
 | `[network]` | `bind_addr` | `0.0.0.0` | modem listener bind address |
 | `[network]` | `use_tls` | `true` | TLS for the session transport |
-| `[network]` | `gtsm_enforce` | `true` | require TTL 255 on discovery |
+| `[network]` | `gtsm_enforce` | `true` | Linux TCP minimum-TTL filter and strict reset monitor (`CAP_NET_RAW`); discovery always checks TTL |
 | `[tls]` | `cert` / `key` | none | identity (modem: required; router: mTLS) |
 | `[tls]` | `ca_bundle` | none | trust roots (router: required; modem: for mTLS) |
 | `[tls]` | `require_client_cert` | `false` | modem requires router client certs |
@@ -113,7 +113,7 @@ The DLEP well-known port (854, UDP and TCP) is below 1024 and requires
 `CAP_NET_BIND_SERVICE` on Linux. Pick one:
 
 1. **systemd (recommended)** — the shipped units grant
-   `AmbientCapabilities=CAP_NET_BIND_SERVICE` to the unprivileged `dlep`
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW` to the unprivileged `dlep`
    service user.
 2. **setcap** — `sudo setcap cap_net_bind_service=+ep /usr/local/bin/dlep-modem`
    (repeat after each binary update).
@@ -130,9 +130,22 @@ Do **not** run the daemons as root.
 | modem → router | UDP | ephemeral | unicast Peer Offer reply |
 | router → modem | TCP | 854 | DLEP session (TLS) |
 
-Discovery sends with TTL 255 and, with `gtsm_enforce = true` (default),
-the modem drops discovery packets whose TTL is not 255 (GTSM, RFC 5082) —
+Discovery sends with TTL 255 and drops discovery packets whose TTL is not 255 (GTSM, RFC 5082) —
 discovery only works between directly-connected (one-hop) peers.
+
+Strict TCP GTSM also requires `CAP_NET_RAW` on Linux to monitor rejected packets
+and reset the affected connection immediately (RFC 8175 §14). The sample
+systemd units grant this capability. For manual runs, grant the capability to
+the installed executable, for example:
+
+```sh
+sudo setcap cap_net_bind_service,cap_net_raw=ep /usr/local/bin/dlep-modem
+sudo setcap cap_net_raw=ep /usr/local/bin/dlep-router
+```
+
+Reinstalling a binary may remove its file capabilities. Missing monitoring
+privileges cause an explicit error; `gtsm_enforce = false` is an opt-out for
+nonconforming development peers, not a production default.
 
 ## 6. systemd
 
@@ -162,6 +175,6 @@ trace|debug|info|warn|error` or the `DLEP_LOG` env var (add
 | `use_tls = true requires RouterBuilder::with_rustls_client(...)` / `…ModemBuilder::with_rustls_server(...)` | Library embedder didn't supply a rustls config — binaries never hit this. |
 | TLS handshake fails with certificate errors | Modem cert SAN doesn't contain the IP the router dialed, or peers disagree about the CA. |
 | `M6 discovery only supports v4 bind_addr` | Discovery mode with an IPv6 `bind_addr` passes `--check-config` but fails at startup; use an IPv4 `bind_addr` or static mode. |
-| Session drops and never re-establishes | The router does not yet reconnect after `SessionDown` (tracked follow-up); restart `dlep-router` to re-pair. |
+| Session drops and never re-establishes | The router retries after `SessionDown`; inspect connection/TLS errors and verify the offered addresses remain reachable. |
 | Discovery finds nothing | Peers more than one hop apart (GTSM), multicast blocked, or wrong `interface`. Try static mode (`--peer`) to isolate. |
 | `permission denied` binding port 854 | See §4. |

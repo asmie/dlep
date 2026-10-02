@@ -85,8 +85,11 @@ pub trait DlepExtension: Send + Sync + 'static {
     /// Invoked after parsing the peer's Session Init / Session Init Response.
     /// Return `false` to opt out of this session (extension stays inert).
     fn on_negotiated(&self, remote_ids: &[ExtensionId]) -> bool {
-        let _ = remote_ids;
-        true
+        !self.advertised_ids().is_empty()
+            && self
+                .advertised_ids()
+                .iter()
+                .all(|id| remote_ids.contains(id))
     }
 
     /// Called when the core codec could not map a data item to a typed
@@ -160,12 +163,48 @@ impl ExtensionRegistry {
     pub fn negotiate(&self, remote: &[ExtensionId]) -> Vec<Arc<dyn DlepExtension>> {
         self.extensions
             .iter()
-            .filter(|e| e.on_negotiated(remote))
+            .filter(|e| {
+                !e.advertised_ids().is_empty()
+                    && e.advertised_ids().iter().all(|id| remote.contains(id))
+                    && e.on_negotiated(remote)
+            })
             .cloned()
             .collect()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn DlepExtension>> {
         self.extensions.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct DefaultExtension;
+    impl DlepExtension for DefaultExtension {
+        fn advertised_ids(&self) -> &[ExtensionId] {
+            &[ExtensionId(65000)]
+        }
+    }
+    struct PermissiveExtension;
+    impl DlepExtension for PermissiveExtension {
+        fn advertised_ids(&self) -> &[ExtensionId] {
+            &[ExtensionId(65000), ExtensionId(65001)]
+        }
+        fn on_negotiated(&self, _: &[ExtensionId]) -> bool {
+            true
+        }
+    }
+    #[test]
+    fn negotiation_requires_mutual_support_even_for_permissive_plugins() {
+        let mut r = ExtensionRegistry::new();
+        r.register(Arc::new(DefaultExtension));
+        r.register(Arc::new(PermissiveExtension));
+        assert!(r.negotiate(&[]).is_empty());
+        assert_eq!(r.negotiate(&[ExtensionId(65000)]).len(), 1);
+        assert_eq!(
+            r.negotiate(&[ExtensionId(65000), ExtensionId(65001)]).len(),
+            2
+        );
     }
 }

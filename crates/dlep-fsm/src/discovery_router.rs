@@ -3,7 +3,7 @@ use std::time::Duration;
 use dlep_core::SignalType;
 
 use crate::discovery_common::{
-    build_peer_discovery, extract_offer_endpoint, extract_peer_description,
+    build_peer_discovery, extract_peer_description, offer_endpoints, valid_signal,
 };
 use crate::events::{EmittedEvent, FsmAction, FsmEvent, SendTarget};
 use crate::timers::{TimerId, TimerKind};
@@ -87,23 +87,23 @@ impl RouterDiscoveryFsm {
             }
 
             // Probing: inbound Peer_Offer → emit + transition.
-            (RouterDiscoveryState::Probing, FsmEvent::RecvSignal { signal, .. })
+            (RouterDiscoveryState::Probing, FsmEvent::RecvSignal { signal, from })
                 if signal.signal_type == SignalType::PEER_OFFER =>
             {
-                let Some(endpoint) = extract_offer_endpoint(&signal) else {
-                    // Malformed offer — keep probing.
+                if !valid_signal(&signal) {
                     return Vec::new();
-                };
+                }
+                let endpoints = offer_endpoints(&signal, from);
+                if endpoints.is_empty() {
+                    return Vec::new();
+                }
                 let peer_description = extract_peer_description(&signal);
-                self.state = RouterDiscoveryState::OfferReceived;
-                vec![
-                    FsmAction::CancelTimer(TIMER_DISCOVERY),
-                    FsmAction::Emit(EmittedEvent::PeerDiscovered {
-                        addr: endpoint.addr,
-                        peer_description,
-                        use_tls: endpoint.use_tls,
-                    }),
-                ]
+                // Remain probing: later offers may describe other modems or
+                // a modem that restarted at a different address.
+                vec![FsmAction::Emit(EmittedEvent::PeerDiscovered {
+                    endpoints,
+                    peer_description,
+                })]
             }
 
             // App shutdown: any state → Idle, cancel timer if armed.

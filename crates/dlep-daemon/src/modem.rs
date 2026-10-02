@@ -5,7 +5,7 @@ use dlep_core::StatusCode;
 use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
 use dlep_fsm::session_modem::ModemSessionFsm;
 use dlep_net::{Acceptor, ServerConfig};
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -27,6 +27,7 @@ pub struct ModemDaemon {
     /// First entry is the listen task; subsequent entries are per-session.
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     listen_task: JoinHandle<()>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     discovery_shutdown: Mutex<Option<mpsc::Sender<()>>>,
     discovery_task: Mutex<Option<JoinHandle<Result<(), DaemonError>>>>,
     extensions: ExtensionRegistry,
@@ -94,7 +95,8 @@ impl ModemDaemon {
     /// caller's problem.
     async fn fanout(&self, cmd: SessionCommand) -> Result<(), DaemonError> {
         let senders: Vec<_> = {
-            let guard = self.session_cmds.lock().await;
+            let mut guard = self.session_cmds.lock().await;
+            guard.retain(|tx| !tx.is_closed());
             guard.clone()
         };
         for tx in senders {
@@ -104,6 +106,8 @@ impl ModemDaemon {
     }
 
     pub async fn shutdown(self) -> Result<(), DaemonError> {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
         // Stop the discovery task first so it doesn't try to reply to a
         // late Peer_Discovery after the TCP machinery is gone.
         if let Some(tx) = self.discovery_shutdown.lock().await.take() {
@@ -172,7 +176,18 @@ impl ModemBuilder {
         let extensions_for_accept = self.extensions.clone();
 
         let bind_addr = SocketAddr::new(cfg.shared.network.bind_addr, cfg.shared.network.tcp_port);
-        let listener = TcpListener::bind(bind_addr).await?;
+        let socket = if bind_addr.is_ipv6() {
+            TcpSocket::new_v6()?
+        } else {
+            TcpSocket::new_v4()?
+        };
+        dlep_net::gtsm::configure_tcp(
+            &socket,
+            bind_addr.is_ipv6(),
+            cfg.shared.network.gtsm_enforce,
+        )?;
+        socket.bind(bind_addr)?;
+        let listener = socket.listen(128)?;
         let local_addr = listener.local_addr()?;
 
         let acceptor = if cfg.shared.network.use_tls {
@@ -181,9 +196,9 @@ impl ModemBuilder {
                     "use_tls = true requires ModemBuilder::with_rustls_server(...)".into(),
                 )
             })?;
-            Acceptor::tls(listener, server_cfg)
+            Acceptor::tls_with_gtsm(listener, server_cfg, cfg.shared.network.gtsm_enforce)?
         } else {
-            Acceptor::plain(listener)
+            Acceptor::plain_with_gtsm(listener, cfg.shared.network.gtsm_enforce)?
         };
 
         let (events_tx, _events_rx) = new_event_channel();
@@ -191,17 +206,6 @@ impl ModemBuilder {
             Arc::new(Mutex::new(Vec::new()));
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let session_id_counter = new_session_id_counter();
-
-        let listen_task = tokio::spawn(modem_accept_loop(
-            acceptor,
-            events_tx.clone(),
-            cfg.shared.timers.clone(),
-            cfg.peer_description.clone(),
-            session_cmds.clone(),
-            tasks.clone(),
-            extensions_for_accept,
-            session_id_counter.clone(),
-        ));
 
         // Discovery: bind the UDP multicast socket and spawn the listener.
         // The modem starts in Listening; it has no app-driven start event
@@ -214,12 +218,26 @@ impl ModemBuilder {
                 None => (None, None),
             };
 
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listen_task = tokio::spawn(modem_accept_loop(
+            acceptor,
+            events_tx.clone(),
+            cfg.shared.timers.clone(),
+            cfg.peer_description.clone(),
+            session_cmds.clone(),
+            tasks.clone(),
+            extensions_for_accept,
+            session_id_counter.clone(),
+            stopping.clone(),
+        ));
+
         Ok(ModemDaemon {
             events_tx,
             local_addr,
             session_cmds,
             tasks,
             listen_task,
+            stopping,
             discovery_shutdown: Mutex::new(discovery_shutdown),
             discovery_task: Mutex::new(discovery_task),
             extensions: self.extensions,
@@ -290,56 +308,77 @@ async fn modem_accept_loop(
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     extensions: ExtensionRegistry,
     session_id_counter: SessionIdCounter,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
-        let transport = match acceptor.accept().await {
-            Ok(t) => t,
+        let pending = match acceptor.accept_pending().await {
+            Ok(p) => p,
             Err(e) => {
                 warn!("modem accept failed: {e}");
                 continue;
             }
         };
-        let peer_addr = match transport.peer_addr() {
-            Ok(a) => a,
-            Err(e) => {
-                warn!("modem accept: peer_addr failed: {e}");
-                continue;
-            }
+        // Bound concurrent handshakes/sessions; excess TCP streams are closed.
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            continue;
         };
-        info!(peer = %peer_addr, "modem accepted connection");
-
-        let peer_info = PeerInfo {
-            addr: peer_addr,
-            is_tls: transport.is_tls(),
-            peer_description: None,
-        };
-        let advertised = extensions.advertised();
-        let session_cfg = session_config_from_timers(&timers, peer_description.clone(), advertised);
-        let fsm = ModemSessionFsm::with_config(session_cfg);
-
-        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-        session_cmds.lock().await.push(cmd_tx);
-
-        let events_tx_for_task = events_tx.clone();
-        let extensions_for_task = extensions.clone();
-        let counter_for_task = session_id_counter.clone();
+        let events_tx = events_tx.clone();
+        let extensions = extensions.clone();
+        let timers = timers.clone();
+        let peer_description = peer_description.clone();
+        let counter = session_id_counter.clone();
+        let commands = session_cmds.clone();
+        let stopping = stopping.clone();
         let handle = tokio::spawn(async move {
+            let _permit = permit;
+            let transport = match pending.handshake().await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("modem handshake failed: {e}");
+                    return;
+                }
+            };
+            let peer_addr = match transport.peer_addr() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            info!(peer = %peer_addr, "modem accepted connection");
+            let peer = PeerInfo {
+                addr: peer_addr,
+                is_tls: transport.is_tls(),
+                peer_description: None,
+            };
+            let cfg =
+                session_config_from_timers(&timers, peer_description, extensions.advertised());
+            let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+            {
+                let mut senders = commands.lock().await;
+                if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                senders.retain(|s| !s.is_closed());
+                senders.push(tx);
+            }
             if let Err(e) = run_session(
-                fsm,
+                ModemSessionFsm::with_config(cfg),
                 transport,
                 dlep_fsm::FsmEvent::TcpAccepted,
-                cmd_rx,
-                events_tx_for_task,
-                peer_info,
-                extensions_for_task,
+                rx,
+                events_tx,
+                peer,
+                extensions,
                 Role::Modem,
-                counter_for_task,
+                counter,
             )
             .await
             {
                 warn!("modem session task error: {e}");
             }
+            commands.lock().await.retain(|s| !s.is_closed());
         });
-        tasks.lock().await.push(handle);
+        let mut running = tasks.lock().await;
+        running.retain(|h| !h.is_finished());
+        running.push(handle);
     }
 }

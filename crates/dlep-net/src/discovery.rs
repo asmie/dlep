@@ -73,6 +73,7 @@ impl DiscoverySocket {
         sock.set_nonblocking(true)?;
         gtsm::set_send_ttl(&sock, false)?;
         gtsm::enable_recv_ttl(&sock, false)?;
+        nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)?;
         sock.set_multicast_loop_v4(params.multicast_loop)?;
         let bind_addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, params.port).into();
         sock.bind(&bind_addr.into())?;
@@ -161,6 +162,11 @@ impl DiscoverySocket {
     /// if the cmsg is missing the function returns an error rather than
     /// guessing (silent guess would defeat GTSM).
     pub async fn recv(&self) -> io::Result<(Signal, SocketAddr, u8)> {
+        let (signal, from, ttl, _) = self.recv_with_local().await?;
+        Ok((signal, from, ttl))
+    }
+
+    pub async fn recv_with_local(&self) -> io::Result<(Signal, SocketAddr, u8, Ipv4Addr)> {
         use bytes::BytesMut;
         use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 
@@ -171,7 +177,7 @@ impl DiscoverySocket {
         // `i32` matches `libc::c_int` on every supported target, keeping
         // `dlep-net` free of an explicit `libc` dep.
         let mut payload = [0u8; 1500];
-        let mut cmsg_space = nix::cmsg_space!(i32);
+        let mut cmsg_space = nix::cmsg_space!(i32, nix::libc::in_pktinfo);
 
         loop {
             let mut guard = self.fd.readable().await?;
@@ -195,7 +201,11 @@ impl DiscoverySocket {
                     })
                     .ok_or_else(|| io::Error::other("recvmsg without v4 sender"))?;
                 let mut ttl: Option<u8> = None;
+                let mut local = None;
                 for cmsg in res.cmsgs().map_err(io::Error::from)? {
+                    if let ControlMessageOwned::Ipv4PacketInfo(info) = cmsg {
+                        local = Some(Ipv4Addr::from(info.ipi_spec_dst.s_addr.to_ne_bytes()));
+                    }
                     if let ControlMessageOwned::Ipv4Ttl(t) = cmsg {
                         // TTL is a single byte in the IP header; the kernel
                         // hands it back as `int` (0..=255), so the cast is
@@ -203,10 +213,10 @@ impl DiscoverySocket {
                         ttl = Some(t as u8);
                     }
                 }
-                Ok::<_, io::Error>((bytes_read, from, ttl))
+                Ok::<_, io::Error>((bytes_read, from, ttl, local))
             });
             match outcome {
-                Ok(Ok((bytes_read, from, ttl_opt))) => {
+                Ok(Ok((bytes_read, from, ttl_opt, local))) => {
                     let ttl = ttl_opt.ok_or_else(|| {
                         io::Error::other(
                             "recvmsg returned no IP_TTL cmsg — IP_RECVTTL not enabled?",
@@ -217,7 +227,12 @@ impl DiscoverySocket {
                         .codec
                         .decode_datagram(buf)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    return Ok((signal, from, ttl));
+                    return Ok((
+                        signal,
+                        from,
+                        ttl,
+                        local.ok_or_else(|| io::Error::other("missing IP_PKTINFO"))?,
+                    ));
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => continue,

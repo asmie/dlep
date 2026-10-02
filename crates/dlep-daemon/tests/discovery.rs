@@ -3,7 +3,7 @@
 //! End-to-end gate for the discovery pipeline: spawn a `ModemDaemon` (which
 //! auto-starts its discovery listener), spawn a `RouterDaemon`, kick off
 //! `start_discovery()`, observe `DaemonEvent::PeerDiscovered`, then
-//! `connect_static` to the discovered endpoint and assert `SessionUp` on
+//! `connect_discovered` using the offered endpoints and assert `SessionUp` on
 //! both sides.
 //!
 //! ## WSL2 environment caveat
@@ -12,10 +12,8 @@
 //! (`ip link show lo`), so binding the discovery socket's multicast join to
 //! `127.0.0.1` would never receive datagrams. This test uses
 //! `Ipv4Addr::UNSPECIFIED` for `bind_addr` to let the kernel pick the
-//! default-route interface (typically `eth0`) for multicast. On Linux,
-//! `TcpStream::connect("0.0.0.0:<port>")` still routes to loopback, so the
-//! TCP-session leg works fine — the modem's `Peer_Offer` carries
-//! `0.0.0.0:<resolved-tcp-port>`, which the router dials successfully.
+//! default-route interface for multicast. The offer must resolve the wildcard
+//! listener to the ingress interface's real unicast address via IP_PKTINFO.
 //!
 //! The router-side discovery socket binds an ephemeral port (port `0`) and
 //! does not join the multicast group; only the modem joins. This avoids
@@ -29,7 +27,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use dlep_daemon::{
-    DaemonEvent, ModemConfig, ModemDaemon, NetworkConfig, PeerInfo, RouterConfig, RouterDaemon,
+    DaemonEvent, ModemConfig, ModemDaemon, NetworkConfig, PeerOffer, RouterConfig, RouterDaemon,
     SharedConfig, TimersConfig,
 };
 use tokio::sync::broadcast::Receiver;
@@ -85,7 +83,7 @@ fn loopback_router_config() -> RouterConfig {
     }
 }
 
-async fn await_peer_discovered(rx: &mut Receiver<DaemonEvent>) -> PeerInfo {
+async fn await_peer_discovered(rx: &mut Receiver<DaemonEvent>) -> PeerOffer {
     loop {
         let evt = timeout(STEP_TIMEOUT, rx.recv())
             .await
@@ -132,17 +130,21 @@ async fn discovery_loopback_finds_modem_and_establishes_session() {
 
     // 4) Router observes the modem's offer.
     let peer = await_peer_discovered(&mut router_events).await;
-    // `peer.addr.ip()` is whatever the modem's TCP listener bound to —
-    // `0.0.0.0` here (see file-level WSL2 note). The load-bearing
-    // assertions are the description echo (proves the offer's data items
-    // round-trip end-to-end) and that the port is a resolved, non-zero
-    // value (proves the OS-assigned listen port was captured).
+    // A wildcard bind must produce a usable unicast connection point.
     assert_eq!(peer.peer_description.as_deref(), Some("discovery-modem"));
-    assert_ne!(peer.addr.port(), 0, "modem TCP port must be resolved");
+    assert!(
+        !peer.endpoints[0].addr.ip().is_unspecified(),
+        "must advertise a reachable unicast address"
+    );
+    assert_ne!(
+        peer.endpoints[0].addr.port(),
+        0,
+        "modem TCP port must be resolved"
+    );
 
     // 5) Router connects to the discovered modem (embedder-driven path).
     router
-        .connect_static(peer.addr)
+        .connect_discovered(&peer)
         .await
         .expect("connect_static after discovery");
 

@@ -118,6 +118,26 @@ impl RouterDaemon {
         Ok(())
     }
 
+    /// Try the offer's compatible endpoints in preference order. TLS-required
+    /// configuration never falls back to plaintext; --no-tls never sends
+    /// plaintext to an endpoint advertising TLS.
+    pub async fn connect_discovered(
+        &self,
+        offer: &crate::events::PeerOffer,
+    ) -> Result<SocketAddr, DaemonError> {
+        let mut error = DaemonError::Config("offer has no compatible connection points".into());
+        for endpoint in &offer.endpoints {
+            if endpoint.use_tls != self.network.use_tls {
+                continue;
+            }
+            match self.connect_static(endpoint.addr).await {
+                Ok(()) => return Ok(endpoint.addr),
+                Err(e) => error = e,
+            }
+        }
+        Err(error)
+    }
+
     /// Open a session against a known modem address. The TCP connection is
     /// established before this function returns; the session task then runs
     /// independently until shutdown or peer disconnect.
@@ -133,7 +153,10 @@ impl RouterDaemon {
             Connector::plain()
         };
 
-        let transport = connector.connect(peer).await?;
+        let transport = connector
+            .with_gtsm(self.network.gtsm_enforce)
+            .connect(peer)
+            .await?;
         let peer_info = PeerInfo {
             addr: transport.peer_addr()?,
             is_tls: transport.is_tls(),
@@ -159,8 +182,12 @@ impl RouterDaemon {
             self.session_id_counter.clone(),
         ));
 
-        self.session_cmds.lock().await.push(cmd_tx);
-        self.tasks.lock().await.push(handle);
+        let mut commands = self.session_cmds.lock().await;
+        commands.retain(|tx| !tx.is_closed());
+        commands.push(cmd_tx);
+        let mut tasks = self.tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
         Ok(())
     }
 
@@ -172,10 +199,12 @@ impl RouterDaemon {
             .await
     }
 
-    /// Push session-wide metric changes to every connected modem via a
-    /// Session Update Message (RFC 8175 §12.7).
-    pub async fn update_session_metrics(&self, metrics: LinkMetrics) -> Result<(), DaemonError> {
-        self.fanout(SessionCommand::SessionUpdate { metrics }).await
+    /// Compatibility entry point: always returns a configuration error.
+    /// RFC 8175 §12.7 permits only modems to originate session metric items.
+    pub async fn update_session_metrics(&self, _metrics: LinkMetrics) -> Result<(), DaemonError> {
+        Err(DaemonError::Config(
+            "only a modem may originate session metrics (RFC 8175 section 12.7)".into(),
+        ))
     }
 
     /// Fan a command to every active session. Snapshot the sender list under
@@ -183,7 +212,8 @@ impl RouterDaemon {
     /// already exited and dropped its receiver is not the caller's problem.
     async fn fanout(&self, cmd: SessionCommand) -> Result<(), DaemonError> {
         let senders: Vec<_> = {
-            let guard = self.session_cmds.lock().await;
+            let mut guard = self.session_cmds.lock().await;
+            guard.retain(|tx| !tx.is_closed());
             guard.clone()
         };
         for tx in senders {

@@ -36,6 +36,10 @@ pub struct DestinationAddrs {
 pub enum FsmEvent {
     // Wire
     RecvMessage(Message),
+    /// A negotiated extension consumed a valid message.
+    RecvExtensionMessage,
+    /// Malformed input detected by the transport codec.
+    ProtocolError(StatusCode),
     RecvSignal {
         signal: Signal,
         from: std::net::SocketAddr,
@@ -67,8 +71,7 @@ pub enum FsmEvent {
         mac: MacAddress,
     },
     /// Push session-wide metric changes to the peer via a Session Update
-    /// Message (RFC 8175 §12.7). Either participant may originate one —
-    /// the RFC scopes it to "a DLEP participant", not to a single role.
+    /// Message (RFC 8175 §12.7). Metrics may only originate at the modem.
     AppSessionUpdate {
         metrics: LinkMetrics,
     },
@@ -124,9 +127,8 @@ pub enum EmittedEvent {
     },
     SessionDown(StatusCode),
     PeerDiscovered {
-        addr: std::net::SocketAddr,
+        endpoints: Vec<crate::discovery_common::OfferEndpoint>,
         peer_description: Option<String>,
-        use_tls: bool,
     },
     DestinationUp {
         mac: MacAddress,

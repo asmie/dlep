@@ -129,7 +129,7 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 | Module | Responsibility |
 |---|---|
 | `config.rs` | `RouterConfig`, `ModemConfig`, plus shared `NetworkConfig`, `TlsConfig`, `TimersConfig`. All `serde::Deserialize` for TOML. |
-| `events.rs` | Public `DaemonEvent` enum (`PeerDiscovered`, `SessionUp`, `SessionDown`, `Destination`, `Metrics`, `Extension`), plus `DestinationId`, `LinkMetrics`, `PeerInfo`. `SessionUp` and `SessionDown` both carry `PeerInfo` so a multi-session embedder can attribute the event to a peer. `DaemonEvent: Clone` (required by `tokio::sync::broadcast`); `Debug` is hand-written because `Arc<dyn Any + Send + Sync>` does not derive `Debug`. |
+| `events.rs` | Public `DaemonEvent` enum (`PeerDiscovered`, `SessionUp`, `SessionDown`, `Destination`, `Metrics`, `Extension`), plus `DestinationId`, `LinkMetrics`, `PeerInfo`. `SessionUp`, `SessionDown`, `Destination`, and `Metrics` carry both `PeerInfo` and a `SessionId` so a multi-session embedder can attribute events across reconnects. `DaemonEvent: Clone` (required by `tokio::sync::broadcast`); `Debug` is hand-written because `Arc<dyn Any + Send + Sync>` does not derive `Debug`. |
 | `runtime.rs` | Channel plumbing: `EventTx = broadcast::Sender<DaemonEvent>` for the public event bus, `mpsc` for internal commands. `DaemonError` lives here too. |
 | `discovery.rs` | `run_discovery` background task: owns a `DiscoverySocket` + a discovery FSM (router or modem), bridges socket I/O to FSM events, applies GTSM filtering on inbound packets, drives periodic Peer_Discovery resends via `DiscoveryTimers`, and translates `EmittedEvent::PeerDiscovered` into `DaemonEvent::PeerDiscovered`. |
 | `session.rs` | The `SessionFsm` trait that the runtime drives, with blanket impls for the router and modem session FSMs. |
@@ -178,7 +178,7 @@ Splitting into seven crates is more upfront work, but each split serves a purpos
 
 The decoder produces a fully typed `DataItem` enum, with an `Unknown(RawDataItem)` variant that preserves any item the core codec does not recognise. Downstream code matches exhaustively on the typed variants and gets compile-time errors when a new variant is added; extensions can introspect the `Unknown` items.
 
-The codec **never fails on an unknown Data Item type id**. It only fails on malformed framing (truncated buffer, wrong length, missing `"DLEP"` prefix on a signal). This is the forward-compatibility behaviour required by the RFC.
+The codec preserves unknown Data Items for extension dispatch and validates framing, lengths, and value ranges. The session layer rejects unclaimed unknown items with `INVALID_DATA` under RFC 8175 §12.1, except for the initialization exception for unrecognized advertised extensions. Unknown items are not silently accepted in an established session.
 
 ### 5.3 Bytes-based parsing, no `nom`, no full zero-copy
 
@@ -196,7 +196,7 @@ The four FSMs share `FsmEvent`, `FsmAction`, `TimerId`/`TimerKind`, and `Transac
 
 ### 5.6 Heartbeat reset is centralised
 
-Any successfully decoded `FsmEvent::RecvMessage` causes the FSM to emit `FsmAction::ResetHeartbeat { missed_deadline }`, which the runtime uses to cancel and re-arm the **missed-heartbeat deadline** (the single-shot timer set to `2 × peer_interval` per RFC 8175 §11.2). The send-side periodic heartbeat timer is **independent**: it is armed once at `InSession` entry from our locally-configured `heartbeat_interval_ms` and reschedules itself on each tick — receives don't touch it. The advertised local interval is clamped to RFC 8175's minimum of 1 second, and the codec rejects Heartbeat Interval Data Items below that minimum (`0` is explicitly forbidden by RFC §13.5). The FSM owns `peer_heartbeat_interval: Option<Duration>` extracted from the Heartbeat Interval Data Item in the Session Init / Init Response handshake; `None` means the field was absent. Two consecutive missed intervals — equivalently, one fire of a `2 × interval` deadline — trigger a Session Termination with status code 132.
+A valid in-session core message or a message consumed by a negotiated extension causes the FSM to emit `FsmAction::ResetHeartbeat { missed_deadline }`, which the runtime uses to cancel and re-arm the **missed-heartbeat deadline** (the single-shot timer set to `2 × peer_interval` per RFC 8175 §11.2). The send-side periodic heartbeat timer is **independent**: it is armed once at `InSession` entry from our locally-configured `heartbeat_interval_ms` and reschedules itself on each tick — receives don't touch it. The advertised local interval is clamped to RFC 8175's minimum of 1 second, and the codec rejects Heartbeat Interval Data Items below that minimum (`0` is explicitly forbidden by RFC §13.5). The FSM owns `peer_heartbeat_interval: Option<Duration>` extracted from the Heartbeat Interval Data Item in the Session Init / Init Response handshake; `None` is valid only before initialization; a missing mandatory heartbeat interval rejects initialization. Two consecutive missed intervals — equivalently, one fire of a `2 × interval` deadline — trigger a Session Termination with status code 132.
 
 ### 5.7 Transaction serialisation is enforced in one place
 
@@ -208,11 +208,25 @@ The public event channel is a `tokio::sync::broadcast` — fan-out, lossy on slo
 
 ### 5.9 TLS is on by default
 
-`use_tls` defaults to `true` in `NetworkConfig::default()` (M7). Embedders that need plain TCP must explicitly set `use_tls = false` in their config — the default is RFC 8175 §10's recommended posture. Daemons configured with `use_tls = true` MUST also call `RouterBuilder::with_rustls_client(...)` / `ModemBuilder::with_rustls_server(...)` before `spawn`; otherwise spawn fails fast with a `DaemonError::Config` error rather than silently downgrading to plaintext. `ServerName::IpAddress` is derived from the connect target's IP; cert SANs must include that IP. Client/server `rustls::ClientConfig` and `rustls::ServerConfig` re-exported from `dlep-net` for one-stop import. A `dlep_net::tls::test_helpers` module (gated by the `test-helpers` feature) generates rcgen-based self-signed certs for integration tests.
+`use_tls` defaults to `true` in `NetworkConfig::default()` (M7). Embedders that need plain TCP must explicitly set `use_tls = false` in their config — the default is RFC 8175 §10's recommended posture. Daemons configured with `use_tls = true` MUST also call `RouterBuilder::with_rustls_client(...)` / `ModemBuilder::with_rustls_server(...)` before `spawn`; otherwise the modem fails during spawn and the router fails when connecting with a `DaemonError::Config` error. `ServerName::IpAddress` is derived from the connect target's IP; cert SANs must include that IP. Client/server `rustls::ClientConfig` and `rustls::ServerConfig` re-exported from `dlep-net` for one-stop import. A `dlep_net::tls::test_helpers` module (gated by the `test-helpers` feature) generates rcgen-based self-signed certs for integration tests.
 
-### 5.10 GTSM (RFC 5082) primarily on UDP
+### 5.10 GTSM (RFC 5082)
 
-DLEP requires inbound packets to have TTL/HopLimit = 255 (any lower means the packet was forwarded across an L3 hop). The full enforcement happens on the UDP discovery socket via `IP_RECVTTL` / `IPV6_RECVHOPLIMIT` and `recvmsg`-based cmsg parsing. For TCP, we set TTL = 255 on send and check it once at connection setup; per-segment TTL inspection on TCP would require XDP/eBPF, which is out of scope. This is consistent with the RFC's intent — GTSM is primarily about discovery.
+IPv4 UDP discovery sends with TTL 255 and checks received TTL through ancillary
+data. TCP sockets set TTL/hop limit 255 before connecting or listening. On Linux,
+`gtsm_enforce` additionally configures `IP_MINTTL` / `IPV6_MINHOPCOUNT` so the
+kernel rejects lower-TTL TCP segments, including handshake traffic. Other
+platforms fail explicitly when TCP enforcement is requested.
+
+Linux does not surface minimum-TTL drops through the stream API. The transport
+therefore opens an `AF_PACKET` monitor before accepting/connecting, requiring
+`CAP_NET_RAW`. It matches incoming TCP tuples (including IPv6 scope and mapped
+IPv4 addresses) and aborts an affected connection using Linux's `AF_UNSPEC`
+disconnect. This sends RST, wakes the session task, and triggers its normal
+`SessionDown` cleanup. The monitor remains active during TLS negotiation and is
+released with the connection/listener. Setup failures are explicit; a monitor
+read failure resets all its registered connections. The systemd examples grant
+the capability; network tests run in an isolated network namespace.
 
 ### 5.11 Channels: broadcast for events, mpsc for commands
 
@@ -224,13 +238,12 @@ Extensions are dispatched per session by the session task. Their lifecycle:
 
 1. At `spawn` time, the registry's union of `advertised_ids()` is stamped into `SessionConfig.advertised_extensions` and goes onto the wire in `ExtensionsSupported`.
 2. On the inbound `Session Initialization` (modem) or `Session Initialization Response` (router), the FSM extracts the peer's `ExtensionsSupported` into `peer_extensions` and emits `EmittedEvent::SessionUp { peer_extensions }`.
-3. The session task runs `registry.negotiate(&peer_extensions)` → an `active_exts: Vec<Arc<dyn DlepExtension>>` of extensions whose `on_negotiated` returned `true`. Only these receive subsequent hook calls.
-4. `on_session_state(up=true)` fires on every active extension *before* the public `DaemonEvent::SessionUp` is broadcast, so a hook's `ctx.send_message(...)` can race extension wire traffic out ahead of application-level reactions.
-5. For inbound messages: if `message_type` is in the RFC 8175 core set, the FSM steps on it and (afterwards) `on_unknown_data_item` runs for every `DataItem::Unknown` it contained. If `message_type` is unknown, the FSM never sees it; extensions handle it via `on_unknown_message` and a `Handled` return silences any further processing. Otherwise the message is dropped (RFC 8175 §13's "silently discard" rule).
-6. `on_destination_state` fires on `Destination_Up` / `Destination_Down` (and only those — `Destination_Update` is metric-only).
-7. `on_session_state(up=false)` fires on any `EmittedEvent::SessionDown(_)`.
+3. The registry activates only plugins whose nonempty advertised ID set is supported by the peer and whose negotiation callback accepts the session. A plugin implementing independent extensions can register separate instances if it needs partial negotiation.
+4. The public `SessionUp` event is emitted before `on_session_state(up=true)` runs.
+5. In-session unknown messages and items are first offered to negotiated extensions. Unclaimed input reaches the FSM's strict validation; handled messages reset the peer-silence deadline. Extension callbacks do not process terminating-session traffic.
+6. Destination lifecycle events notify `on_destination_state`; the router also surfaces successful Announce responses as destination arrivals.
+7. A lifecycle guard emits exactly one `SessionDown` and extension teardown callback on ordinary termination, I/O failure, or task cancellation. Codec failures initiate protocol termination; writes have a bounded deadline.
 
-Hook handlers are synchronous. They queue outbound messages via `ctx.send_message(...)` (drained to the writer once the hook returns) and emit application-level events via `ctx.emit_event(Arc<dyn Any + Send + Sync>)` onto the public broadcast channel. The `SessionCtx` impl that backs every hook call is constructed fresh per call and never held across `.await` — extensions cannot accidentally hold mutable runtime state.
 
 ---
 
@@ -291,7 +304,7 @@ let mut events = daemon.subscribe();          // broadcast::Receiver<DaemonEvent
 daemon.start_discovery().await?;
 
 while let Ok(event) = events.recv().await {
-    // react to PeerDiscovered, SessionUp, Destination(...), Metrics(...) …
+    // react to PeerDiscovered, SessionUp, Destination { .. }, Metrics { .. } …
 }
 
 daemon.shutdown().await?;
@@ -299,7 +312,7 @@ daemon.shutdown().await?;
 
 The modem-side API is symmetric, with `add_destination`, `update_destination` and `drop_destination` taking the place of `start_discovery` / `connect_static`.
 
-Both handles also expose `update_session_metrics` (session-wide metric changes via `Session Update`; RFC 8175 §12.7 permits either participant to originate one). `announce_destination` is **router-side only**, because RFC 8175 §12.13 makes `Destination Announce` router-originated — the modem receives it, answers per §12.14, and surfaces it to its application as `DestinationEvent::Announced`.
+Only the modem can originate metric changes via `update_session_metrics`. The router compatibility method returns an error; router Session Update payloads are restricted to Layer 3 information. `announce_destination` is **router-side only**, because RFC 8175 §12.13 makes `Destination Announce` router-originated — the modem receives it, answers per §12.14, and surfaces it to its application as `DestinationEvent::Announced`.
 
 ---
 
@@ -323,7 +336,7 @@ CI (`.github/workflows/ci.yml`) runs three parallel jobs: `cargo fmt --all -- --
 
 ## 9. Implementation status (high level)
 
-The tree is **functionally complete for the RFC 8175 core protocol** as of M10: no `TODO (Mn)` stub markers remain, `cargo clippy --all-targets -D warnings` is clean, and the 209-test suite passes. The gaps that remain are enumerated at the end of this section and in §10 — chiefly IPv6 discovery transport, `Link Characteristics Request`/`Response`, and configurable session-wide metrics.
+The implementation is **not yet complete for RFC 8175**. The initial 209-test suite validated many happy paths but missed interoperability and failure-path defects. The current review adds strict message/transaction validation, fatal-status echoing, metric merging, destination Announce state, continuous discovery with usable unicast endpoints, bounded concurrent TLS handshakes, session error cleanup, and peer/session attribution for application events. Remaining feature gaps are tracked separately below. Strict TCP GTSM now uses a privileged Linux packet monitor.
 
 The order of work was:
 
@@ -337,19 +350,18 @@ The order of work was:
 8. Wire the extension plug-in API and round-trip a private-use ID through a test-only extension. **Done (M8)** — `ExtensionRegistry` is now plumbed from `RouterBuilder`/`ModemBuilder` into each session task; `SessionConfig.advertised_extensions` is populated from `registry.advertised()` and shows up in the `ExtensionsSupported` data item of `Session Initialization` / `Session Initialization Response`; both FSMs capture the peer's advertised IDs into `peer_extensions` and surface them via `EmittedEvent::SessionUp { peer_extensions }`; the daemon computes `negotiated_extensions = advertised_local ∩ peer_extensions` for `DaemonEvent::SessionUp`. The session task routes inbound messages with an unknown `MessageType` through `on_unknown_message`, dispatches `DataItem::Unknown` items inside known messages through `on_unknown_data_item`, and drives `on_session_state` / `on_destination_state` on lifecycle transitions. Verified by the `private_use_extension_round_trips_session_init_and_unknown_message` integration test (Private-Use `ExtensionId(0xF000)` + `MessageType(0xF000)`). Follow-ups: extension-driven Session Termination, per-extension config plumbing, extensions over the UDP discovery socket, and an "ask FSM to terminate" hook.
 9. Polish the CLI binaries and document deployment. **Done (M9)** — the binaries build rustls configs from the TOML `[tls]` section via `dlep_daemon::tls::{client_config, server_config}`: the router requires `ca_bundle` (private PKI; no system-roots fallback) and presents `cert`+`key` as its mTLS identity when set; the modem requires `cert`+`key` and, with `require_client_cert = true`, enforces client certificates through `WebPkiClientVerifier` — closing the mutual-TLS follow-up from M7. New flags: `--cert` / `--key` / `--ca-bundle` overrides, `--check-config` (validates TOML shape, static peers and TLS material via `check_router_config` / `check_modem_config`, then exits), and the router's repeatable `--peer` (implies static mode). The router binary gained its missing run loop: static peers connect at startup, discovery mode auto-connects on `PeerDiscovered` (deduplicated by address). `NetworkConfig` is now `#[serde(default)]` so partial `[network]` sections parse, and the `[network]`/`[tls]`/`[timers]` sections reject unknown keys. Deployment guide at `doc/deployment.md` (private-CA openssl walkthrough, port-854 privileges, firewall/GTSM, systemd) plus working artifacts in `examples/` (TOML configs, hardened systemd units with a static `dlep` user). Verified by the `mtls_session_requires_and_accepts_client_certificate` / `mtls_modem_rejects_client_without_certificate` integration tests and an end-to-end smoke run with openssl-issued certificates. Follow-ups: `--tcp-port`/`--bind-addr` overrides, shell completions, packaging, reconnect-on-drop for the router's run loop.
 10. Close the RFC-conformance gaps a post-M9 audit turned up. **Done (M10)** — three defects, all of which had survived because nothing in the tree exercised them:
-    - **`Session Update` / `Session Update Response` (RFC 8175 §12.7-12.8) were entirely absent.** Neither FSM had an arm, so an inbound `Session Update` fell through the `InSession` catch-all: the missed-heartbeat deadline was reset and the message was then dropped **without the mandatory Response** ("A Session Update Response Message MUST be sent … when a Session Update Message is received"). Both FSMs now answer unconditionally, close the session-level transaction on the Response, and accept an app-originated `AppSessionUpdate`. §12.7 scopes the message to "a DLEP participant", so both roles implement both directions — exposed as `update_session_metrics` on both handles. Inbound session-wide metrics now surface as `DaemonEvent::Metrics`, which had been a defined-but-never-constructed variant.
-    - **`Destination Announce` was on the wrong role.** `ModemDaemon::announce_destination` existed, took a MAC, discarded it and returned `Ok(())` — a public method that silently did nothing, advertised in both the README and §7. But §12.13 makes Destination Announce *router*-originated ("MAY be sent by a router to announce such an interest"), and §12.14 obliges the *modem* to answer it. The no-op is gone; `RouterDaemon::announce_destination` sends the message under a per-destination transaction, and the modem answers and emits `DestinationEvent::Announced` (another previously-dead variant) so its application can decide whether to follow up with a `Destination_Up`. A malformed announce with no MAC is dropped leniently rather than terminating the session — there is no MAC to key the mandatory response on.
+    - **`Session Update` / `Session Update Response` (RFC 8175 §12.7-12.8) were entirely absent.** Neither FSM had an arm, so an inbound `Session Update` fell through the `InSession` catch-all: the missed-heartbeat deadline was reset and the message was then dropped **without the mandatory Response** ("A Session Update Response Message MUST be sent … when a Session Update Message is received"). Both FSMs acknowledge valid Session Updates and close matching transactions. The subsequent review corrected the original interpretation of §12.7: only modem-originated updates may contain metrics. Inbound session-wide metrics now surface as `DaemonEvent::Metrics`, which had been a defined-but-never-constructed variant.
+    - **`Destination Announce` was on the wrong role.** `ModemDaemon::announce_destination` existed, took a MAC, discarded it and returned `Ok(())` — a public method that silently did nothing, advertised in both the README and §7. But §12.13 makes Destination Announce *router*-originated ("MAY be sent by a router to announce such an interest"), and §12.14 obliges the *modem* to answer it. The no-op is gone; `RouterDaemon::announce_destination` sends the message under a per-destination transaction, and the modem answers and emits `DestinationEvent::Announced` (another previously-dead variant) so its application can decide whether to follow up with a `Destination_Up`. A malformed announce with no MAC now terminates the session with Invalid Data.
     - **The router binary could never reconnect.** `run_event_loop` inserted each peer into a `connected` dedup set and never removed it, and the `SessionDown` arm only logged, so a modem restart orphaned the router until the process was restarted — re-discovery hit the dedup `continue` and was skipped forever. The root cause was an API gap: `DaemonEvent::SessionDown` carried only a `StatusCode`, so the loop could not tell *which* peer had dropped. `SessionDown` now carries `PeerInfo`, and the loop evicts the dead peer and re-dials it via a `ReconnectQueue` (1 s base, doubling, 30 s cap; `forget` on `SessionUp` so each drop starts a fresh sequence). The queue takes its clock as a parameter, so the backoff is unit-tested without sleeping.
 
-    Follow-ups: extend session attribution to `Destination` / `Metrics` events (they still carry no peer or session id, so a router with several modems cannot tell destinations apart); make session-wide metrics configurable instead of the `PLACEHOLDER_*` constants in `build_session_initialization_response`; IPv6 discovery; `Link Characteristics Request`/`Response`. Note also that the new `AppSessionUpdate` / `AppAnnounceDestination` arms follow the existing convention of *silently dropping* a command when the transaction slot is busy (`tracing::debug!` + empty action vec) — the same wart tracked below for `AppDropDestination`. It should be fixed for all of them at once, by queueing or by surfacing a busy error.
+    Follow-ups: make session-wide metrics configurable instead of the `PLACEHOLDER_*` constants in `build_session_initialization_response`; IPv6 discovery; `Link Characteristics Request`/`Response`. Note also that the new `AppSessionUpdate` / `AppAnnounceDestination` arms follow the existing convention of *silently dropping* a command when the transaction slot is busy (`tracing::debug!` + empty action vec) — the same wart tracked below for `AppDropDestination`. It should be fixed for all of them at once, by queueing or by surfacing a busy error.
 
 ---
 
 ## 10. Open questions / risks
 
-- **Extension-set negotiation semantics.** RFC 8175 §11.6 phrases the negotiated set ambiguously; cross-reference with the LL-DLEP reference implementation when wiring this.
+- **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.
-- **Per-segment TTL on TCP.** Out of scope; we accept the GTSM-on-UDP-only stance documented above. If a deployment needs it, that is an XDP/eBPF concern.
 - **Privileged binding to port 854.** Port 854 is below 1024 and requires `CAP_NET_BIND_SERVICE` on Linux, or running behind an unprivileged user with `setcap cap_net_bind_service=+ep` on the binary, or a systemd unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE`. Documented in `doc/deployment.md` §4 (M9).
 - **IPv4 vs IPv6.** Wire encoding handles both from day one (`Ipv4ConnectionPoint` / `Ipv6ConnectionPoint` etc.), and the GTSM helpers in `dlep-net/src/gtsm.rs` already have `IPV6_UNICAST_HOPS` / `IPV6_MULTICAST_HOPS` paths. **The discovery transport is still IPv4-only**: `dlep-net/src/discovery.rs` contains no IPv6 code, so `NetworkConfig::discovery_v6_group` is currently a dead config key — it parses and is then read by nothing. Setting it silently does nothing, which is worse than rejecting it; wiring v6 discovery (or rejecting the key until then) is outstanding work.
 - **Silent drops when a transaction slot is busy.** `AppDropDestination`, `AppSessionUpdate` and `AppAnnounceDestination` all `tracing::debug!` and return an empty action vector if a request for the same scope is already in flight. The caller gets `Ok(())` and no indication the command evaporated. For `AppDropDestination` this means a destination can stay up forever from the router's view if the drop races the preceding `Destination_Up`. All three need the same fix — queue the command, or surface a busy error through the public API — and it should be one change, not three.

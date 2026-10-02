@@ -47,7 +47,7 @@ fn router_probing_resends_on_timer() {
 }
 
 #[test]
-fn router_probing_to_offer_received_on_peer_offer() {
+fn router_keeps_probing_after_peer_offer() {
     let mut fsm = RouterDiscoveryFsm::new();
     let _ = fsm.step(FsmEvent::AppStartDiscovery);
     let offer = build_peer_offer("dlep-modem", peer_addr(), false);
@@ -55,15 +55,15 @@ fn router_probing_to_offer_received_on_peer_offer() {
         signal: offer,
         from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 12345),
     });
-    assert_eq!(fsm.state, RouterDiscoveryState::OfferReceived);
+    assert_eq!(fsm.state, RouterDiscoveryState::Probing);
     assert!(
-        actions
+        !actions
             .iter()
-            .any(|a| matches!(a, FsmAction::CancelTimer(t) if *t == TIMER_DISCOVERY))
+            .any(|a| matches!(a, FsmAction::CancelTimer(_)))
     );
     assert!(actions.iter().any(|a| matches!(
         a,
-        FsmAction::Emit(EmittedEvent::PeerDiscovered { addr, .. }) if *addr == peer_addr()
+        FsmAction::Emit(EmittedEvent::PeerDiscovered { endpoints, .. }) if endpoints[0].addr == peer_addr()
     )));
 }
 
@@ -108,7 +108,7 @@ fn router_offer_received_holds_state() {
         signal: build_peer_offer("another", peer_addr(), false),
         from: peer_addr(),
     });
-    assert_eq!(fsm.state, RouterDiscoveryState::OfferReceived);
+    assert_eq!(fsm.state, RouterDiscoveryState::Probing);
 }
 
 #[test]
@@ -174,5 +174,66 @@ fn modem_offer_burst_replies_to_another_discovery() {
         actions
             .iter()
             .any(|a| matches!(a, FsmAction::SendSignal { .. }))
+    );
+}
+
+#[test]
+fn multiple_modems_are_discovered_and_probes_continue() {
+    let mut fsm = RouterDiscoveryFsm::new();
+    fsm.step(FsmEvent::AppStartDiscovery);
+    for addr in ["192.0.2.1:854", "192.0.2.2:854", "192.0.2.3:854"] {
+        let addr = addr.parse().unwrap();
+        let actions = fsm.step(FsmEvent::RecvSignal {
+            signal: build_peer_offer("modem", addr, false),
+            from: addr,
+        });
+        assert!(actions.iter().any(|a| matches!(a, FsmAction::Emit(EmittedEvent::PeerDiscovered { endpoints, .. }) if endpoints[0].addr == addr)));
+    }
+    assert!(
+        !fsm.step(FsmEvent::TimerExpired(
+            TIMER_DISCOVERY,
+            TimerKind::Discovery
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn connection_points_prefer_tls_then_ipv6() {
+    use dlep_core::{DataItem, Signal, data_item::ConnectionPointFlags};
+    let signal = Signal::new(SignalType::PEER_OFFER)
+        .with_item(DataItem::Ipv4ConnectionPoint {
+            flags: ConnectionPointFlags { use_tls: false },
+            addr: "192.0.2.1".parse().unwrap(),
+            port: None,
+        })
+        .with_item(DataItem::Ipv4ConnectionPoint {
+            flags: ConnectionPointFlags { use_tls: true },
+            addr: "192.0.2.2".parse().unwrap(),
+            port: None,
+        })
+        .with_item(DataItem::Ipv6ConnectionPoint {
+            flags: ConnectionPointFlags { use_tls: true },
+            addr: "2001:db8::1".parse().unwrap(),
+            port: None,
+        });
+    let endpoints = dlep_fsm::discovery_common::offer_endpoints(&signal, peer_addr());
+    assert!(endpoints[0].use_tls && endpoints[0].addr.is_ipv6());
+    assert!(endpoints[1].use_tls && endpoints[1].addr.is_ipv4());
+    assert!(!endpoints[2].use_tls);
+}
+
+#[test]
+fn signals_with_unknown_or_duplicate_items_are_ignored() {
+    let mut fsm = RouterDiscoveryFsm::new();
+    fsm.step(FsmEvent::AppStartDiscovery);
+    let mut signal = build_peer_offer("modem", peer_addr(), false);
+    signal.data_items.push(signal.data_items[0].clone());
+    assert!(
+        fsm.step(FsmEvent::RecvSignal {
+            signal,
+            from: peer_addr()
+        })
+        .is_empty()
     );
 }

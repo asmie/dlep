@@ -296,7 +296,7 @@ where
             .await
             .expect("timed out waiting for destination event")
             .expect("event channel closed");
-        if let DaemonEvent::Destination(d) = evt {
+        if let DaemonEvent::Destination { event: d, .. } = evt {
             if pred(&d) {
                 return d;
             }
@@ -378,7 +378,7 @@ async fn destination_round_trip_over_loopback() {
     )
     .await;
     if let DestinationEvent::Down { reason, .. } = down {
-        assert_eq!(reason, StatusCode::SHUTTING_DOWN);
+        assert_eq!(reason, StatusCode::SUCCESS);
     } else {
         unreachable!()
     }
@@ -397,7 +397,7 @@ async fn await_session_metrics(rx: &mut Receiver<DaemonEvent>) -> LinkMetrics {
             .await
             .expect("timed out waiting for Metrics")
             .expect("event channel closed");
-        if let DaemonEvent::Metrics(m) = evt {
+        if let DaemonEvent::Metrics { event: m, .. } = evt {
             return m.session_wide;
         }
     }
@@ -438,6 +438,7 @@ async fn session_update_round_trip_surfaces_session_wide_metrics() {
     await_session_up(&mut router_events).await;
     await_session_up(&mut modem_events).await;
 
+    let _initial_defaults = await_session_metrics(&mut router_events).await;
     let mut m = sample_metrics();
     m.current_data_rate_tx_bps = 42_000_000;
     modem

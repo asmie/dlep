@@ -17,6 +17,7 @@ pub mod session_modem;
 pub mod session_router;
 pub mod timers;
 pub mod transaction;
+pub mod validation;
 
 pub use events::{DestinationAddrs, FsmAction, FsmEvent, LinkMetrics, SendTarget};
 pub use session_common::SessionConfig;

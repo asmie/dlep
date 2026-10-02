@@ -37,6 +37,9 @@ impl ModemDiscoveryFsm {
             FsmEvent::RecvSignal { signal, from }
                 if signal.signal_type == SignalType::PEER_DISCOVERY =>
             {
+                if !crate::discovery_common::valid_signal(&signal) {
+                    return Vec::new();
+                }
                 self.state = ModemDiscoveryState::OfferBurst;
                 vec![FsmAction::SendSignal {
                     signal: build_peer_offer(

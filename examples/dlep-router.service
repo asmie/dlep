@@ -9,9 +9,9 @@ ExecStart=/usr/local/bin/dlep-router --config /etc/dlep/router.toml
 Restart=on-failure
 RestartSec=2
 
-# Port 854 is privileged; grant only the bind capability.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Port 854 needs bind privileges; strict TCP GTSM needs packet monitoring.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 # Hardening
 # Static service user so PKI keys can be owned root:dlep mode 0640.

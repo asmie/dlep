@@ -202,32 +202,19 @@ fn router_session_init_pending_to_in_session_on_success_response() {
 
 #[test]
 fn router_session_init_pending_to_terminated_on_terminate_status() {
-    let mut fsm = router_at(RouterSessionState::SessionInitPending);
-    let actions = fsm.step(FsmEvent::RecvMessage(make_init_response(
-        StatusCode::REQUEST_DENIED, // 2 — continue category... we want a terminate
-    )));
-    // REQUEST_DENIED is a Continue code; FSM stays InSession. Re-test with a Terminate code.
-    assert_eq!(fsm.state(), RouterSessionState::InSession);
-    assert!(matches!(
-        actions.last().unwrap(),
-        FsmAction::Emit(EmittedEvent::SessionUp { .. })
-    ));
-
-    let mut fsm = router_at(RouterSessionState::SessionInitPending);
-    let actions = fsm.step(FsmEvent::RecvMessage(make_init_response(
-        StatusCode::INVALID_DATA, // 130 — terminate category
-    )));
-    assert_eq!(fsm.state(), RouterSessionState::Terminated);
-    assert!(matches!(
-        actions[0],
-        FsmAction::CancelTimer(TIMER_SESSION_INIT)
-    ));
-    assert!(matches!(actions[1], FsmAction::CloseTcp));
-    match &actions[2] {
-        FsmAction::Emit(EmittedEvent::SessionDown(s)) => {
-            assert_eq!(*s, StatusCode::INVALID_DATA);
-        }
-        other => panic!("expected SessionDown(InvalidData), got {other:?}"),
+    for status in [StatusCode::REQUEST_DENIED, StatusCode::INVALID_DATA] {
+        let mut fsm = router_at(RouterSessionState::SessionInitPending);
+        let actions = fsm.step(FsmEvent::RecvMessage(make_init_response(status)));
+        assert_eq!(fsm.state(), RouterSessionState::Terminating);
+        let msg = find_sent(&actions, MessageType::SESSION_TERMINATION);
+        assert!(has_status(
+            msg,
+            if status == StatusCode::REQUEST_DENIED {
+                StatusCode::UNEXPECTED_MESSAGE
+            } else {
+                status
+            }
+        ));
     }
 }
 
@@ -286,23 +273,11 @@ fn router_session_init_pending_to_terminated_on_app_shutdown() {
 fn router_session_init_pending_to_terminated_on_unexpected_message() {
     let mut fsm = router_at(RouterSessionState::SessionInitPending);
     let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
-    assert_eq!(fsm.state(), RouterSessionState::Terminated);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_SESSION_INIT)))
-    );
-    assert!(actions.iter().any(|a| matches!(a, FsmAction::CloseTcp)));
-    assert!(actions.iter().any(|a| matches!(
-        a,
-        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
-    )));
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::SendMessage(_))),
-        "router MUST NOT send any Message before completing init"
-    );
+    assert_eq!(fsm.state(), RouterSessionState::Terminating);
+    assert!(has_status(
+        find_sent(&actions, MessageType::SESSION_TERMINATION),
+        StatusCode::UNEXPECTED_MESSAGE
+    ));
 }
 
 #[test]
@@ -604,7 +579,7 @@ fn modem_awaiting_session_init_to_terminated_on_unexpected_message() {
     assert!(actions.iter().any(|a| matches!(a, FsmAction::CloseTcp)));
     assert!(actions.iter().any(|a| matches!(
         a,
-        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
+        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::UNEXPECTED_MESSAGE))
     )));
     // Critical: per RFC, the modem MUST NOT send any Message in this case.
     assert!(
@@ -790,33 +765,29 @@ fn modem_in_session_to_terminating_on_missed_deadline() {
 }
 
 #[test]
-fn router_in_session_missing_peer_interval_skips_reset() {
-    // Build the FSM directly into InSession with peer_heartbeat_interval = None
-    // (= the field was missing). RecvMessage(Heartbeat) must not emit
-    // ResetHeartbeat because there is no peer interval to double.
-    let mut fsm = RouterSessionFsm::new();
-    fsm.state = RouterSessionState::InSession;
-    fsm.peer_heartbeat_interval = None;
-    let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. })),
-        "expected no ResetHeartbeat when peer_heartbeat_interval is None"
-    );
+fn router_rejects_initialization_without_heartbeat() {
+    let mut fsm = router_at(RouterSessionState::SessionInitPending);
+    let mut msg = make_init_response(StatusCode::SUCCESS);
+    msg.data_items
+        .retain(|i| !matches!(i, DataItem::HeartbeatInterval(_)));
+    let actions = fsm.step(FsmEvent::RecvMessage(msg));
+    assert_eq!(fsm.state(), RouterSessionState::Terminating);
+    assert!(has_status(
+        find_sent(&actions, MessageType::SESSION_TERMINATION),
+        StatusCode::INVALID_DATA
+    ));
 }
 
 #[test]
-fn modem_in_session_missing_peer_interval_skips_reset() {
-    let mut fsm = ModemSessionFsm::new();
-    fsm.state = ModemSessionState::InSession;
-    fsm.peer_heartbeat_interval = None;
-    let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. }))
-    );
+fn modem_rejects_initialization_without_heartbeat() {
+    let mut fsm = modem_at(ModemSessionState::AwaitingSessionInit);
+    let mut msg = make_session_init();
+    msg.data_items
+        .retain(|i| !matches!(i, DataItem::HeartbeatInterval(_)));
+    let actions = fsm.step(FsmEvent::RecvMessage(msg));
+    assert_eq!(fsm.state(), ModemSessionState::Terminated);
+    assert!(actions.iter().any(|a| matches!(a, FsmAction::CloseTcp)));
+    assert_eq!(action_count_send_message(&actions), 0);
 }
 
 #[test]
@@ -968,7 +939,7 @@ fn modem_in_session_destination_up_response_success_marks_announced() {
 }
 
 #[test]
-fn modem_in_session_destination_up_response_failure_drops_local() {
+fn modem_in_session_destination_up_response_failure_stops_updates() {
     let mut fsm = modem_at(ModemSessionState::InSession);
     let _ = fsm.step(FsmEvent::AppAddDestination {
         mac: dest_mac(),
@@ -982,8 +953,8 @@ fn modem_in_session_destination_up_response_failure_drops_local() {
     assert_eq!(fsm.state(), ModemSessionState::InSession);
     assert!(!fsm.tx.destination_busy(&dest_mac()));
     assert!(
-        !fsm.destinations.contains_key(&dest_mac()),
-        "non-Success response should drop the local destination"
+        !fsm.destinations[&dest_mac()].announced,
+        "non-Success response should stop announcements but retain modem knowledge"
     );
 }
 
@@ -998,6 +969,9 @@ fn modem_in_session_app_update_metrics_sends_update() {
 
     let mut new_metrics = sample_metrics_dest();
     new_metrics.current_data_rate_rx_bps = 1_234_567;
+    fsm.step(FsmEvent::RecvMessage(make_destination_up_response(
+        StatusCode::SUCCESS,
+    )));
     let actions = fsm.step(FsmEvent::AppUpdateMetrics {
         mac: dest_mac(),
         metrics: new_metrics,
@@ -1031,6 +1005,13 @@ fn modem_in_session_app_update_metrics_ignored_for_unknown_destination() {
 #[test]
 fn router_in_session_destination_update_emits() {
     let mut fsm = router_at(RouterSessionState::InSession);
+    fsm.step(FsmEvent::RecvMessage(
+        dlep_fsm::session_common::build_destination_up(
+            dest_mac(),
+            &sample_metrics_dest(),
+            &DestinationAddrs::default(),
+        ),
+    ));
     let metrics = sample_metrics_dest();
     let update_msg = dlep_fsm::session_common::build_destination_update(dest_mac(), &metrics);
     let actions = fsm.step(FsmEvent::RecvMessage(update_msg));
@@ -1060,13 +1041,9 @@ fn make_destination_down_response(status: StatusCode) -> dlep_core::Message {
         })
 }
 
-fn make_destination_down(reason: StatusCode) -> dlep_core::Message {
+fn make_destination_down(_reason: StatusCode) -> dlep_core::Message {
     dlep_core::Message::new(MessageType::DESTINATION_DOWN)
         .with_item(DataItem::MacAddress(dest_mac()))
-        .with_item(DataItem::Status {
-            code: reason,
-            text: String::new(),
-        })
 }
 
 #[test]
@@ -1074,7 +1051,12 @@ fn modem_in_session_app_drop_destination_sends_down() {
     let mut fsm = modem_at(ModemSessionState::InSession);
     fsm.destinations.insert(
         dest_mac(),
-        dlep_fsm::session_modem::DestinationState { announced: true },
+        dlep_fsm::session_modem::DestinationState {
+            announced: true,
+            pending_metrics: false,
+            metrics: sample_metrics_dest(),
+            addrs: DestinationAddrs::default(),
+        },
     );
     let actions = fsm.step(FsmEvent::AppDropDestination {
         mac: dest_mac(),
@@ -1099,7 +1081,12 @@ fn modem_in_session_destination_down_response_removes_local() {
     let mut fsm = modem_at(ModemSessionState::InSession);
     fsm.destinations.insert(
         dest_mac(),
-        dlep_fsm::session_modem::DestinationState { announced: true },
+        dlep_fsm::session_modem::DestinationState {
+            announced: true,
+            pending_metrics: false,
+            metrics: sample_metrics_dest(),
+            addrs: DestinationAddrs::default(),
+        },
     );
     let _ = fsm.step(FsmEvent::AppDropDestination {
         mac: dest_mac(),
@@ -1118,7 +1105,10 @@ fn router_in_session_destination_down_responds_and_emits() {
     let mut fsm = router_at(RouterSessionState::InSession);
     fsm.destinations.insert(
         dest_mac(),
-        dlep_fsm::session_router::DestinationState { up: true },
+        dlep_fsm::session_router::DestinationState {
+            up: true,
+            metrics: sample_metrics_dest(),
+        },
     );
     let actions = fsm.step(FsmEvent::RecvMessage(make_destination_down(
         StatusCode::SHUTTING_DOWN,
@@ -1135,7 +1125,7 @@ fn router_in_session_destination_down_responds_and_emits() {
     assert!(actions.iter().any(|a| matches!(
         a,
         FsmAction::Emit(EmittedEvent::DestinationDown { mac, reason })
-            if *mac == dest_mac() && *reason == StatusCode::SHUTTING_DOWN
+            if *mac == dest_mac() && *reason == StatusCode::SUCCESS
     )));
     assert!(!fsm.destinations.contains_key(&dest_mac()));
 }
@@ -1196,12 +1186,16 @@ fn router_in_session_session_update_must_send_response() {
 #[test]
 fn modem_in_session_session_update_must_send_response() {
     let mut fsm = modem_at(ModemSessionState::InSession);
-    let actions = fsm.step(FsmEvent::RecvMessage(make_session_update(
-        &sample_metrics_dest(),
-    )));
-    assert_eq!(fsm.state(), ModemSessionState::InSession);
-    let resp = find_sent(&actions, MessageType::SESSION_UPDATE_RESPONSE);
-    assert!(has_status(resp, StatusCode::SUCCESS));
+    let msg =
+        dlep_core::Message::new(MessageType::SESSION_UPDATE).with_item(DataItem::Ipv4Address {
+            add: true,
+            addr: "192.0.2.1".parse().unwrap(),
+        });
+    let actions = fsm.step(FsmEvent::RecvMessage(msg));
+    assert!(has_status(
+        find_sent(&actions, MessageType::SESSION_UPDATE_RESPONSE),
+        StatusCode::SUCCESS
+    ));
 }
 
 #[test]
@@ -1247,12 +1241,13 @@ fn modem_in_session_app_session_update_sends_session_update() {
 }
 
 #[test]
-fn router_in_session_app_session_update_sends_session_update() {
+fn router_cannot_originate_session_metrics() {
     let mut fsm = router_at(RouterSessionState::InSession);
     let actions = fsm.step(FsmEvent::AppSessionUpdate {
         metrics: sample_metrics_dest(),
     });
-    find_sent(&actions, MessageType::SESSION_UPDATE);
+    assert_eq!(action_count_send_message(&actions), 0);
+    assert!(!fsm.tx.session_busy());
 }
 
 #[test]
@@ -1265,9 +1260,9 @@ fn modem_in_session_session_update_opens_then_closes_session_transaction() {
         fsm.tx.session_busy(),
         "outbound Session Update must occupy the session-level transaction slot"
     );
-    let _ = fsm.step(FsmEvent::RecvMessage(make_simple(
-        MessageType::SESSION_UPDATE_RESPONSE,
-    )));
+    let _ = fsm.step(FsmEvent::RecvMessage(
+        dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+    ));
     assert!(
         !fsm.tx.session_busy(),
         "Session Update Response must free the slot"
@@ -1323,7 +1318,7 @@ fn modem_in_session_destination_announce_must_send_response() {
         dlep_fsm::session_common::extract_destination_mac(resp),
         Some(dest_mac())
     );
-    assert!(has_status(resp, StatusCode::SUCCESS));
+    assert!(has_status(resp, StatusCode::REQUEST_DENIED));
 }
 
 #[test]
@@ -1355,15 +1350,14 @@ fn router_in_session_announce_opens_then_closes_destination_transaction() {
 }
 
 #[test]
-fn modem_in_session_destination_announce_without_mac_is_dropped_leniently() {
+fn modem_rejects_destination_announce_without_mac() {
     let mut fsm = modem_at(ModemSessionState::InSession);
     let actions = fsm.step(FsmEvent::RecvMessage(make_simple(
         MessageType::DESTINATION_ANNOUNCE,
     )));
-    assert_eq!(fsm.state(), ModemSessionState::InSession);
-    assert_eq!(
-        action_count_send_message(&actions),
-        0,
-        "no MAC to answer for; stay lenient like Destination_Update"
-    );
+    assert_eq!(fsm.state(), ModemSessionState::Terminating);
+    assert!(has_status(
+        find_sent(&actions, MessageType::SESSION_TERMINATION),
+        StatusCode::INVALID_DATA
+    ));
 }

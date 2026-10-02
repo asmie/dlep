@@ -12,7 +12,7 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 
 [RFC 8175]: https://www.rfc-editor.org/rfc/rfc8175
 
-> **Status: ten milestones complete.** Wire codec, both state machines,
+> **Status: core implementation with remaining conformance gaps.** Wire codec, both state machines,
 > TCP + TLS (mutual TLS supported) transport, UDP multicast discovery with
 > GTSM, destinations & metrics, `Session Update` and `Destination Announce`,
 > the extension plug-in API, and deployable CLI binaries with
@@ -127,7 +127,7 @@ let mut events = daemon.subscribe();          // broadcast::Receiver<DaemonEvent
 daemon.start_discovery().await?;
 
 while let Ok(event) = events.recv().await {
-    // react to PeerDiscovered, SessionUp, Destination(...), Metrics(...) …
+    // react to PeerDiscovered, SessionUp, Destination { .. }, Metrics { .. } …
 }
 
 daemon.shutdown().await?;
@@ -137,11 +137,48 @@ The modem-side API is symmetric, with
 `add_destination` / `update_destination` / `drop_destination` in place of
 `start_discovery` / `connect_static`.
 
-Both handles also expose `update_session_metrics` (session-wide metric
-changes via `Session Update`, RFC 8175 §12.7 — either participant may send
-one). `announce_destination` is **router-side only**: RFC 8175 §12.13 makes
-`Destination Announce` a router-originated message, which the modem answers
-and surfaces to its application as `DestinationEvent::Announced`.
+`ModemDaemon::update_session_metrics` sends session-wide metric changes via
+`Session Update` (RFC 8175 §12.7). The router compatibility method returns an
+error: routers may report Layer 3 changes but cannot originate metric items.
+`announce_destination` is router-side only. The modem denies destinations it
+does not know; successful responses create destinations at the router.
+
+Discovery events carry a `PeerOffer` containing ordered connection points.
+Use `RouterDaemon::connect_discovered(&offer)` to try compatible endpoints;
+TLS-required configurations never fall back to plaintext. Discovery continues
+while sessions are active, allowing additional modems to be found.
+
+`SessionUp`, `SessionDown`, `Destination`, and `Metrics` events carry a
+`session_id`; destination and metric events also carry `peer` and `event`
+fields. Consumers of the earlier tuple variants must update their matches:
+`DaemonEvent::Destination { session_id, peer, event }`. Metric event values are
+effective merged values, including defaults received during initialization.
+
+On Linux, TCP sends use TTL/hop limit 255, including the connection handshake.
+With `gtsm_enforce = true`, the kernel filters lower-TTL traffic and a packet
+monitor immediately resets the affected connection. This requires `CAP_NET_RAW`;
+missing privileges fail explicitly. The supplied systemd units grant it.
+Setting `gtsm_enforce = false` disables TCP receive enforcement for development;
+outbound TTL remains 255 and discovery still checks inbound TTL.
+
+The network tests exercise strict enforcement. On Linux, run them in an isolated
+network namespace (requires unprivileged user namespaces and `iproute2`):
+
+```sh
+unshare --user --map-root-user --net sh -c '
+  set -e
+  ip link set lo up
+  ip link add dlep-test type dummy
+  ip addr add 192.0.2.1/24 dev dlep-test
+  ip link set dlep-test up multicast on
+  ip route add default dev dlep-test
+  cargo test --workspace --locked
+'
+```
+
+This grants capabilities only inside the temporary namespace, without changing
+binary capabilities or the host network. See the CI workflow for the privileged
+namespace alternative on systems that restrict user namespaces.
 
 ## Documentation
 

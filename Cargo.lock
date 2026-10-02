@@ -257,6 +257,7 @@ dependencies = [
 name = "dlep-fsm"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dlep-core",
  "ipnet",
  "thiserror",

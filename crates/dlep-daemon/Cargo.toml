@@ -24,5 +24,6 @@ ipnet.workspace = true
 rustls.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 dlep-net = { workspace = true, features = ["test-helpers"] }
 tempfile.workspace = true
