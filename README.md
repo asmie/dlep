@@ -56,24 +56,28 @@ responsibilities and the design rationale.
 
 ## Build
 
-Requires Rust **1.85** or newer (edition 2024).
+Requires Rust **1.85** or newer (edition 2024). The daemons and transport
+currently require Linux; the core, FSM, and extension API are portable.
 
 ```bash
-cargo build --workspace
-cargo test  --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-CI (`.github/workflows/ci.yml`) runs `fmt`, `clippy -D warnings`, and `build` +
-`test` across the workspace.
+Run network tests using the [isolated namespace command below](#network-tests).
+CI also checks Rust 1.85, the portable crates on macOS, coverage, workflow syntax,
+and dependency advisories. See [CI documentation](.github/README.md) for job scope,
+local commands, coverage artifacts, and the guarded audit exception.
 
 ## Run
 
+Provision certificates and install the binaries with the capabilities described
+in the [deployment guide](doc/deployment.md) before using the example configs.
 Both binaries take a TOML configuration file:
 
 ```bash
-cargo run -p dlep-router -- --config examples/router.toml
-cargo run -p dlep-modem  -- --config examples/modem.toml
+dlep-router --config /etc/dlep/router.toml
+dlep-modem  --config /etc/dlep/modem.toml
 ```
 
 CLI flags shared by both binaries:
@@ -82,10 +86,15 @@ CLI flags shared by both binaries:
 |----------------|----------------------------------------------------------|
 | `--config`     | Path to the TOML config file.                            |
 | `--interface`  | Select the discovery interface (overrides config).        |
-| `--log-level`  | Override `RUST_LOG`-style level (`info`, `debug`, …).    |
+| `--log-level`  | Override the `DLEP_LOG` filter (`info`, `debug`, …).       |
 | `--no-tls`     | Force plain TCP regardless of config.                    |
 
-A minimal configuration:
+Logging precedence is `--log-level`, then `DLEP_LOG`, then `info`; `RUST_LOG`
+is not read. TLS paths, `--check-config`, and router-only `--peer` flags are
+listed in the [deployment guide](doc/deployment.md#3-configuration).
+
+A minimal plaintext development configuration for either role (select an
+interface present on your host):
 
 ```toml
 [network]
@@ -93,7 +102,6 @@ interface           = "eth0"
 discovery_v4_group  = "224.0.0.117"
 discovery_v6_group  = "ff02::1:7"
 discovery_port      = 854
-tcp_port            = 854
 use_tls             = false
 gtsm_enforce        = true
 
@@ -109,15 +117,16 @@ Unknown keys and sections are rejected, including at the top level. Run
 least 1000 ms; initialization and termination timeouts must be positive.
 Daemon builders enforce the same timer limits for programmatic configuration.
 
-> Port **854** is below 1024 and requires `CAP_NET_BIND_SERVICE` on Linux
-> (`setcap cap_net_bind_service=+ep` on the binary, or
-> `AmbientCapabilities=CAP_NET_BIND_SERVICE` in a systemd unit).
+> The modem binds UDP and TCP port **854** and normally needs
+> `CAP_NET_BIND_SERVICE`. The router uses ephemeral source ports and does not
+> need that capability. Both roles need `CAP_NET_RAW` for strict TCP GTSM; the
+> supplied systemd units grant the capabilities for each role.
 
 ## Library use
 
 ```rust
 use std::sync::Arc;
-use dlep_daemon::{RouterDaemon, RouterConfig};
+use dlep_daemon::{DaemonEvent, RouterDaemon, RouterConfig};
 use dlep_ext::DlepExtension;
 
 let daemon = RouterDaemon::builder()
@@ -131,11 +140,23 @@ let mut events = daemon.subscribe();          // broadcast::Receiver<DaemonEvent
 daemon.start_discovery().await?;
 
 while let Ok(event) = events.recv().await {
-    // react to PeerDiscovered, SessionUp, Destination { .. }, Metrics { .. } …
+    match event {
+        DaemonEvent::PeerDiscovered(offer) => {
+            daemon.connect_discovered(&offer).await?;
+        }
+        _ => { /* react to SessionUp, Destination { .. }, Metrics { .. }, etc. */ }
+    }
 }
 
 daemon.shutdown().await?;
 ```
+
+This setup sketch omits application shutdown and event-loss recovery. Discovery
+only reports offers; the application chooses when to connect. The router binary
+adds concurrent scheduling and reconnection using the retained connection-state
+feed described below. Library applications must supply their own policy and
+handle `broadcast::error::RecvError::Lagged` if they need to continue after event
+loss.
 
 The modem-side API is symmetric, with
 `add_destination` / `update_destination` / `drop_destination` in place of
@@ -294,26 +315,23 @@ Setting `gtsm_enforce = false` disables TCP receive enforcement for development;
 outbound TTL remains 255 and discovery still checks inbound TTL before decoding.
 Malformed discovery packets are discarded without a per-packet retry delay.
 
-The network tests exercise strict enforcement. On Linux, run them in an isolated
-network namespace (requires unprivileged user namespaces and `iproute2`):
+## Network tests
+
+The network tests exercise strict enforcement. On Linux, build first, then run
+in an isolated network namespace (requires unprivileged user namespaces and
+`iproute2`):
 
 ```sh
-unshare --user --map-root-user --net sh -c '
-  set -e
-  ip link set lo up
-  ip link add dlep-test type dummy
-  ip addr add 192.0.2.1/24 dev dlep-test
-  ip link set dlep-test up multicast on
-  ip -6 addr add fe80::1/64 dev dlep-test nodad
-  ip -6 addr add fd00::1/64 dev dlep-test nodad
-  ip route add default dev dlep-test
-  cargo test --workspace --locked
-'
+cargo build --workspace --all-targets --locked
+unshare --user --map-root-user bash .github/scripts/test-network.sh \
+  cargo test --workspace --locked --offline
 ```
 
 This grants capabilities only inside the temporary namespace, without changing
 binary capabilities or the host network. See the CI workflow for the privileged
 namespace alternative on systems that restrict user namespaces.
+
+## Shutdown
 
 The standalone daemons handle SIGTERM (`systemctl stop`) and SIGINT (Ctrl-C)
 with a graceful DLEP Session Termination exchange. Pending connection attempts

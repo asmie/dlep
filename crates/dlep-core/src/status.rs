@@ -1,4 +1,4 @@
-//! DLEP Status Codes (RFC 8175 §13.1.1).
+//! DLEP Status Codes (RFC 8175 §13.1).
 //!
 //! Codes < 128 mean "continue the session"; codes >= 128 mean "terminate".
 

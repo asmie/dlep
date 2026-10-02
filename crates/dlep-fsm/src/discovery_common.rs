@@ -1,10 +1,10 @@
 //! Builders and extractors shared by both discovery FSMs (router + modem).
 //!
-//! Peer_Discovery (RFC 8175 §11.1): signal sent by routers searching for
+//! Peer_Discovery (RFC 8175 §12.3): signal sent by routers searching for
 //! a modem. Payload is the router's Peer Type and (optionally) Extensions
 //! Supported.
 //!
-//! Peer_Offer (RFC 8175 §11.2): signal sent by a modem in response to a
+//! Peer_Offer (RFC 8175 §12.4): signal sent by a modem in response to a
 //! Peer_Discovery. Carries Peer Type + at least one Connection Point
 //! identifying the TCP endpoint the router should dial.
 

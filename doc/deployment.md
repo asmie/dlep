@@ -6,12 +6,12 @@ and unit files live in [`examples/`](../examples/).
 
 ## 1. Build and install
 
-Requires Rust 1.85+ (edition 2024).
+Requires Linux and Rust 1.85+ (edition 2024). macOS CI covers the portable
+protocol crates, not the daemon transport. See [CI documentation](../.github/README.md).
 
 ```bash
-cargo install --path crates/dlep-router
-cargo install --path crates/dlep-modem
-# or: cargo build --release && cp target/release/dlep-{router,modem} /usr/local/bin/
+cargo build --release --workspace --locked
+sudo install -m 0755 target/release/dlep-router target/release/dlep-modem /usr/local/bin/
 ```
 
 ## 2. Certificates
@@ -51,10 +51,14 @@ Install to `/etc/dlep/pki/`. The shipped systemd units run as a static
 else:
 
 ```bash
-useradd --system --no-create-home --shell /usr/sbin/nologin dlep
-install -d -m 0755 /etc/dlep /etc/dlep/pki
-install -m 0644 ca.pem modem.pem /etc/dlep/pki/        # certs are public
-install -m 0640 -g dlep modem.key /etc/dlep/pki/       # keys: root:dlep 0640
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin dlep
+sudo install -d -m 0755 /etc/dlep /etc/dlep/pki
+# On the modem host:
+sudo install -m 0644 ca.pem modem.pem /etc/dlep/pki/
+sudo install -m 0640 -g dlep modem.key /etc/dlep/pki/
+# On the router host (create the same service user and directories there):
+sudo install -m 0644 ca.pem router.pem /etc/dlep/pki/
+sudo install -m 0640 -g dlep router.key /etc/dlep/pki/
 ```
 
 The router needs: `ca.pem` (to verify the modem), `router.pem` + `router.key`
@@ -68,7 +72,8 @@ Both binaries read a TOML file via `--config/-c` (env:
 `DLEP_ROUTER_CONFIG` / `DLEP_MODEM_CONFIG`). Start from
 [`examples/router.toml`](../examples/router.toml) and
 [`examples/modem.toml`](../examples/modem.toml). All sections and fields
-are optional; defaults follow the RFC (port 854, TLS on, discovery on).
+are optional; defaults select port 854, TLS on, and router discovery. TLS
+identities and trust roots must still be supplied before startup.
 Unknown keys and sections are rejected at parse time, including top-level
 typos and settings for the wrong role (such as `[metrics]` on the router).
 Finish each edit with `--check-config` to validate timer values, interfaces,
@@ -82,17 +87,17 @@ metrics, and TLS material as well.
 | `[network]` | `interface` | none | Discovery interface name: membership, sending, and receive filtering |
 | `[network]` | `discovery_v4_group` | `224.0.0.117` | IPv4 discovery multicast group |
 | `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (used with an IPv6 `bind_addr`) |
-| `[network]` | `discovery_port` | `854` | UDP discovery port |
-| `[network]` | `tcp_port` | `854` | TCP/TLS session port |
-| `[network]` | `bind_addr` | `0.0.0.0` | discovery address/family and modem listener bind address |
+| `[network]` | `discovery_port` | `854` | modem UDP listen port / router multicast destination port; router source port is ephemeral |
+| `[network]` | `tcp_port` | `854` | modem TCP/TLS listen port; ignored by router (which uses offered/static endpoints) |
+| `[network]` | `bind_addr` | `0.0.0.0` | discovery source preference/family and modem TCP listener address; does not bind router TCP sources |
 | `[network]` | `use_tls` | `true` | TLS for the session transport |
 | `[network]` | `gtsm_enforce` | `true` | Linux TCP minimum-TTL filter and strict reset monitor (`CAP_NET_RAW`); discovery always checks TTL |
 | `[tls]` | `cert` / `key` | none | identity (modem: required; router: mTLS) |
 | `[tls]` | `ca_bundle` | none | trust roots (router: required; modem: for mTLS) |
-| `[tls]` | `require_client_cert` | `false` | modem requires router client certs |
+| `[tls]` | `require_client_cert` | `false` | modem requires router client certs; not used by router |
 | `[timers]` | `heartbeat_interval_ms` | `60000` | heartbeat interval, minimum 1000 ms |
 | `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval, minimum 1000 ms |
-| `[timers]` | `session_init_timeout_ms` | `5000` | positive deadline for Session Initialization Response |
+| `[timers]` | `session_init_timeout_ms` | `5000` | positive deadline for initialization: router awaits response, modem awaits request |
 | `[timers]` | `termination_timeout_ms` | omitted: `4 × heartbeat_interval_ms` | positive explicit override for Session Termination Response; default resolves to `240000` ms |
 | `[metrics]` (modem) | `max_data_rate_rx_bps` / `max_data_rate_tx_bps` | `0` | maximum receive/transmit rates, bits/second |
 | `[metrics]` (modem) | `current_data_rate_rx_bps` / `current_data_rate_tx_bps` | `0` | current receive/transmit rates, bits/second |
@@ -161,26 +166,35 @@ dlep-modem  --config /etc/dlep/modem.toml  --check-config
 
 `configuration OK` on stdout and exit code 0 mean the TOML parses, static
 mode has peers, any explicit discovery interface is usable on this host, modem
-metric values and timers pass validation, and all TLS material loads.
+metric values and timers pass validation, and all TLS material loads. This does
+not open sockets or check GTSM capabilities, firewall rules, or peer reachability.
 
 Timer limits are checked by `--check-config` and by both daemon builders before
 opening sockets. Heartbeat and discovery intervals below 1000 ms are rejected
 (RFC 8175 §7.3.1 and §7.1); initialization and termination timeouts must be at
 least 1 ms. Errors name the field, minimum, and supplied value. Zero does not
-disable a timer. Existing defaults remain unchanged.
+disable a timer.
 
-## 4. Port 854 privileges
+## 4. Socket privileges
 
-The DLEP well-known port (854, UDP and TCP) is below 1024 and requires
-`CAP_NET_BIND_SERVICE` on Linux. Pick one:
+The modem listens on the DLEP well-known port (854, UDP and TCP), which normally
+requires `CAP_NET_BIND_SERVICE` on Linux. The router uses ephemeral UDP and TCP
+source ports and needs no bind capability. Strict TCP GTSM requires
+`CAP_NET_RAW` on both roles, independently of port numbers.
 
-1. **systemd (recommended)** — the shipped units grant
-   `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW` to the unprivileged `dlep`
-   service user.
-2. **setcap** — `sudo setcap cap_net_bind_service=+ep /usr/local/bin/dlep-modem`
-   (repeat after each binary update).
-3. **Unprivileged ports** — set `discovery_port`/`tcp_port` ≥ 1024 on both
-   sides (non-standard; both peers must agree).
+Use the supplied systemd units to grant these capabilities to the `dlep` service
+user, or apply file capabilities for manual runs:
+
+```sh
+sudo setcap cap_net_bind_service,cap_net_raw=ep /usr/local/bin/dlep-modem
+sudo setcap cap_net_raw=ep /usr/local/bin/dlep-router
+```
+
+To avoid privileged binds, choose modem `discovery_port` and `tcp_port` values
+of at least 1024. Set the router's `discovery_port` to the same UDP port; TCP
+uses the modem's advertised port, or the explicit port in `static_peers`.
+Setting the router's `tcp_port` has no effect. Nonstandard ports do not remove
+the strict GTSM monitoring capability requirement.
 
 Do **not** run the daemons as root.
 
@@ -188,7 +202,7 @@ Do **not** run the daemons as root.
 
 | Direction | Proto | Port | Purpose |
 |---|---|---|---|
-| router → 224.0.0.117 | UDP | 854 | Peer Discovery multicast |
+| router → 224.0.0.117 or ff02::1:7 | UDP | 854 | Peer Discovery multicast on the selected family/interface |
 | modem → router | UDP | ephemeral | unicast Peer Offer reply |
 | router → modem | TCP | 854 | DLEP session (TLS) |
 
@@ -200,13 +214,7 @@ Socket errors use a receive retry delay while timers and shutdown remain active.
 
 Strict TCP GTSM also requires `CAP_NET_RAW` on Linux to monitor rejected packets
 and reset the affected connection immediately (RFC 8175 §14). The sample
-systemd units grant this capability. For manual runs, grant the capability to
-the installed executable, for example:
-
-```sh
-sudo setcap cap_net_bind_service,cap_net_raw=ep /usr/local/bin/dlep-modem
-sudo setcap cap_net_raw=ep /usr/local/bin/dlep-router
-```
+systemd units grant this capability; manual installation commands are in §4.
 
 Reinstalling a binary may remove its file capabilities. Missing monitoring
 privileges cause an explicit error; `gtsm_enforce = false` is an opt-out for
@@ -215,7 +223,10 @@ nonconforming development peers, not a production default.
 ## 6. systemd
 
 ```bash
-sudo cp examples/dlep-modem.service /etc/systemd/system/
+sudo install -m 0644 examples/modem.toml /etc/dlep/modem.toml
+# Edit the configuration and provision PKI, then validate as the service user:
+sudo -u dlep /usr/local/bin/dlep-modem --config /etc/dlep/modem.toml --check-config
+sudo install -m 0644 examples/dlep-modem.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dlep-modem
 journalctl -u dlep-modem -f
@@ -223,7 +234,15 @@ journalctl -u dlep-modem -f
 
 Same for `dlep-router.service`. Log verbosity: `--log-level
 trace|debug|info|warn|error` or the `DLEP_LOG` env var (add
-`Environment=DLEP_LOG=debug` to the unit).
+`Environment=DLEP_LOG=debug` to the unit). `--log-level` takes precedence over
+`DLEP_LOG`; the default is `info`. `RUST_LOG` is not read.
+
+The units restrict filesystem writes, device access, kernel/control-group
+changes, real-time scheduling, and set-ID file creation. Socket families include
+`AF_PACKET` for strict GTSM monitoring and `AF_NETLINK` for interface enumeration.
+The router grants only `CAP_NET_RAW`; the modem also grants
+`CAP_NET_BIND_SERVICE`. A future modem backend needing device access will need
+a corresponding unit override.
 
 Both binaries handle SIGTERM (`systemctl stop`) and SIGINT (Ctrl-C). They stop
 new work and send Session Termination with Shutting Down status to established
@@ -278,13 +297,13 @@ addresses remain eligible; the last connection closing restores replies.
 | `tls.key is required on the modem (server) side…` | Modem with a cert but no private key. Set `[tls] key`. |
 | `tls.require_client_cert = true requires tls.ca_bundle` | The modem can't verify client certs without roots. |
 | `tls.cert and tls.key must be set together; only … is set` | One half of the identity is missing (check both TOML and CLI overrides). |
-| `failed to read TLS material from <path>` | Path wrong, or the service user can't read it (keys should be `root:dlep` mode `0640`; is the path under the unit's `ReadOnlyPaths`?). |
+| `failed to read TLS material from <path>` | Path wrong, or the service user can't read it (keys should be `root:dlep` mode `0640`; is it accessible with the unit's `ProtectHome=yes`?). |
 | `<path> contains no PEM certificates` | File exists but isn't PEM (`openssl x509 -in <path> -noout` to check). |
 | `rustls rejected the TLS material from …` | Cert/key mismatch or corrupt PEM payload; the message names the field and file. |
 | `use_tls = true requires RouterBuilder::with_rustls_client(...)` / `…ModemBuilder::with_rustls_server(...)` | Library embedder didn't supply a rustls config — binaries never hit this. |
 | TLS handshake fails with certificate errors | Modem cert SAN doesn't contain the IP the router dialed, or peers disagree about the CA. |
 | `IPv6 discovery with bind_addr = :: requires an interface` | Set `[network].interface` or `--interface` to the link used for IPv6 discovery. |
-| Session drops and never re-establishes | The router retries after `SessionDown`; inspect connection/TLS errors and verify the offered addresses remain reachable. |
+| Session drops and never re-establishes | The router retries from retained connection state; inspect connection/TLS errors and verify the offered addresses remain reachable. |
 | `invalid discovery interface` / `has no usable IPv4/IPv6 address` | Check the interface name, link state, address assignment, and that a specific `bind_addr` belongs to it. |
 | Discovery finds nothing | Peers more than one hop apart (GTSM), multicast blocked, or wrong `interface`. Try static mode (`--peer`) to isolate. |
 | `permission denied` binding port 854 | See §4. |

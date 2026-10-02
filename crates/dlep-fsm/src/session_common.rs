@@ -226,7 +226,7 @@ pub fn extract_status(msg: &Message) -> Option<StatusCode> {
 }
 
 /// `Message::new(MessageType::HEARTBEAT)` with no Data Items. RFC 8175
-/// §11.2 allows the Heartbeat Message to carry no fields.
+/// §12.20 specifies no Data Items in the core Heartbeat Message.
 pub fn build_heartbeat() -> Message {
     Message::new(MessageType::HEARTBEAT)
 }
@@ -287,10 +287,9 @@ pub fn heartbeat_reset_action(
     })
 }
 
-/// Build a `Destination_Up` message (RFC 8175 §11.3). The MAC must be the
-/// first Data Item — the RFC does not strictly require ordering, but every
-/// real-world peer (LL-DLEP, vendor X) puts MAC first and reads no further
-/// to identify the destination.
+/// Build a `Destination_Up` message (RFC 8175 §12.11). This implementation
+/// emits the MAC first for a consistent wire order; the RFC does not require
+/// Data Items to appear in a particular order.
 pub fn build_destination_up(
     mac: MacAddress,
     metrics: &LinkMetrics,
@@ -324,7 +323,7 @@ pub fn build_destination_up(
     push_metric_items(msg, metrics)
 }
 
-/// Build a `Destination_Up_Response` (RFC 8175 §11.4). Carries the same
+/// Build a `Destination_Up_Response` (RFC 8175 §12.12). Carries the same
 /// MAC the request used plus a Status.
 pub fn build_destination_up_response(mac: MacAddress, status: StatusCode) -> Message {
     Message::new(MessageType::DESTINATION_UP_RESPONSE)
@@ -335,21 +334,21 @@ pub fn build_destination_up_response(mac: MacAddress, status: StatusCode) -> Mes
         })
 }
 
-/// Build a `Destination_Update` message (RFC 8175 §11.7). Modem → router,
+/// Build a `Destination_Update` message (RFC 8175 §12.17). Modem → router,
 /// no response expected.
 pub fn build_destination_update(mac: MacAddress, metrics: &LinkMetrics) -> Message {
     let msg = Message::new(MessageType::DESTINATION_UPDATE).with_item(DataItem::MacAddress(mac));
     push_metric_items(msg, metrics)
 }
 
-/// Build a `Destination_Down` message (RFC 8175 §11.5).
+/// Build a `Destination_Down` message (RFC 8175 §12.15).
 pub fn build_destination_down(mac: MacAddress, _reason: StatusCode) -> Message {
     // Status is not allowed in Destination Down (§12.15). The API reason
     // remains local; only session termination carries a teardown reason.
     Message::new(MessageType::DESTINATION_DOWN).with_item(DataItem::MacAddress(mac))
 }
 
-/// Build a `Destination_Down_Response` (RFC 8175 §11.6).
+/// Build a `Destination_Down_Response` (RFC 8175 §12.16).
 pub fn build_destination_down_response(mac: MacAddress, status: StatusCode) -> Message {
     Message::new(MessageType::DESTINATION_DOWN_RESPONSE)
         .with_item(DataItem::MacAddress(mac))

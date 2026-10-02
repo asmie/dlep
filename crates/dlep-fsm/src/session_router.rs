@@ -24,16 +24,16 @@ use dlep_core::LinkMetrics;
 pub const TIMER_SESSION_INIT: TimerId = TimerId::new(1);
 pub const TIMER_TERMINATION: TimerId = TimerId::new(2);
 /// Periodic timer that drives outbound `Heartbeat` sends at the local
-/// announced interval (RFC 8175 §9, §11.2).
+/// announced interval (RFC 8175 §7.3.1).
 pub const TIMER_HEARTBEAT: TimerId = TimerId::new(3);
 /// Single-shot deadline armed at `2 × peer_interval`. One fire ⇒ "two
 /// consecutive missed heartbeats" ⇒ Terminate with `TIMED_OUT` (RFC 8175
-/// §11.2).
+/// §7.3.1).
 pub const TIMER_HEARTBEAT_MISSED: TimerId = TimerId::new(4);
 
-/// Router-side session states (RFC 8175 §7.1). The current runtime calls
-/// `Connector::connect` synchronously and feeds `TcpConnected` once that
-/// future resolves, so the FSM never sits in an explicit "connecting" state
+/// Router-side session states (RFC 8175 §7.2–§7.5). The runtime awaits
+/// `Connector::connect` outside the FSM and feeds `TcpConnected` once that
+/// future resolves, so the FSM has no explicit "connecting" state
 /// — `Closed` transitions straight to `SessionInitPending`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouterSessionState {
@@ -568,7 +568,7 @@ impl RouterSessionFsm {
                 vec![FsmAction::SendMessage(build_heartbeat())]
             }
             // New: missed-deadline fires ⇒ "two consecutive missed
-            // heartbeats" per RFC §11.2 ⇒ Terminate with TIMED_OUT (132).
+            // heartbeats" per RFC §7.3.1 ⇒ Terminate with TIMED_OUT (132).
             // Mirror the InSession+AppShutdown shape: cancel the periodic
             // send timer, send Termination, arm the Termination response
             // deadline, transition to Terminating.
@@ -655,10 +655,8 @@ impl RouterSessionFsm {
                 ]
             }
 
-            // Anything else (destination messages in InSession, stray events
-            // in Terminated, unknown message types) — ignore for M3. M5 will
-            // reject Destination_* in pre-InSession states with
-            // UNEXPECTED_MESSAGE.
+            // Valid heartbeats refresh peer liveness. Unknown/unexpected input
+            // is rejected by the validation at the start of step().
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::HEARTBEAT =>
             {

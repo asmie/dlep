@@ -21,11 +21,12 @@ peer_description = "dlep-router"
 # IPv6: set bind_addr = "::" and interface to use ff02::1:7 discovery.
 # A concrete bind_addr must belong to this interface.
 # interface = "eth0"
+# Preferred discovery source and address family; not a TCP source bind.
 # bind_addr = "0.0.0.0"
-# DLEP well-known port is 854 (UDP for discovery, TCP for the session).
-# Ports below 1024 need CAP_NET_BIND_SERVICE — see doc/deployment.md.
+# Discovery destination port on the modem; the router binds an ephemeral port.
+# TCP endpoints come from Peer Offers or static_peers, not network.tcp_port.
+# The router needs CAP_NET_RAW for strict GTSM, but not CAP_NET_BIND_SERVICE.
 discovery_port = 854
-tcp_port = 854
 # TLS is on by default per the RFC's security guidance. With use_tls = true
 # the [tls] section below is required.
 use_tls = true

@@ -46,7 +46,7 @@ dlep/
 │   ├── dlep-router/             router-side daemon binary
 │   └── dlep-modem/              modem-side daemon binary
 ├── doc/                         this document and any future docs
-└── .github/workflows/ci.yml     fmt + clippy + build & test
+└── .github/                    CI workflows, test scripts, and reproduction guide
 ```
 
 The dependency DAG is strictly acyclic; arrows point in the "depends on" direction:
@@ -72,7 +72,7 @@ The wire-format crate. Pure data and parsing; depends only on `bytes`, `thiserro
 | Module | Responsibility |
 |---|---|
 | `ids.rs` | Newtypes `SignalType`, `MessageType`, `DataItemType`, `ExtensionId` plus all RFC-assigned constants. |
-| `mac.rs` | `MacAddress([u8; 6])` newtype with `Display`. |
+| `mac.rs` | `MacAddress::Eui48` / `Eui64` with parsing, wire-length checks, and `Display`. |
 | `status.rs` | `StatusCode(u8)` plus the standard Continue (<128) / Terminate (≥128) constants and a `terminates_session()` helper. |
 | `data_item.rs` | Typed `DataItem` enum with one variant per RFC data item, plus an `Unknown(RawDataItem)` variant for forward compatibility. |
 | `signal.rs`, `message.rs` | The two top-level wire structures (`Signal` for UDP discovery, `Message` for TCP session). |
@@ -90,9 +90,9 @@ State machines for both the discovery phase and the session phase, on both the r
 | `events.rs` | `FsmEvent` (inbound: parsed messages, transport lifecycle, timer expiry, app commands), `FsmAction` (outbound: send message, start/cancel timer, reset heartbeat, close TCP, emit public-API event). |
 | `timers.rs` | `TimerId` (opaque handle) and `TimerKind` (`Heartbeat`, `HeartbeatMissed`, `SessionInit`, `Termination`, `Discovery`). |
 | `transaction.rs` | `TransactionTracker` — enforces the RFC rule that at most one session-level request and one per-destination request may be in flight at a time. Violation → `StatusCode::UNEXPECTED_MESSAGE` (129). |
-| `session_router.rs` | `RouterSessionFsm` (`Closed → TcpConnecting → SessionInitPending → InSession → Terminating → Terminated`). |
+| `session_router.rs` | `RouterSessionFsm` (`Closed → SessionInitPending → InSession → Terminating → Terminated`). |
 | `session_modem.rs` | `ModemSessionFsm` (`Listening → AwaitingSessionInit → InSession → Terminating → Terminated`). |
-| `discovery_router.rs` | `RouterDiscoveryFsm` (`Idle → Probing → OfferReceived`). |
+| `discovery_router.rs` | `RouterDiscoveryFsm` (`Idle → Probing`; offers emit events while probing continues). |
 | `discovery_modem.rs` | `ModemDiscoveryFsm` (`Listening → OfferBurst`). |
 
 ### 4.3 `dlep-net`
@@ -102,18 +102,19 @@ Everything that touches the operating system. Built on Tokio.
 | Module | Responsibility |
 |---|---|
 | `transport.rs` | `Transport` trait (`AsyncRead + AsyncWrite + Unpin + Send + 'static` plus `peer_addr`/`local_addr`/`is_tls`). `Connector` and `Acceptor` produce `Box<dyn Transport>` for either plain TCP or TLS. |
-| `tls.rs` | rustls helpers: `load_certs`, `load_private_key`, placeholder `client_config_placeholder`. |
+| `tls.rs` | Certificate/key loading through `rustls-pki-types::pem::PemObject`; optional certificate-generation helpers for tests. |
 | `framed.rs` | `MessageCodec` and `SignalCodec` — `tokio_util::codec::{Decoder, Encoder}` adapters over the byte-level codec from `dlep-core`. |
 | `discovery.rs` | `DiscoverySocket`: builds UDP IPv4/IPv6 sockets via `socket2`, selects multicast membership and interface, and sends with TTL/hop limit 255 using `nix::sendmsg`. `recvmsg` extracts ancillary interface and TTL/hop-limit data; the socket filters disallowed interfaces and non-255 TTLs before decoding. Malformed/truncated datagrams return `InvalidData`, separately from socket failures. |
 | `gtsm.rs` | RFC 5082 helpers: `REQUIRED_TTL = 255`, `set_send_ttl` (configures IP_TTL/IP_MULTICAST_TTL on `socket2::Socket`), `enable_recv_ttl` (enables IP_RECVTTL via `nix::setsockopt`), `is_gtsm_valid` for inbound checks. |
-| `addr.rs` | `InterfaceSpec` (by name / index / any) and `PeerAddr` convenience wrappers. |
+| `tcp_monitor.rs` | Linux packet monitor for strict GTSM resets, with per-connection filtering and task cleanup. |
+| `addr.rs` | `InterfaceSpec` (by name / index / any), interface/address resolution, IPv6 scope, and `PeerAddr` wrappers. |
 | `lib.rs` | Re-exports `MessageCodec`, `SignalCodec`, `Transport`, `Connector`, `Acceptor`, `TransportKind`, plus `rustls::{ClientConfig, ServerConfig}` so consumers have a single import site for TLS configuration. |
 
 ### 4.4 `dlep-ext`
 
 The extension plug-in surface. A separate crate so a third-party extension can depend on it (and on `dlep-core`) without dragging in the runtime.
 
-`DlepExtension` is a trait with default-empty hooks for:
+`DlepExtension` requires `advertised_ids()` and provides default implementations for its hooks:
 
 - `advertised_ids()` — which `ExtensionId`s the plug-in announces in Session Initialization.
 - `on_negotiated(remote_ids)` — accept or opt out of this session based on what the peer advertised.
@@ -152,7 +153,8 @@ Thin binaries. Each one:
 3. Loads configuration via `dlep_daemon::load_toml_config` and applies CLI
    overrides (`apply_overrides`).
 4. With `--check-config`: runs `check_router_config` / `check_modem_config`
-   (TOML shape, static peers, TLS material) and exits.
+   (TOML shape, timers, interfaces, static peers, modem metrics, and TLS material)
+   and exits without opening sockets.
 5. When `use_tls` is on, builds the rustls config from the `[tls]` section
    via `dlep_daemon::tls::{client_config, server_config}` and hands it to
    the builder.
@@ -162,7 +164,8 @@ Thin binaries. Each one:
    session lifecycle; the modem's accept loop starts on `spawn`.
 7. Registers SIGINT/SIGTERM before opening networking resources and calls
    `daemon.shutdown().await` on either signal. The router races shutdown against
-   its entire startup/event driver, including inline TCP/TLS connection attempts.
+   its entire startup/event driver, including the bounded pool of concurrent
+   TCP/TLS connection attempts.
    Driver errors also pass through cleanup before being returned.
 
 ---
@@ -175,7 +178,7 @@ Splitting into seven crates is more upfront work, but each split serves a purpos
 
 - **`dlep-core` is a leaf** with minimal dependencies. It is the only place that knows the wire format, and it can be tested without any runtime.
 - **`dlep-fsm` cannot accidentally do I/O**, because Tokio is not on its dependency list. This is a structural guarantee: a future contributor cannot, by accident, make a state handler `.await` something. Anything that needs to wait must come back through an `FsmEvent`.
-- **`dlep-net` is the only place that uses `tokio`, `rustls`, `socket2` and `nix`**. If we ever swap Tokio for another runtime (unlikely, but conceivable), only one crate changes.
+- **`dlep-net` owns low-level socket operations** through `socket2` and `nix`. Tokio and rustls are also used by the daemon integration layer; changing the runtime would affect both layers and the binaries.
 - **`dlep-ext` is tiny on purpose.** A third-party extension only needs to depend on `dlep-core` and `dlep-ext` — it does not pull in the runtime, the network layer, or the binaries.
 - **`dlep-daemon` is the integration crate**, used by library embedders. The two binaries depend on it.
 - **`dlep-router` and `dlep-modem` are separate binaries** rather than one binary with a `--mode` flag. This keeps each binary's CLI focused and makes deployment (e.g. systemd units, capability scoping) cleaner.
@@ -188,7 +191,7 @@ The codec preserves unknown Data Items for extension dispatch and validates fram
 
 ### 5.3 Bytes-based parsing, no `nom`, no full zero-copy
 
-`dlep-core` uses `bytes::Bytes` and `bytes::BytesMut` directly; `Bytes::split_to` keeps Data Item payloads as zero-copy slices of the original network buffer. We deliberately did not adopt `nom` (its expressive power is overkill for a strictly linear `type/length/value` format) and we did not push borrowed slices into the `DataItem` API (the lifetime would propagate through the FSM and hurt ergonomics). Strings inside Data Items pay one UTF-8-validation copy; everything else is a refcount bump on the underlying `Bytes` allocation.
+`dlep-core` uses `bytes::Bytes` and `bytes::BytesMut` directly; `Bytes::split_to` keeps Data Item payloads as zero-copy slices of the original network buffer. We deliberately did not adopt `nom` (its expressive power is overkill for a strictly linear `type/length/value` format) and we did not push borrowed slices into the `DataItem` API (the lifetime would propagate through the FSM and hurt ergonomics). Unknown Data Items retain slices of the shared buffer. Typed fields are decoded into owned values; text is copied for UTF-8 validation, and list fields allocate their own storage.
 
 ### 5.4 Hand-rolled FSMs
 
@@ -202,11 +205,11 @@ The four FSMs share `FsmEvent`, `FsmAction`, `TimerId`/`TimerKind`, and `Transac
 
 ### 5.6 Heartbeat reset is centralised
 
-A valid in-session core message or a message consumed by a negotiated extension causes the FSM to emit `FsmAction::ResetHeartbeat { missed_deadline }`, which the runtime uses to cancel and re-arm the **missed-heartbeat deadline** (the single-shot timer set to `2 × peer_interval` per RFC 8175 §11.2). The send-side periodic heartbeat timer is **independent**: it is armed once at `InSession` entry from our locally-configured `heartbeat_interval_ms` and reschedules itself on each tick — receives don't touch it. The advertised local interval is clamped to RFC 8175's minimum of 1 second, and the codec rejects Heartbeat Interval Data Items below that minimum (`0` is explicitly forbidden by RFC §13.5). The FSM owns `peer_heartbeat_interval: Option<Duration>` extracted from the Heartbeat Interval Data Item in the Session Init / Init Response handshake; `None` is valid only before initialization; a missing mandatory heartbeat interval rejects initialization. Two consecutive missed intervals — equivalently, one fire of a `2 × interval` deadline — trigger a Session Termination with status code 132.
+A valid in-session core message or a message consumed by a negotiated extension causes the FSM to emit `FsmAction::ResetHeartbeat { missed_deadline }`, which the runtime uses to cancel and re-arm the **missed-heartbeat deadline** (the single-shot timer set to `2 × peer_interval` per RFC 8175 §7.3.1). The send-side periodic heartbeat timer is **independent**: it is armed once at `InSession` entry from our locally-configured `heartbeat_interval_ms` and reschedules itself on each tick — receives don't touch it. The advertised local interval is clamped to RFC 8175's minimum of 1 second, and the codec rejects Heartbeat Interval Data Items below that minimum (`0` is explicitly forbidden by RFC §13.5). The FSM owns `peer_heartbeat_interval: Option<Duration>` extracted from the Heartbeat Interval Data Item in the Session Init / Init Response handshake; `None` is valid only before initialization; a missing mandatory heartbeat interval rejects initialization. Two consecutive missed intervals — equivalently, one fire of a `2 × interval` deadline — trigger a Session Termination with status code 132.
 
 ### 5.7 Transaction serialisation is enforced in one place
 
-`TransactionTracker` (in `dlep-fsm/src/transaction.rs`) is the single source of truth for the rule "at most one session-level request and one per-destination request in flight at a time." Each FSM consults it before sending or before acting on an inbound request; violations always produce a Session Termination with status code 129.
+`TransactionTracker` (in `dlep-fsm/src/transaction.rs`) is the single source of truth for the rule "at most one session-level request and one per-destination request in flight at a time." Each FSM consults it before sending or before acting on an inbound request. Conflicting inbound requests terminate the session with status code 129; local application commands receive explicit Busy rejections and leave the session active.
 
 ### 5.8 `DaemonEvent::Extension(Arc<dyn Any + Send + Sync>)`
 
@@ -214,7 +217,7 @@ The public event channel is a `tokio::sync::broadcast` — fan-out, lossy on slo
 
 ### 5.9 TLS is on by default
 
-`use_tls` defaults to `true` in `NetworkConfig::default()` (M7). Embedders that need plain TCP must explicitly set `use_tls = false` in their config — the default is RFC 8175 §10's recommended posture. Daemons configured with `use_tls = true` MUST also call `RouterBuilder::with_rustls_client(...)` / `ModemBuilder::with_rustls_server(...)` before `spawn`; otherwise the modem fails during spawn and the router fails when connecting with a `DaemonError::Config` error. `ServerName::IpAddress` is derived from the connect target's IP; cert SANs must include that IP. Client/server `rustls::ClientConfig` and `rustls::ServerConfig` re-exported from `dlep-net` for one-stop import. A `dlep_net::tls::test_helpers` module (gated by the `test-helpers` feature) generates rcgen-based self-signed certs for integration tests.
+`use_tls` defaults to `true` in `NetworkConfig::default()` (M7). Embedders that need plain TCP must explicitly set `use_tls = false` in their config — this is a project default informed by the credential-validation guidance in RFC 8175 §14. Daemons configured with `use_tls = true` MUST also call `RouterBuilder::with_rustls_client(...)` / `ModemBuilder::with_rustls_server(...)` before `spawn`; otherwise the modem fails during spawn and the router fails when connecting with a `DaemonError::Config` error. `ServerName::IpAddress` is derived from the connect target's IP; cert SANs must include that IP. Client/server `rustls::ClientConfig` and `rustls::ServerConfig` re-exported from `dlep-net` for one-stop import. A `dlep_net::tls::test_helpers` module (gated by the `test-helpers` feature) generates rcgen-based self-signed certs for integration tests.
 
 ### 5.10 GTSM (RFC 5082)
 
@@ -261,64 +264,53 @@ Extensions are dispatched per session by the session task. Their lifecycle:
 
 Configuration is a TOML file passed via `--config`. Both binaries share a `SharedConfig` (network, TLS, timers) and add their own role-specific bits:
 
+A router configuration (role-specific keys must precede the first table):
+
 ```toml
+mode = "discovery"
+peer_description = "example-router"
+# For static mode: mode = "static" and static_peers = ["192.0.2.10:854"]
+
 [network]
-interface           = "eth0"
-discovery_v4_group  = "224.0.0.117"
-discovery_v6_group  = "ff02::1:7"
-discovery_port      = 854
-tcp_port            = 854
-use_tls             = true
-gtsm_enforce        = true
+discovery_port = 854
+use_tls = true
+gtsm_enforce = true
+# interface = "eth0"  # choose an interface that exists on this host
 
 [tls]
-cert                 = "/etc/dlep/server.pem"
-key                  = "/etc/dlep/server.key"
-ca_bundle            = "/etc/dlep/ca.pem"
-require_client_cert  = true
+ca_bundle = "/etc/dlep/pki/ca.pem"
+cert = "/etc/dlep/pki/router.pem"
+key = "/etc/dlep/pki/router.key"
 
 [timers]
 heartbeat_interval_ms = 60000
 discovery_interval_ms = 5000
-
-# router only
-mode         = "discovery"          # or "static"
-static_peers = ["10.0.0.1:854"]
-
-# modem only
-peer_description = "example-modem"
 ```
 
-The configuration types live in `dlep-daemon/src/config.rs`. The IANA-assigned multicast groups (`224.0.0.117`, `ff02::1:7`) and default port (`854`) are hard-coded constants in `dlep-core/src/lib.rs` and used as the `Default` for `NetworkConfig`.
+The modem has no `mode` or `static_peers`; it uses `peer_description`, shared
+network/TLS/timer sections, and an optional `[metrics]` section. Its
+`network.tcp_port` configures the listener. The router instead connects to
+ports from Peer Offers or `static_peers`; its UDP source port is ephemeral.
+Both roles use `bind_addr` for discovery source preference and address family,
+while only the modem uses it for its TCP listener.
+
+See [the deployment schema](deployment.md#3-configuration) and the complete
+[router](../examples/router.toml) and [modem](../examples/modem.toml) examples.
+The configuration types live in `dlep-daemon/src/config.rs`; unknown keys and
+sections are rejected. The default groups (`224.0.0.117`, `ff02::1:7`) and port
+(`854`) come from `dlep-core`. TLS defaults to enabled but requires configured
+identities/trust roots. `--check-config` validates the configuration without
+opening sockets; it does not test capabilities or network reachability.
 
 ---
 
 ## 7. Public API shape
 
-A library embedder uses `dlep-daemon` like this (router side):
-
-```rust
-use std::sync::Arc;
-
-use dlep_daemon::{RouterDaemon, RouterConfig};
-use dlep_ext::DlepExtension;
-
-let daemon = RouterDaemon::builder()
-    .config(RouterConfig::default())
-    .register_extension(my_extension as Arc<dyn DlepExtension>)
-    .with_rustls_client(my_client_tls_config)
-    .spawn()
-    .await?;
-
-let mut events = daemon.subscribe();          // broadcast::Receiver<DaemonEvent>
-daemon.start_discovery().await?;
-
-while let Ok(event) = events.recv().await {
-    // react to PeerDiscovered, SessionUp, Destination { .. }, Metrics { .. } …
-}
-
-daemon.shutdown().await?;
-```
+The [README library example](../README.md#library-use) shows router setup,
+extension registration, TLS configuration, and event subscription.
+`start_discovery` publishes offers; the application must call
+`connect_discovered` to establish sessions. Automatic connection scheduling and
+reconnection are policies of the router binary, not the library handle.
 
 The modem-side API is symmetric, with `add_destination`, `update_destination` and `drop_destination` taking the place of `start_discovery` / `connect_static`.
 
@@ -328,19 +320,27 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
-The suite is **209 tests**, all passing, with `clippy -D warnings` clean.
+The last validated suite contains **389 passing tests**. The CI coverage run
+measured **94.3% lines, 93.3% regions, and 94.5% functions**; these are a snapshot,
+not a conformance score or a coverage gate. Reports are produced on each CI run.
 
-| Layer | Where | What |
+| Layer | Where | Coverage |
 |---|---|---|
-| Codec roundtrip | `dlep-core/src/codec.rs` (`#[cfg(test)]`) | `encode → decode → ==` for every typed `DataItem`. Hand-rolled byte-vector tests for the dozen most common items. |
-| Codec robustness | `dlep-core/tests/codec_proptest.rs` | `proptest` strategies for `DataItem` and `Message`; the decoder must never panic on random bytes. |
-| FSM transitions | `dlep-fsm/tests/session_table.rs`, `discovery_table.rs` | Table-driven, in-memory: feed events, assert states and emitted actions. No sockets. Owns the transaction-slot lifecycle assertions, which are racy to observe from an integration test. |
-| Integration | `dlep-daemon/tests/loopback.rs`, `tls.rs`, `discovery.rs`, `extensions.rs` | Two daemons on `127.0.0.1`, plain TCP and `rcgen`-generated TLS (incl. mTLS). Assert session-up, destination churn, Session Update, Destination Announce, clean shutdown. |
-| FSM end-to-end | (partly covered by the loopback integration tests) | A dedicated in-memory router↔modem FSM bus was never needed; the loopback tests cover the same ground over real sockets. A fake-peer harness is still wanted for selective-silence timeout scenarios — see §10. |
-| Conformance | `testdata/pcaps/` (nice-to-have) | Captures from reference implementations parsed read-only. |
-| Fuzzing | `cargo-fuzz` (later) | Targets for `Signal::decode` and `Message::decode`. Not yet present; the codec proptests cover much of the same ground. |
+| Codec | `dlep-core/src/codec.rs`, `tests/codec_boundaries.rs`, `tests/codec_proptest.rs` | Round-trips, malformed lengths, reserved flags, UTF-8, numeric limits, truncation, and arbitrary-input panic checks. |
+| FSM | `dlep-fsm/tests/` | Initialization, transactions, destinations, metrics, address changes, unknown input, heartbeat and termination state transitions. |
+| Transport and daemon | `dlep-net/src/`, `dlep-daemon/tests/` | IPv4/IPv6 discovery, interface selection, TTL filtering/reset, real TCP/TLS/mTLS sessions, certificate rejection, stalled peers, cleanup, and extension dispatch. |
+| Independent peer scenarios | `dlep-daemon/tests/review_regressions.rs`, `termination_timeout.rs` | Malformed input, silent peers, pending requests, bounded writes, and virtual-time termination deadlines. |
+| CLI | binary unit tests and `crates/dlep-{router,modem}/tests/` | Configuration checks, overrides, signals, reconnection/backoff, event-loss recovery, and concurrent connection scheduling. |
 
-CI (`.github/workflows/ci.yml`) runs three parallel jobs: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo build --workspace --all-targets --locked` + `cargo test --workspace --locked`.
+Reference-implementation packet captures and dedicated `cargo-fuzz` targets are
+still absent. Property tests and two-daemon loopback tests do not establish
+interoperability with independent DLEP implementations.
+
+See [CI documentation](../.github/README.md) for exact jobs and reproduction
+commands. Linux tests run in a disposable network namespace with strict GTSM
+privileges. CI additionally checks Rust 1.85, portable crates on macOS,
+formatting, clippy, workflow syntax, and dependency advisories. Coverage reports
+are downloadable artifacts; the audit has one documented, guarded exception.
 
 ---
 
@@ -644,13 +644,22 @@ The order of work was:
     Rust 1.85 compatibility. See `.github/README.md` for job scope, local
     reproduction, coverage artifacts, and the exception's exact conditions.
 
+29. Documentation and deployment examples. **Done** — refreshed build/test/CI
+    instructions, logging precedence, role-specific network settings, the TOML
+    example, public API descriptions, and RFC references. The router unit now
+    grants only CAP_NET_RAW; both units restrict device/kernel access and socket
+    families while retaining packet monitoring and interface enumeration.
+    Deployment instructions cover both peers' PKI/config installation and the
+    limits of --check-config. Repository-local contributor guidance identifies
+    this workspace as DLEP rather than the unrelated parent project.
+
 ---
 
 ## 10. Open questions / risks
 
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.
-- **Privileged binding to port 854.** Port 854 is below 1024 and requires `CAP_NET_BIND_SERVICE` on Linux, or running behind an unprivileged user with `setcap cap_net_bind_service=+ep` on the binary, or a systemd unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE`. Documented in `doc/deployment.md` §4 (M9).
+- **Socket privileges.** The modem normally needs `CAP_NET_BIND_SERVICE` for port 854; the router uses ephemeral source ports. Both roles need `CAP_NET_RAW` for strict TCP GTSM. See [deployment §4](deployment.md#4-socket-privileges).
 - **IPv4 vs IPv6.** Wire encoding and discovery support both families. Each daemon uses the family of `bind_addr`; simultaneous discovery over both families is not enabled. IPv6 wildcard binds require an explicit interface to scope multicast, and link-local TCP endpoints retain the discovery interface index.
 
 - **Heartbeat failure coverage.** `silent_peer_is_detected_by_heartbeat_while_request_is_pending` uses an independent TCP peer that completes initialization, starts a destination transaction, and then goes silent. It verifies termination and `SessionDown(TIMED_OUT)`. A virtual-time transport test verifies that a response delayed for three minutes is accepted while the peer continues communicating.

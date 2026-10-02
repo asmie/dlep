@@ -16,13 +16,13 @@ pub struct RawDataItem {
     pub value: Bytes,
 }
 
-/// Peer Type flags (RFC 8175 §13.4.4).
+/// Peer Type flags (RFC 8175 §13.4).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PeerFlags {
     pub smi: bool,
 }
 
-/// IPv4/IPv6 Connection Point sub-flags (RFC 8175 §13.4.2 / §13.4.3).
+/// IPv4/IPv6 Connection Point sub-flags (RFC 8175 §13.2 / §13.3).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnectionPointFlags {
     pub use_tls: bool,

@@ -8,10 +8,10 @@ use crate::discovery_common::{
 use crate::events::{EmittedEvent, FsmAction, FsmEvent, SendTarget};
 use crate::timers::{TimerId, TimerKind};
 
-/// Timer ID for the periodic Peer_Discovery resend (RFC 8175 §7.3.1).
+/// Timer ID for the periodic Peer_Discovery resend (RFC 8175 §7.1).
 pub const TIMER_DISCOVERY: TimerId = TimerId::new(10);
 
-/// Router-side discovery states (RFC 8175 §7.3).
+/// Router-side discovery states (RFC 8175 §7.1).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RouterDiscoveryState {
     #[default]
@@ -86,7 +86,7 @@ impl RouterDiscoveryFsm {
                 }]
             }
 
-            // Probing: inbound Peer_Offer → emit + transition.
+            // Probing: inbound Peer_Offer → emit while continuing discovery.
             (RouterDiscoveryState::Probing, FsmEvent::RecvSignal { signal, from })
                 if signal.signal_type == SignalType::PEER_OFFER =>
             {
@@ -120,7 +120,7 @@ impl RouterDiscoveryFsm {
             }
 
             // Probing: ignore anything else (notably stray Peer_Discovery
-            // from other routers — RFC 8175 §7.3 says routers don't reply
+            // from other routers — RFC 8175 §7.1 says routers don't reply
             // to each other).
             (RouterDiscoveryState::Probing, _) => Vec::new(),
 

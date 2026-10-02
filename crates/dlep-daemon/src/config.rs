@@ -11,7 +11,10 @@ pub struct NetworkConfig {
     pub interface: Option<String>,
     pub discovery_v4_group: Ipv4Addr,
     pub discovery_v6_group: Ipv6Addr,
+    /// Modem discovery listen port and router multicast destination port.
+    /// Router discovery sockets bind an ephemeral local port.
     pub discovery_port: u16,
+    /// Modem TCP listener port. Routers use offered/static endpoint ports.
     pub tcp_port: u16,
     /// Address the modem's TCP listener binds to; its family also selects
     /// discovery transport for both roles. Defaults to `0.0.0.0`
@@ -108,7 +111,7 @@ impl Default for NetworkConfig {
             discovery_port: DEFAULT_PORT,
             tcp_port: DEFAULT_PORT,
             bind_addr: default_bind_addr(),
-            // TLS on by default (RFC 8175 §10 recommendation). Embedders
+            // TLS on by default (see RFC 8175 §14 security considerations). Embedders
             // that need plain TCP must override `use_tls = false` in their
             // config. Embedders that keep TLS on MUST call
             // `with_rustls_client` / `with_rustls_server` on the daemon

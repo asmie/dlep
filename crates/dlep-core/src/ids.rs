@@ -20,15 +20,15 @@ macro_rules! id_newtype {
 }
 
 id_newtype!(
-    /// Signal type on the UDP discovery channel (RFC 8175 §13.1).
+    /// Signal type on the UDP discovery channel (RFC 8175 §11.1 / §15.2).
     pub SignalType
 );
 id_newtype!(
-    /// Message type on the TCP session channel (RFC 8175 §13.2).
+    /// Message type on the TCP session channel (RFC 8175 §11.2 / §15.3).
     pub MessageType
 );
 id_newtype!(
-    /// Data item type inside a message or signal (RFC 8175 §13.4).
+    /// Data item type inside a message or signal (RFC 8175 §11.3 / §15.4).
     pub DataItemType
 );
 id_newtype!(

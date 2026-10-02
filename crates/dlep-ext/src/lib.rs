@@ -56,8 +56,7 @@ pub enum ExtHandled {
     Passthrough,
 }
 
-/// A snapshot of session-level state exposed to extensions. Real fields
-/// arrive once the FSM grows its transitions; for now this is a placeholder.
+/// Session lifecycle state exposed to negotiated extensions.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionStateSnapshot {
     pub up: bool,

@@ -14,9 +14,10 @@ KillSignal=SIGTERM
 # Increase this if heartbeat_interval_ms or termination_timeout_ms is increased.
 TimeoutStopSec=300s
 
-# Port 854 needs bind privileges; strict TCP GTSM needs packet monitoring.
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+# Outbound TCP and ephemeral UDP source ports need no bind capability.
+# Strict TCP GTSM requires packet monitoring.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 
 # Hardening
 # Static service user so PKI keys can be owned root:dlep mode 0640.
@@ -27,6 +28,16 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+UMask=0027
+# AF_PACKET is required by GTSM; AF_NETLINK by interface enumeration.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 ReadOnlyPaths=/etc/dlep
 
 [Install]

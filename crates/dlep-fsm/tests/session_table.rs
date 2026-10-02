@@ -333,7 +333,7 @@ fn router_in_session_heartbeat_resets_heartbeat() {
     let mut fsm = router_at(RouterSessionState::InSession);
     let actions = fsm.step(FsmEvent::RecvMessage(make_simple(MessageType::HEARTBEAT)));
     assert_eq!(fsm.state(), RouterSessionState::InSession);
-    // Per RFC 8175 §11.2 the missed-deadline is rearmed at 2 × peer interval.
+    // Per RFC 8175 §7.3.1 the missed-deadline is rearmed at 2 × peer interval.
     let expected = DEFAULT_PEER_HEARTBEAT * 2;
     assert!(actions.iter().any(|a| matches!(
         a,
@@ -501,7 +501,7 @@ fn modem_awaiting_session_init_to_in_session_on_session_init_message() {
         _ => None,
     });
     let init_response = init_response.expect("expected SendMessage(InitResponse)");
-    // RFC 8175 §11.2: response carries Status, Heartbeat, PeerType,
+    // RFC 8175 §12.6: response carries Status, Heartbeat, PeerType,
     // ExtensionsSupported, MTU, MaxDR Rx/Tx, CurDR Rx/Tx, Latency,
     // Resources, RLQ Rx/Tx — at least 13 items.
     assert!(init_response.data_items.len() >= 13);
@@ -1241,7 +1241,7 @@ fn router_in_session_session_update_resets_missed_heartbeat_deadline() {
         actions
             .iter()
             .any(|a| matches!(a, FsmAction::ResetHeartbeat { .. })),
-        "RFC 8175 §11.2: any received message resets the deadline"
+        "RFC 8175 §7.3.1: any received message resets the deadline"
     );
 }
 

@@ -18,7 +18,8 @@ peer_description = "dlep-modem"
 # Address the TCP listener binds to; 0.0.0.0 means all interfaces.
 bind_addr = "0.0.0.0"
 # DLEP well-known port is 854 (UDP for discovery, TCP for the session).
-# Ports below 1024 need CAP_NET_BIND_SERVICE — see doc/deployment.md.
+# Ports below 1024 normally need CAP_NET_BIND_SERVICE. Strict TCP GTSM also
+# needs CAP_NET_RAW — see doc/deployment.md.
 discovery_port = 854
 tcp_port = 854
 # TLS is on by default per the RFC's security guidance. With use_tls = true

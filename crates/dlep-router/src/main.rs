@@ -36,16 +36,16 @@ struct Cli {
     no_tls: bool,
 
     /// PEM bundle of CA certificates used to verify the modem
-    /// (overrides [tls] ca_bundle).
+    /// (overrides tls.ca_bundle).
     #[arg(long, value_name = "PATH")]
     ca_bundle: Option<PathBuf>,
 
     /// PEM client certificate presented to the modem for mutual TLS
-    /// (overrides [tls] cert).
+    /// (overrides tls.cert).
     #[arg(long, value_name = "PATH")]
     cert: Option<PathBuf>,
 
-    /// PEM private key for --cert (overrides [tls] key).
+    /// PEM private key for --cert (overrides tls.key).
     #[arg(long, value_name = "PATH")]
     key: Option<PathBuf>,
 

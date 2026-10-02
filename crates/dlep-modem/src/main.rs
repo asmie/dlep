@@ -25,17 +25,17 @@ struct Cli {
     #[arg(long)]
     no_tls: bool,
 
-    /// PEM server certificate presented to routers (overrides [tls] cert).
+    /// PEM server certificate presented to routers (overrides tls.cert).
     #[arg(long, value_name = "PATH")]
     cert: Option<PathBuf>,
 
-    /// PEM private key for --cert (overrides [tls] key).
+    /// PEM private key for --cert (overrides tls.key).
     #[arg(long, value_name = "PATH")]
     key: Option<PathBuf>,
 
     /// PEM bundle of CA certificates used to verify router client
     /// certificates when require_client_cert is set
-    /// (overrides [tls] ca_bundle).
+    /// (overrides tls.ca_bundle).
     #[arg(long, value_name = "PATH")]
     ca_bundle: Option<PathBuf>,
 

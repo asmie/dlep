@@ -343,7 +343,7 @@ impl ModemSessionFsm {
                 actions
             }
             // InSession: app asks us to advertise an updated metric set for
-            // an existing destination. RFC 8175 §11.7 — Destination_Update is
+            // an existing destination. RFC 8175 §12.17 — Destination_Update is
             // one-way; there is no Response. Preflight rejects unknown MACs.
             (ModemSessionState::InSession, FsmEvent::AppUpdateMetrics { mac, metrics }) => {
                 let destination = self
@@ -387,7 +387,7 @@ impl ModemSessionFsm {
                 )]
             }
             // InSession: app asks us to tear down a previously announced
-            // destination. RFC 8175 §11.5 — open a per-destination transaction
+            // destination. RFC 8175 §12.15 — open a per-destination transaction
             // and send `Destination_Down(mac, reason)`. The local entry stays
             // until the response arrives (symmetric to the Up flow where
             // `announced` flips only on response).
@@ -433,7 +433,7 @@ impl ModemSessionFsm {
             }
             // InSession: router replied to our Destination_Down. Close the
             // per-destination transaction, remove the local entry, and reset
-            // the missed-heartbeat deadline (RFC §11.2).
+            // the missed-heartbeat deadline (RFC §7.3.1).
             (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_DOWN_RESPONSE =>
             {
