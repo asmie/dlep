@@ -237,6 +237,11 @@ released with the connection/listener. Setup failures are explicit; a monitor
 read failure resets all its registered connections. The systemd examples grant
 the capability; network tests run in an isolated network namespace.
 
+A receive-error regression drives the real receive loop with a socket that
+fails on `recvfrom`. It verifies reset of registered IPv4 and IPv6 connections,
+local reader wakeup, rejection of subsequent registrations, survival of an
+unregistered connection, and release of registrations and monitor state.
+
 ### 5.11 Channels: broadcast for events, mpsc for commands
 
 The public event bus is `tokio::sync::broadcast::Sender<DaemonEvent>` with a fixed capacity (256). Slow subscribers lose old events; bridging this stream into another channel does not recover events already dropped.
@@ -320,9 +325,11 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
-The last validated suite contains **389 passing tests**. The CI coverage run
-measured **94.3% lines, 93.3% regions, and 94.5% functions**; these are a snapshot,
-not a conformance score or a coverage gate. Reports are produced on each CI run.
+The last validated suite contains **416 passing tests**, including the monitor
+receive-failure regression. The earlier 389-test coverage run measured
+**94.3% lines, 93.3% regions, and 94.5% functions**; these are a snapshot,
+not a conformance score or a coverage gate. Coverage was not recollected for
+this checkpoint. Reports are produced on each CI run.
 
 | Layer | Where | Coverage |
 |---|---|---|

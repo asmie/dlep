@@ -49,6 +49,10 @@ mod platform {
                 )
             })?;
             filter_low_ttl(&socket)?;
+            Self::start(socket)
+        }
+
+        fn start(socket: Socket) -> io::Result<Arc<Self>> {
             socket.set_nonblocking(true)?;
             let socket = AsyncFd::new(socket)?;
             let state = Arc::new(Mutex::new(State::default()));
@@ -325,9 +329,82 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio::time::{Duration, timeout};
+
+        async fn tcp_pair(addr: &str) -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let peer = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (local, _) = listener.accept().await.unwrap();
+            (local, peer)
+        }
+
+        #[tokio::test]
+        async fn receive_failure_resets_all_registered_connections_and_rejects_new_ones() {
+            // A listening socket becomes readable when a client connects, but
+            // recvfrom on it fails with ENOTCONN. This exercises the real receive
+            // error and task cleanup without invalid fds or packet privileges.
+            let source = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+            source
+                .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+                .unwrap();
+            source.listen(1).unwrap();
+            let trigger_addr = source.local_addr().unwrap().as_socket().unwrap();
+            let monitor = Monitor::start(source).unwrap();
+
+            let mut registered = Vec::new();
+            for addr in ["127.0.0.1:0", "[::1]:0"] {
+                let (local, peer) = tcp_pair(addr).await;
+                let registration = monitor.register(&local).unwrap();
+                registered.push((local, peer, registration));
+            }
+            let (mut unregistered, mut unregistered_peer) = tcp_pair("127.0.0.1:0").await;
+            drop(monitor.register(&unregistered).unwrap());
+            assert_eq!(monitor.state.lock().unwrap().sockets.len(), 2);
+            assert!(!monitor.state.lock().unwrap().failed);
+
+            let _trigger = TcpStream::connect(trigger_addr).await.unwrap();
+            let mut buf = [0; 1];
+            for (local, peer, _) in &mut registered {
+                let error = timeout(Duration::from_secs(1), peer.read(&mut buf))
+                    .await
+                    .expect("monitor failure must reset each remote peer")
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+                let result = timeout(Duration::from_secs(1), local.read(&mut buf))
+                    .await
+                    .expect("monitor failure must wake each local reader");
+                assert!(matches!(result, Ok(0) | Err(_)));
+            }
+            assert!(monitor.state.lock().unwrap().failed);
+            assert!(monitor.task.is_finished());
+
+            let error = monitor
+                .register(&unregistered)
+                .err()
+                .expect("failed monitor must reject registration");
+            assert_eq!(error.to_string(), "TCP GTSM monitor has failed");
+            assert_eq!(monitor.state.lock().unwrap().sockets.len(), 2);
+            // A removed registration is outside the monitor's ownership. A
+            // rejected registration must neither retain nor reset that socket.
+            unregistered_peer.write_all(b"x").await.unwrap();
+            timeout(Duration::from_secs(1), unregistered.read_exact(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf, b"x");
+
+            drop(registered);
+            assert!(monitor.state.lock().unwrap().sockets.is_empty());
+            // Dropping the last registration must not revive a failed monitor.
+            assert!(monitor.register(&unregistered).is_err());
+            let weak = Arc::downgrade(&monitor);
+            drop(monitor);
+            assert!(weak.upgrade().is_none());
+        }
 
         #[tokio::test]
         async fn disconnect_resets_peer_and_wakes_local_reader() {
