@@ -657,9 +657,14 @@ The order of work was:
 
 ## 10. Open questions / risks
 
+The [2026-10-02 completeness and coverage review](review-2026-10-02.md)
+records the final review of batches 1–29, fresh validation results, and four
+remaining fixes. Its open findings take precedence over broad completion
+statements above. Each follow-up remains a separate commit checkpoint.
+
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.
 - **Socket privileges.** The modem normally needs `CAP_NET_BIND_SERVICE` for port 854; the router uses ephemeral source ports. Both roles need `CAP_NET_RAW` for strict TCP GTSM. See [deployment §4](deployment.md#4-socket-privileges).
-- **IPv4 vs IPv6.** Wire encoding and discovery support both families. Each daemon uses the family of `bind_addr`; simultaneous discovery over both families is not enabled. IPv6 wildcard binds require an explicit interface to scope multicast, and link-local TCP endpoints retain the discovery interface index.
+- **IPv4 vs IPv6.** Wire encoding and discovery support both families. Each daemon uses the family of `bind_addr`; simultaneous discovery over both families is not enabled. IPv6 wildcard binds require an explicit interface to scope multicast. IPv6 discovery retains scope for link-local TCP endpoints; IPv6 link-local Connection Points received over IPv4 discovery still lose that scope (review finding R1).
 
 - **Heartbeat failure coverage.** `silent_peer_is_detected_by_heartbeat_while_request_is_pending` uses an independent TCP peer that completes initialization, starts a destination transaction, and then goes silent. It verifies termination and `SessionDown(TIMED_OUT)`. A virtual-time transport test verifies that a response delayed for three minutes is accepted while the peer continues communicating.
