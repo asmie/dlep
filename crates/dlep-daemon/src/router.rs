@@ -53,49 +53,17 @@ impl RouterDaemon {
     }
 
     pub async fn start_discovery(&self) -> Result<(), DaemonError> {
-        use std::net::IpAddr;
         use std::time::Duration;
 
         use dlep_fsm::FsmEvent;
         use dlep_fsm::discovery_router::{RouterDiscoveryConfig, RouterDiscoveryFsm};
-        use dlep_net::discovery::{DiscoveryParams, DiscoverySocket};
 
         let mut slot = self.discovery_shutdown.lock().await;
         if slot.is_some() {
             return Err(DaemonError::Config("discovery already running".into()));
         }
 
-        let interface_v4 = match self.network.bind_addr {
-            IpAddr::V4(v4) => v4,
-            IpAddr::V6(_) => {
-                return Err(DaemonError::Config(
-                    "M6 discovery only supports v4 bind_addr".into(),
-                ));
-            }
-        };
-        let params = DiscoveryParams {
-            group_v4: self.network.discovery_v4_group,
-            interface_v4,
-            // Router-side: bind ephemeral (port 0) so the modem's unicast
-            // Peer_Offer reply lands on a port not shared with any other
-            // discovery socket — critical for same-host loopback tests
-            // where SO_REUSEPORT would otherwise hash the reply to the
-            // modem's own socket. Routers don't receive multicast (only
-            // unicast offers), so this is also more correct.
-            port: 0,
-            group_port: Some(self.network.discovery_port),
-            // Loopback testing runs router and modem in the same process,
-            // so the kernel must deliver our own multicast sends to our own
-            // receive queue. Production deployments where the modem is on a
-            // separate host wouldn't strictly need this, but leaving it on
-            // simplifies the public API.
-            multicast_loop: true,
-            // Router only sends multicast Peer_Discovery and receives
-            // unicast Peer_Offer; no need to join the discovery group.
-            join_group: false,
-        };
-        let socket =
-            DiscoverySocket::bind_on_interface(&params, &self.network.discovery_interface())?;
+        let socket = self.network.bind_discovery(false)?;
 
         let fsm = RouterDiscoveryFsm::with_config(RouterDiscoveryConfig {
             peer_description: self.peer_description.clone(),

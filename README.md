@@ -22,7 +22,7 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > for the milestone log and remaining follow-ups, and
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
 >
-> Not yet implemented: IPv6 discovery transport, a modem backend that applies
+> Not yet implemented: a modem backend that applies
 > requested link changes. Busy commands return explicit acceptance errors.
 
 ## Goals
@@ -81,7 +81,7 @@ CLI flags shared by both binaries:
 | Flag           | Purpose                                                  |
 |----------------|----------------------------------------------------------|
 | `--config`     | Path to the TOML config file.                            |
-| `--interface`  | Select the IPv4 discovery interface (overrides config).   |
+| `--interface`  | Select the discovery interface (overrides config).        |
 | `--log-level`  | Override `RUST_LOG`-style level (`info`, `debug`, …).    |
 | `--no-tls`     | Force plain TCP regardless of config.                    |
 
@@ -227,7 +227,7 @@ Use `RouterDaemon::connect_discovered(&offer)` to try compatible endpoints;
 TLS-required configurations never fall back to plaintext. Discovery continues
 while sessions are active, allowing additional modems to be found.
 
-`[network].interface` / `--interface` selects IPv4 discovery group membership,
+`[network].interface` / `--interface` selects discovery group membership,
 multicast egress, unicast reply source, and accepted ingress interface. For
 example, `interface = "eth1"` with `bind_addr = "0.0.0.0"` discovers peers on
 eth1 while the modem's TCP listener still binds all addresses. A specific IPv4
@@ -236,11 +236,22 @@ source address. With several addresses and no preference, the lowest IPv4
 address is selected. Without an interface name, a specific IPv4 `bind_addr`
 selects its interface; a wildcard lets the routing table choose.
 
-The interface must exist, be up, and have IPv4 plus multicast support (loopback
-is also supported for testing). `--check-config` and startup validate an explicit
+The interface must exist, be up, and have an address in the selected family
+plus multicast support (loopback is also supported for IPv4 testing). `--check-config` and startup validate an explicit
 name against the current host. Failure to create discovery on a named interface
 fails startup instead of silently disabling discovery. The setting does not bind
-TCP connections to a device; IPv6 discovery remains unimplemented.
+TCP connections to a device.
+
+The `bind_addr` family selects one discovery transport per daemon. For IPv6,
+set `bind_addr = "::"` and `interface = "eth1"` on both peers; this uses
+`discovery_v6_group` (default `ff02::1:7`). A wildcard IPv6 bind requires an
+interface because multicast needs a link scope. A concrete IPv6 address can
+identify its interface without a name, provided it belongs to only one link.
+With no preferred address, discovery prefers a link-local address on that
+interface. Wildcard TCP listeners advertise that unicast address; discovered
+link-local connection points retain their interface scope for TCP. IPv4
+remains the default. Simultaneous discovery over both families is not enabled.
+`DiscoverySocket::recv_with_local` now returns `IpAddr` for the local address.
 
 
 `SessionUp`, `SessionDown`, `Destination`, and `Metrics` events carry a
@@ -266,6 +277,8 @@ unshare --user --map-root-user --net sh -c '
   ip link add dlep-test type dummy
   ip addr add 192.0.2.1/24 dev dlep-test
   ip link set dlep-test up multicast on
+  ip -6 addr add fe80::1/64 dev dlep-test nodad
+  ip -6 addr add fd00::1/64 dev dlep-test nodad
   ip route add default dev dlep-test
   cargo test --workspace --locked
 '

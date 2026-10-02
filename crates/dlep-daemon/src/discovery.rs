@@ -143,7 +143,7 @@ async fn process_actions(
     events_tx: &EventTx,
     timers: &mut DiscoveryTimers,
     timer_tx: &mpsc::Sender<(TimerId, TimerKind)>,
-    local: Option<std::net::Ipv4Addr>,
+    local: Option<std::net::IpAddr>,
 ) -> Result<(), DaemonError> {
     for action in actions {
         match action {
@@ -154,14 +154,20 @@ async fn process_actions(
                     }
                 }
                 SendTarget::Unicast(addr) => {
-                    // IP_PKTINFO identifies the receiving interface's local
-                    // unicast address even when the TCP listener binds ANY.
+                    // Replace wildcard listeners with the selected ingress
+                    // interface's usable unicast address, never a multicast IP.
                     if let Some(local) = local {
                         for item in &mut signal.data_items {
-                            if let dlep_core::DataItem::Ipv4ConnectionPoint { addr, .. } = item {
-                                if addr.is_unspecified() {
-                                    *addr = local;
-                                }
+                            match (item, local) {
+                                (
+                                    dlep_core::DataItem::Ipv4ConnectionPoint { addr, .. },
+                                    std::net::IpAddr::V4(local),
+                                ) if addr.is_unspecified() => *addr = local,
+                                (
+                                    dlep_core::DataItem::Ipv6ConnectionPoint { addr, .. },
+                                    std::net::IpAddr::V6(local),
+                                ) if addr.is_unspecified() => *addr = local,
+                                _ => {}
                             }
                         }
                     }
@@ -205,7 +211,18 @@ async fn process_actions(
                 debug!("discovery task received session-domain action; ignoring");
             }
             FsmAction::Emit(emitted) => {
-                if let Some(evt) = translate(emitted) {
+                if let Some(mut evt) = translate(emitted) {
+                    if let (DaemonEvent::PeerDiscovered(offer), Some(index)) =
+                        (&mut evt, socket.interface_index())
+                    {
+                        for endpoint in &mut offer.endpoints {
+                            if let std::net::SocketAddr::V6(addr) = &mut endpoint.addr {
+                                if addr.ip().is_unicast_link_local() {
+                                    addr.set_scope_id(index);
+                                }
+                            }
+                        }
+                    }
                     let _ = events_tx.send(evt);
                 }
             }

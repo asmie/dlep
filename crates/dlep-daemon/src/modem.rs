@@ -263,7 +263,7 @@ impl ModemBuilder {
         let initial_metrics = cfg.metrics.link_metrics();
         let extensions_for_accept = self.extensions.clone();
 
-        let bind_addr = SocketAddr::new(cfg.shared.network.bind_addr, cfg.shared.network.tcp_port);
+        let bind_addr = cfg.shared.network.tcp_bind_addr()?;
         let socket = if bind_addr.is_ipv6() {
             TcpSocket::new_v6()?
         } else {
@@ -341,32 +341,9 @@ async fn spawn_modem_discovery(
     local_addr: SocketAddr,
     events_tx: EventTx,
 ) -> Result<Option<(mpsc::Sender<()>, JoinHandle<Result<(), DaemonError>>)>, DaemonError> {
-    use std::net::IpAddr;
-
     use dlep_fsm::discovery_modem::ModemDiscoveryFsm;
-    use dlep_net::discovery::{DiscoveryParams, DiscoverySocket};
 
-    let interface_v4 = match cfg.shared.network.bind_addr {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => {
-            return Err(DaemonError::Config(
-                "M6 discovery only supports v4 bind_addr".into(),
-            ));
-        }
-    };
-    let params = DiscoveryParams {
-        group_v4: cfg.shared.network.discovery_v4_group,
-        interface_v4,
-        port: cfg.shared.network.discovery_port,
-        group_port: None,
-        multicast_loop: true,
-        // Modem listens on the multicast group for Peer_Discovery.
-        join_group: true,
-    };
-    let socket = match DiscoverySocket::bind_on_interface(
-        &params,
-        &cfg.shared.network.discovery_interface(),
-    ) {
+    let socket = match cfg.shared.network.bind_discovery(true) {
         Ok(s) => s,
         Err(e) if cfg.shared.network.interface.is_some() => return Err(e.into()),
         Err(e) => {

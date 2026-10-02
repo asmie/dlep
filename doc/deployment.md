@@ -78,12 +78,12 @@ edit with `--check-config`.
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |
 | top level (router) | `static_peers` | `[]` | modem `addr:port` list for static mode |
 | top level | `peer_description` | binary name | Peer Type data item text |
-| `[network]` | `interface` | none | IPv4 discovery interface name: membership, sending, and receive filtering |
+| `[network]` | `interface` | none | Discovery interface name: membership, sending, and receive filtering |
 | `[network]` | `discovery_v4_group` | `224.0.0.117` | IPv4 discovery multicast group |
-| `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (reserved; discovery is IPv4-only today) |
+| `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (used with an IPv6 `bind_addr`) |
 | `[network]` | `discovery_port` | `854` | UDP discovery port |
 | `[network]` | `tcp_port` | `854` | TCP/TLS session port |
-| `[network]` | `bind_addr` | `0.0.0.0` | modem listener bind address |
+| `[network]` | `bind_addr` | `0.0.0.0` | discovery address/family and modem listener bind address |
 | `[network]` | `use_tls` | `true` | TLS for the session transport |
 | `[network]` | `gtsm_enforce` | `true` | Linux TCP minimum-TTL filter and strict reset monitor (`CAP_NET_RAW`); discovery always checks TTL |
 | `[tls]` | `cert` / `key` | none | identity (modem: required; router: mTLS) |
@@ -123,12 +123,32 @@ interface and source address. This uses ordinary IP socket options, without
 an additional capability requirement.
 
 An explicit name is checked against the current host by `--check-config` and at
-startup: the interface must exist, be up, and have usable IPv4 and multicast
-support (loopback is allowed). Socket setup errors for a named interface fail
+startup: the interface must exist, be up, and have a usable address in the
+chosen family and multicast support (loopback is allowed for IPv4 testing). Socket setup errors for a named interface fail
 startup. With no name, a specific IPv4 `bind_addr` selects its interface;
 `0.0.0.0` leaves selection to the kernel routing table. `interface` controls
-discovery only, not TCP device binding. IPv6 discovery is a separate remaining
-feature.
+discovery only, not TCP device binding.
+
+For IPv6 discovery, configure both peers with an IPv6 `bind_addr` and use
+`discovery_v6_group` (default `ff02::1:7`). Each daemon discovers over one family:
+IPv4 with `0.0.0.0`, IPv6 with `::`. For example:
+
+```toml
+[network]
+interface = "eth1"
+bind_addr = "::"
+discovery_v6_group = "ff02::1:7"
+```
+
+An IPv6 wildcard requires `interface`; a concrete address identifies its
+interface if unambiguous. Without a preferred address, a link-local address is
+preferred, then the lowest usable address. The modem replaces a wildcard
+Connection Point with that unicast address, and the router supplies the local
+interface scope when connecting to link-local endpoints. A link-local TCP
+listener also obtains its scope from the interface. Both multicast and unicast
+signals use hop limit 255, with received hop limits checked before FSM input.
+Use a multicast-capable interface for IPv6 discovery; Linux loopback alone does
+not provide the link multicast route.
 
 
 Validate without starting the daemon:
@@ -209,8 +229,8 @@ trace|debug|info|warn|error` or the `DLEP_LOG` env var (add
 | `rustls rejected the TLS material from …` | Cert/key mismatch or corrupt PEM payload; the message names the field and file. |
 | `use_tls = true requires RouterBuilder::with_rustls_client(...)` / `…ModemBuilder::with_rustls_server(...)` | Library embedder didn't supply a rustls config — binaries never hit this. |
 | TLS handshake fails with certificate errors | Modem cert SAN doesn't contain the IP the router dialed, or peers disagree about the CA. |
-| `M6 discovery only supports v4 bind_addr` | Discovery mode with an IPv6 `bind_addr` passes `--check-config` but fails at startup; use an IPv4 `bind_addr` or static mode. |
+| `IPv6 discovery with bind_addr = :: requires an interface` | Set `[network].interface` or `--interface` to the link used for IPv6 discovery. |
 | Session drops and never re-establishes | The router retries after `SessionDown`; inspect connection/TLS errors and verify the offered addresses remain reachable. |
-| `invalid discovery interface` / `has no usable IPv4 address` | Check the interface name, link state, IPv4 assignment, and that a specific `bind_addr` belongs to it. |
+| `invalid discovery interface` / `has no usable IPv4/IPv6 address` | Check the interface name, link state, address assignment, and that a specific `bind_addr` belongs to it. |
 | Discovery finds nothing | Peers more than one hop apart (GTSM), multicast blocked, or wrong `interface`. Try static mode (`--peer`) to isolate. |
 | `permission denied` binding port 854 | See §4. |

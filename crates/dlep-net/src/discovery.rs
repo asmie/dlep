@@ -1,7 +1,7 @@
 //! UDP multicast discovery socket.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 use dlep_core::Signal;
@@ -44,18 +44,28 @@ pub struct DiscoveryParams {
     pub join_group: bool,
 }
 
+/// IPv6 discovery parameters. Interface scope is resolved from the supplied
+/// interface or concrete local address; a wildcard needs an explicit interface.
+#[derive(Clone, Debug)]
+pub struct DiscoveryParamsV6 {
+    pub group: Ipv6Addr,
+    pub local_address: Ipv6Addr,
+    pub port: u16,
+    pub group_port: Option<u16>,
+    pub multicast_loop: bool,
+    pub join_group: bool,
+}
+
 #[derive(Debug)]
 pub struct DiscoverySocket {
     fd: AsyncFd<OwnedFd>,
-    group_v4: Ipv4Addr,
+    group: SocketAddr,
     /// The actual local bind port resolved at bind time (kernel-picked when
     /// `params.port == 0`).
     port: u16,
-    /// Destination port for multicast group sends (`params.group_port`
-    /// falling back to `params.port`).
-    group_port: u16,
     codec: SignalCodec,
     interface: Option<crate::addr::Ipv4Interface>,
+    interface_v6: Option<crate::addr::Ipv6Interface>,
 }
 
 impl DiscoverySocket {
@@ -118,12 +128,63 @@ impl DiscoverySocket {
         let owned = unsafe { OwnedFd::from_raw_fd(raw) };
         Ok(Self {
             fd: AsyncFd::new(owned)?,
-            group_v4: params.group_v4,
+            group: (params.group_v4, params.group_port.unwrap_or(resolved_port)).into(),
             port: resolved_port,
-            group_port: params.group_port.unwrap_or(resolved_port),
             codec: SignalCodec,
             interface,
+            interface_v6: None,
         })
+    }
+
+    /// Bind an IPv6-only discovery socket with explicit multicast scope.
+    pub fn bind_v6(
+        params: &DiscoveryParamsV6,
+        spec: &crate::addr::InterfaceSpec,
+    ) -> io::Result<Self> {
+        let interface = spec.resolve_v6(params.local_address)?;
+        let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_only_v6(true)?;
+        sock.set_reuse_address(true)?;
+        sock.set_reuse_port(true)?;
+        sock.set_nonblocking(true)?;
+        gtsm::set_send_ttl(&sock, true)?;
+        gtsm::enable_recv_ttl(&sock, true)?;
+        nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::Ipv6RecvPacketInfo, &true)?;
+        sock.set_multicast_loop_v6(params.multicast_loop)?;
+        sock.set_multicast_if_v6(interface.index)?;
+        #[cfg(target_os = "linux")]
+        sock.set_multicast_all_v6(false)?;
+        sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, params.port)).into())?;
+        if params.join_group {
+            sock.join_multicast_v6(&params.group, interface.index)?;
+        }
+        let port = sock
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| io::Error::other("missing IPv6 local address"))?
+            .port();
+        let owned: OwnedFd = sock.into();
+        Ok(Self {
+            fd: AsyncFd::new(owned)?,
+            group: SocketAddrV6::new(
+                params.group,
+                params.group_port.unwrap_or(port),
+                0,
+                interface.index,
+            )
+            .into(),
+            port,
+            codec: SignalCodec,
+            interface: None,
+            interface_v6: Some(interface),
+        })
+    }
+
+    /// Interface scope used by connection points advertised over this socket.
+    pub fn interface_index(&self) -> Option<u32> {
+        self.interface
+            .map(|i| i.index)
+            .or_else(|| self.interface_v6.map(|i| i.index))
     }
 
     pub fn local_port(&self) -> u16 {
@@ -136,8 +197,7 @@ impl DiscoverySocket {
     /// `sendto` (which UDP doesn't normally produce) is reported rather
     /// than silently truncated.
     pub async fn send_to_group(&self, signal: &Signal) -> io::Result<()> {
-        let dest = std::net::SocketAddrV4::new(self.group_v4, self.group_port);
-        self.send_v4(signal, dest).await
+        self.send_unicast(signal, self.group).await
     }
 
     /// Send a signal to a specific unicast destination (used for modem
@@ -145,21 +205,20 @@ impl DiscoverySocket {
     /// address comes from the caller (typically the source address of an
     /// inbound Peer_Discovery).
     pub async fn send_unicast(&self, signal: &Signal, dest: SocketAddr) -> io::Result<()> {
-        let SocketAddr::V4(dest_v4) = dest else {
-            return Err(io::Error::other("only v4 unicast is supported in M6"));
-        };
-        self.send_v4(signal, dest_v4).await
-    }
-
-    async fn send_v4(&self, signal: &Signal, dest: std::net::SocketAddrV4) -> io::Result<()> {
+        if dest.is_ipv6() != self.interface_v6.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "discovery destination address family mismatch",
+            ));
+        }
         let bytes = signal
             .encode()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         loop {
             let mut guard = self.fd.writable().await?;
             match guard.try_io(|inner| {
-                use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrIn, sendmsg};
-                let nix_addr = SockaddrIn::from(dest);
+                use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg};
+                let nix_addr = SockaddrStorage::from(dest);
                 let info = self.interface.map(|i| nix::libc::in_pktinfo {
                     ipi_ifindex: i.index as _,
                     ipi_spec_dst: nix::libc::in_addr {
@@ -167,10 +226,17 @@ impl DiscoverySocket {
                     },
                     ipi_addr: nix::libc::in_addr { s_addr: 0 },
                 });
+                let info_v6 = self.interface_v6.map(|i| nix::libc::in6_pktinfo {
+                    ipi6_ifindex: i.index,
+                    ipi6_addr: nix::libc::in6_addr {
+                        s6_addr: i.address.octets(),
+                    },
+                });
                 let controls: Vec<_> = info
                     .as_ref()
                     .map(ControlMessage::Ipv4PacketInfo)
                     .into_iter()
+                    .chain(info_v6.as_ref().map(ControlMessage::Ipv6PacketInfo))
                     .collect();
                 sendmsg(
                     inner.get_ref().as_raw_fd(),
@@ -195,16 +261,16 @@ impl DiscoverySocket {
     }
 
     /// Receive a single signal with its source address and the
-    /// kernel-reported TTL. The TTL comes from an `IP_TTL` cmsg attached
-    /// by the kernel because Task 1 enabled `IP_RECVTTL` on the socket;
-    /// if the cmsg is missing the function returns an error rather than
-    /// guessing (silent guess would defeat GTSM).
+    /// kernel-reported IPv4 TTL or IPv6 hop limit. Missing ancillary data
+    /// is an error; callers must validate the value before processing it.
     pub async fn recv(&self) -> io::Result<(Signal, SocketAddr, u8)> {
         let (signal, from, ttl, _) = self.recv_with_local().await?;
         Ok((signal, from, ttl))
     }
 
-    pub async fn recv_with_local(&self) -> io::Result<(Signal, SocketAddr, u8, Ipv4Addr)> {
+    /// Receive with a usable local unicast address for wildcard Peer Offers.
+    /// IPv6 senders retain their link-local interface scope.
+    pub async fn recv_with_local(&self) -> io::Result<(Signal, SocketAddr, u8, IpAddr)> {
         use bytes::BytesMut;
         use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 
@@ -215,7 +281,7 @@ impl DiscoverySocket {
         // `i32` matches `libc::c_int` on every supported target, keeping
         // `dlep-net` free of an explicit `libc` dep.
         let mut payload = [0u8; 1500];
-        let mut cmsg_space = nix::cmsg_space!(i32, nix::libc::in_pktinfo);
+        let mut cmsg_space = nix::cmsg_space!(i32, nix::libc::in_pktinfo, nix::libc::in6_pktinfo);
 
         loop {
             let mut guard = self.fd.readable().await?;
@@ -230,23 +296,45 @@ impl DiscoverySocket {
                 )
                 .map_err(io::Error::from)?;
                 let bytes_read = res.bytes;
-                let from: SocketAddr = res
+                let mut from: SocketAddr = res
                     .address
                     .and_then(|a| {
-                        a.as_sockaddr_in().map(|s| -> SocketAddr {
-                            std::net::SocketAddrV4::new(s.ip(), s.port()).into()
-                        })
+                        a.as_sockaddr_in()
+                            .map(|s| -> SocketAddr {
+                                std::net::SocketAddrV4::new(s.ip(), s.port()).into()
+                            })
+                            .or_else(|| {
+                                a.as_sockaddr_in6().map(|s| {
+                                    SocketAddrV6::new(s.ip(), s.port(), s.flowinfo(), s.scope_id())
+                                        .into()
+                                })
+                            })
                     })
-                    .ok_or_else(|| io::Error::other("recvmsg without v4 sender"))?;
+                    .ok_or_else(|| io::Error::other("recvmsg without IP sender"))?;
                 let mut ttl: Option<u8> = None;
                 let mut local = None;
                 let mut interface_index = None;
                 for cmsg in res.cmsgs().map_err(io::Error::from)? {
                     if let ControlMessageOwned::Ipv4PacketInfo(info) = cmsg {
-                        local = Some(Ipv4Addr::from(info.ipi_spec_dst.s_addr.to_ne_bytes()));
+                        local = Some(IpAddr::V4(Ipv4Addr::from(
+                            info.ipi_spec_dst.s_addr.to_ne_bytes(),
+                        )));
                         interface_index = Some(info.ipi_ifindex as u32);
                     }
-                    if let ControlMessageOwned::Ipv4Ttl(t) = cmsg {
+                    if let ControlMessageOwned::Ipv6PacketInfo(info) = cmsg {
+                        interface_index = Some(info.ipi6_ifindex);
+                        // IPv6 pktinfo reports the destination (often multicast),
+                        // not a unicast local address as IPv4's ipi_spec_dst does.
+                        local = self.interface_v6.map(|i| IpAddr::V6(i.address));
+                        if let SocketAddr::V6(addr) = &mut from {
+                            if addr.ip().is_unicast_link_local() {
+                                addr.set_scope_id(info.ipi6_ifindex);
+                            }
+                        }
+                    }
+                    if let ControlMessageOwned::Ipv4Ttl(t) | ControlMessageOwned::Ipv6HopLimit(t) =
+                        cmsg
+                    {
                         // TTL is a single byte in the IP header; the kernel
                         // hands it back as `int` (0..=255), so the cast is
                         // lossless.
@@ -259,7 +347,9 @@ impl DiscoverySocket {
                 Ok(Ok((bytes_read, from, ttl_opt, local, interface_index))) => {
                     if self
                         .interface
-                        .is_some_and(|i| Some(i.index) != interface_index)
+                        .map(|i| i.index)
+                        .or_else(|| self.interface_v6.map(|i| i.index))
+                        .is_some_and(|index| Some(index) != interface_index)
                     {
                         // Filter before decode; unrelated interface traffic must
                         // not reach the discovery FSM, even when malformed.
@@ -267,9 +357,7 @@ impl DiscoverySocket {
                         continue;
                     }
                     let ttl = ttl_opt.ok_or_else(|| {
-                        io::Error::other(
-                            "recvmsg returned no IP_TTL cmsg — IP_RECVTTL not enabled?",
-                        )
+                        io::Error::other("recvmsg returned no TTL/hop-limit control message")
                     })?;
                     let buf = BytesMut::from(&payload[..bytes_read]);
                     let signal = self
@@ -280,7 +368,9 @@ impl DiscoverySocket {
                         signal,
                         from,
                         ttl,
-                        local.ok_or_else(|| io::Error::other("missing IP_PKTINFO"))?,
+                        local.ok_or_else(|| {
+                            io::Error::other("missing packet interface information")
+                        })?,
                     ));
                 }
                 Ok(Err(e)) => return Err(e),
@@ -303,6 +393,83 @@ mod tests {
             multicast_loop: true,
             join_group: true,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ipv6_multicast_and_unicast_keep_scope_source_and_hop_limit() {
+        use crate::addr::InterfaceSpec;
+        use dlep_core::SignalType;
+        use std::time::Duration;
+        let spec = InterfaceSpec::ByName("dlep-test".into());
+        let iface = spec
+            .resolve_v6(Ipv6Addr::UNSPECIFIED)
+            .expect("test harness needs IPv6 on dlep-test");
+        assert!(iface.address.is_unicast_link_local());
+        let mut params = DiscoveryParamsV6 {
+            group: "ff02::1:7".parse().unwrap(),
+            local_address: Ipv6Addr::UNSPECIFIED,
+            port: 0,
+            group_port: None,
+            multicast_loop: true,
+            join_group: true,
+        };
+        let modem = DiscoverySocket::bind_v6(&params, &spec).unwrap();
+        params.join_group = false;
+        params.group_port = Some(modem.local_port());
+        let router = DiscoverySocket::bind_v6(&params, &spec).unwrap();
+        // IPv6 pktinfo must reject loopback ingress before decoding, even
+        // though the wildcard UDP socket also receives that traffic.
+        let unrelated = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        unrelated
+            .send_to(b"malformed", (Ipv6Addr::LOCALHOST, modem.local_port()))
+            .unwrap();
+        let discovery = Signal::new(SignalType::PEER_DISCOVERY);
+        router.send_to_group(&discovery).await.unwrap();
+        let (sig, from, hops, local) =
+            tokio::time::timeout(Duration::from_secs(2), modem.recv_with_local())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(sig.signal_type, discovery.signal_type);
+        assert_eq!(hops, 255);
+        assert_eq!(local, iface.address);
+        assert_eq!(
+            from,
+            SocketAddrV6::new(iface.address, router.local_port(), 0, iface.index).into()
+        );
+        let offer = Signal::new(SignalType::PEER_OFFER);
+        modem.send_unicast(&offer, from).await.unwrap();
+        let (sig, from, hops, local) =
+            tokio::time::timeout(Duration::from_secs(2), router.recv_with_local())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(sig.signal_type, offer.signal_type);
+        assert_eq!(hops, 255);
+        assert_eq!(local, iface.address);
+        assert_eq!(
+            from,
+            SocketAddrV6::new(iface.address, modem.local_port(), 0, iface.index).into()
+        );
+        // Receive the actual hop limit, including invalid GTSM values; the
+        // daemon uses this metadata to discard non-255 discovery signals.
+        socket2::SockRef::from(router.fd.get_ref())
+            .set_multicast_hops_v6(254)
+            .unwrap();
+        router.send_to_group(&discovery).await.unwrap();
+        let (_, _, hops) = tokio::time::timeout(Duration::from_secs(2), modem.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hops, 254);
+        assert!(!gtsm::is_gtsm_valid(hops));
+        assert!(
+            router
+                .send_unicast(&discovery, "127.0.0.1:854".parse().unwrap())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

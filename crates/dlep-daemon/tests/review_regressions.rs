@@ -198,7 +198,17 @@ async fn failed_ipv6_start_releases_listening_socket() {
     let reservation = TcpListener::bind("[::1]:0").await.unwrap();
     let addr = reservation.local_addr().unwrap();
     drop(reservation);
+    let occupied = std::net::UdpSocket::bind("[::]:0").unwrap();
     let mut config = modem_config();
+    config.shared.network.discovery_port = occupied.local_addr().unwrap().port();
+    config.shared.network.interface = Some(
+        if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        }
+        .into(),
+    );
     config.shared.network.bind_addr = addr.ip();
     config.shared.network.tcp_port = addr.port();
     assert!(ModemDaemon::builder().config(config).spawn().await.is_err());

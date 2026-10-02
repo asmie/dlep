@@ -15,10 +15,13 @@ mode = "discovery"
 peer_description = "dlep-router"
 
 [network]
-# Interface for IPv4 discovery sending, membership, and receive filtering.
-# Must be up with IPv4. Omit for bind_addr's interface or the default route.
-# A specific bind_addr must belong to this interface; 0.0.0.0 is allowed.
+# Interface for discovery sending, membership, and receive filtering.
+# Must be up with an address in bind_addr's family and support multicast.
+# IPv4: omit for bind_addr's interface or the default route.
+# IPv6: set bind_addr = "::" and interface to use ff02::1:7 discovery.
+# A concrete bind_addr must belong to this interface.
 # interface = "eth0"
+# bind_addr = "0.0.0.0"
 # DLEP well-known port is 854 (UDP for discovery, TCP for the session).
 # Ports below 1024 need CAP_NET_BIND_SERVICE — see doc/deployment.md.
 discovery_port = 854

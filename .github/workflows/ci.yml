@@ -49,6 +49,8 @@ jobs:
               ip link add dlep-test type dummy
               ip addr add 192.0.2.1/24 dev dlep-test
               ip link set dlep-test up multicast on
+              ip -6 addr add fe80::1/64 dev dlep-test nodad
+              ip -6 addr add fd00::1/64 dev dlep-test nodad
               ip route add default dev dlep-test
               cargo test --workspace --locked --offline
             '

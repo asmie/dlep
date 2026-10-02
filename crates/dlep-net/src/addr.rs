@@ -29,7 +29,87 @@ pub struct Ipv4Interface {
     pub address: std::net::Ipv4Addr,
 }
 
+/// A usable IPv6 unicast address and its interface scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv6Interface {
+    pub index: u32,
+    pub address: std::net::Ipv6Addr,
+}
+
 impl InterfaceSpec {
+    /// Resolve IPv6 multicast scope and a usable local unicast address.
+    /// A wildcard address needs an explicit interface: link-local multicast
+    /// has no meaningful default route across multiple links. Prefer a
+    /// link-local address unless the caller supplies a concrete address.
+    pub fn resolve_v6(&self, preferred: std::net::Ipv6Addr) -> std::io::Result<Ipv6Interface> {
+        use nix::{
+            ifaddrs::getifaddrs,
+            net::if_::{InterfaceFlags, if_nametoindex},
+        };
+        use std::io::{Error, ErrorKind};
+        let requested_index = match self {
+            Self::ByName(name) => Some(if_nametoindex(name.as_str()).map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid discovery interface {name:?}: {e}"),
+                )
+            })?),
+            Self::ByIndex(0) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "interface index must not be zero",
+                ));
+            }
+            Self::ByIndex(index) => Some(*index),
+            Self::Any if preferred.is_unspecified() => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "IPv6 discovery with bind_addr = :: requires an interface",
+                ));
+            }
+            Self::Any => None,
+        };
+        let mut candidates = Vec::new();
+        for entry in getifaddrs()? {
+            let Some(address) = entry
+                .address
+                .and_then(|a| a.as_sockaddr_in6().map(|a| a.ip()))
+            else {
+                continue;
+            };
+            let index = if_nametoindex(entry.interface_name.as_str())?;
+            if requested_index.is_some_and(|wanted| wanted != index)
+                || (!preferred.is_unspecified() && address != preferred)
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.to_ipv4_mapped().is_some()
+                || !entry.flags.contains(InterfaceFlags::IFF_UP)
+                || !entry
+                    .flags
+                    .intersects(InterfaceFlags::IFF_MULTICAST | InterfaceFlags::IFF_LOOPBACK)
+            {
+                continue;
+            }
+            candidates.push(Ipv6Interface { index, address });
+        }
+        candidates.sort_by_key(|i| (!i.address.is_unicast_link_local(), i.index, i.address));
+        let chosen = candidates.first().copied().ok_or_else(|| {
+            Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!(
+                    "discovery interface {self:?} has no usable IPv6 address matching {preferred}"
+                ),
+            )
+        })?;
+        if requested_index.is_none() && candidates.iter().any(|i| i.index != chosen.index) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "IPv6 address exists on multiple interfaces; specify interface",
+            ));
+        }
+        Ok(chosen)
+    }
+
     /// Resolve an interface and optional preferred local address. `Any` with
     /// an unspecified address leaves interface selection to the routing table.
     /// A supplied address must belong to the selected interface. Multiple
@@ -97,6 +177,42 @@ impl InterfaceSpec {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn ipv6_interface_resolution_validates_scope_and_ownership() {
+        use std::net::Ipv6Addr;
+        let resolved = InterfaceSpec::Any.resolve_v6(Ipv6Addr::LOCALHOST).unwrap();
+        assert_eq!(
+            InterfaceSpec::ByIndex(resolved.index)
+                .resolve_v6(Ipv6Addr::UNSPECIFIED)
+                .unwrap(),
+            resolved
+        );
+        let name = nix::net::if_::if_indextoname(resolved.index).unwrap();
+        assert_eq!(
+            InterfaceSpec::ByName(name.to_string_lossy().into_owned())
+                .resolve_v6(Ipv6Addr::LOCALHOST)
+                .unwrap(),
+            resolved
+        );
+        assert!(
+            InterfaceSpec::Any
+                .resolve_v6(Ipv6Addr::UNSPECIFIED)
+                .is_err()
+        );
+        assert!(
+            InterfaceSpec::ByIndex(resolved.index)
+                .resolve_v6("2001:db8::1".parse().unwrap())
+                .is_err()
+        );
+        for spec in [
+            InterfaceSpec::ByName("dlep-no-such-if".into()),
+            InterfaceSpec::ByIndex(0),
+            InterfaceSpec::ByIndex(u32::MAX),
+        ] {
+            assert!(spec.resolve_v6(Ipv6Addr::UNSPECIFIED).is_err());
+        }
+    }
 
     #[test]
     fn unspecified_interface_preserves_route_selection() {

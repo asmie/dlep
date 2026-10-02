@@ -7,13 +7,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Discovery interface name. Selects IPv4 membership, egress, and ingress.
+    /// Discovery interface name. Selects discovery membership, egress, and ingress.
     pub interface: Option<String>,
     pub discovery_v4_group: Ipv4Addr,
     pub discovery_v6_group: Ipv6Addr,
     pub discovery_port: u16,
     pub tcp_port: u16,
-    /// Address the modem's TCP listener binds to. Defaults to `0.0.0.0`
+    /// Address the modem's TCP listener binds to; its family also selects
+    /// discovery transport for both roles. Defaults to `0.0.0.0`
     /// (all interfaces); tests pin this to `127.0.0.1` so they don't rely on
     /// the OS-specific behaviour of `connect("0.0.0.0:N")`.
     #[serde(default = "default_bind_addr")]
@@ -32,19 +33,61 @@ impl NetworkConfig {
             })
     }
 
-    /// Validate an explicit interface without opening a privileged socket.
-    /// IPv6 discovery is not implemented yet.
+    /// Validate interface selection and IPv6 scope without opening a socket.
     pub fn validate_discovery_interface(&self) -> std::io::Result<()> {
-        if self.interface.is_some() {
-            let IpAddr::V4(preferred) = self.bind_addr else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "IPv4 discovery requires an IPv4 bind_addr",
-                ));
-            };
-            self.discovery_interface().resolve_v4(preferred)?;
+        match self.bind_addr {
+            IpAddr::V4(preferred) if self.interface.is_some() => {
+                self.discovery_interface().resolve_v4(preferred)?;
+            }
+            IpAddr::V6(preferred) => {
+                self.discovery_interface().resolve_v6(preferred)?;
+            }
+            _ => {}
         }
         Ok(())
+    }
+    /// Create discovery for the configured family. Routers use an ephemeral
+    /// port and receive unicast offers; only modems join the multicast group.
+    pub(crate) fn bind_discovery(
+        &self,
+        modem: bool,
+    ) -> std::io::Result<dlep_net::discovery::DiscoverySocket> {
+        use dlep_net::discovery::{DiscoveryParams, DiscoveryParamsV6, DiscoverySocket};
+        let port = if modem { self.discovery_port } else { 0 };
+        match self.bind_addr {
+            IpAddr::V4(local) => DiscoverySocket::bind_on_interface(
+                &DiscoveryParams {
+                    group_v4: self.discovery_v4_group,
+                    interface_v4: local,
+                    port,
+                    group_port: Some(self.discovery_port),
+                    multicast_loop: true,
+                    join_group: modem,
+                },
+                &self.discovery_interface(),
+            ),
+            IpAddr::V6(local) => DiscoverySocket::bind_v6(
+                &DiscoveryParamsV6 {
+                    group: self.discovery_v6_group,
+                    local_address: local,
+                    port,
+                    group_port: Some(self.discovery_port),
+                    multicast_loop: true,
+                    join_group: modem,
+                },
+                &self.discovery_interface(),
+            ),
+        }
+    }
+
+    pub(crate) fn tcp_bind_addr(&self) -> std::io::Result<SocketAddr> {
+        let mut addr = SocketAddr::new(self.bind_addr, self.tcp_port);
+        if let SocketAddr::V6(ref mut v6) = addr {
+            if v6.ip().is_unicast_link_local() {
+                v6.set_scope_id(self.discovery_interface().resolve_v6(*v6.ip())?.index);
+            }
+        }
+        Ok(addr)
     }
 }
 
