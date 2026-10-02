@@ -234,6 +234,14 @@ and reconnection. The example units use `KillSignal=SIGTERM` explicitly.
 Keep systemd's `TimeoutStopSec` longer than the configured termination timeout
 plus the transport write timeout (5 seconds), allowing scheduling overhead.
 
+After a session drops, the router binary waits 1 second before retrying, then
+doubles the delay after unsuccessful retries, up to 30 seconds. Opening TCP
+suspends further attempts while DLEP initialization is pending; it does not
+clear the failure history. Rejection or failure during initialization resumes
+the retained delay from `SessionDown`. Successful DLEP initialization resets
+it. Discovery offers do not bypass the delay for that endpoint; new endpoints
+remain eligible for connection.
+
 ## 7. Troubleshooting
 
 | Symptom | Cause / fix |

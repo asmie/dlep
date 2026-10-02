@@ -231,6 +231,11 @@ Use `RouterDaemon::connect_discovered(&offer)` to try compatible endpoints;
 TLS-required configurations never fall back to plaintext. Discovery continues
 while sessions are active, allowing additional modems to be found.
 
+The router binary retries dropped sessions with exponential backoff (1 second,
+doubling to a 30-second cap). TCP connection success preserves that retry
+history while DLEP initialization is pending; only `SessionUp` resets it.
+Repeated discovery offers for a queued endpoint do not bypass the delay.
+
 `[network].interface` / `--interface` selects discovery group membership,
 multicast egress, unicast reply source, and accepted ingress interface. For
 example, `interface = "eth1"` with `bind_addr = "0.0.0.0"` discovers peers on

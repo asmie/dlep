@@ -175,17 +175,16 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
             _ = &mut retry_tick => {
                 for peer in reconnect.take_due(Instant::now()) {
                     if connected.contains(&peer) {
-                        // Discovery already re-established this one.
-                        reconnect.forget(&peer);
+                        // An initialization is already in flight. Preserve its
+                        // failure history until SessionUp confirms success.
+                        reconnect.suspend(&peer);
                         continue;
                     }
                     tracing::info!(addr = %peer, "reconnecting to modem");
                     match daemon.connect_static(peer).await {
                         Ok(()) => {
                             connected.insert(peer);
-                            // Drop it from the queue so a deadline firing
-                            // before SessionUp can't open a second session.
-                            reconnect.forget(&peer);
+                            reconnect.suspend(&peer);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -197,10 +196,15 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                 }
             }
             evt = events.recv() => match evt {
-                Ok(DaemonEvent::PeerDiscovered(offer)) => {
+                Ok(DaemonEvent::PeerDiscovered(mut offer)) => {
                     if offer.endpoints.iter().any(|e| connected.contains(&e.addr)) { continue; }
+                    // The retry queue owns endpoints with a failure history.
+                    // Repeated offers must not bypass their backoff; new
+                    // endpoints in the same offer remain eligible.
+                    offer.endpoints.retain(|e| !reconnect.contains(&e.addr));
+                    if offer.endpoints.is_empty() { continue; }
                     match daemon.connect_discovered(&offer).await {
-                        Ok(addr) => { connected.insert(addr); reconnect.forget(&addr); }
+                        Ok(addr) => { connected.insert(addr); }
                         Err(e) => tracing::warn!(error = %e, "offer endpoints failed; discovery will retry"),
                     }
                 }
@@ -246,7 +250,8 @@ struct ReconnectQueue {
 struct ReconnectEntry {
     /// Attempts already handed out by `take_due`.
     attempts: u32,
-    due: Instant,
+    /// None while TCP is open but DLEP initialization is still pending.
+    due: Option<Instant>,
 }
 
 impl ReconnectQueue {
@@ -261,24 +266,32 @@ impl ReconnectQueue {
 
     /// Queue a dropped peer. A peer already queued keeps its accumulated
     /// backoff, so a flapping modem cannot rewind itself to the base delay by
-    /// dropping repeatedly.
+    /// dropping repeatedly. A failed initialization resumes the retained
+    /// backoff from the time SessionDown is received.
     fn schedule(&mut self, addr: SocketAddr, now: Instant) {
-        self.entries.entry(addr).or_insert_with(|| ReconnectEntry {
-            attempts: 0,
-            due: now + Self::backoff_for(0),
-        });
+        self.entries
+            .entry(addr)
+            .and_modify(|entry| {
+                if entry.due.is_none() {
+                    entry.due = Some(now + Self::backoff_for(entry.attempts));
+                }
+            })
+            .or_insert_with(|| ReconnectEntry {
+                attempts: 0,
+                due: Some(now + Self::backoff_for(0)),
+            });
     }
 
     /// Hand back every peer whose delay has elapsed, re-arming each at the
-    /// next backoff step. A caller that reconnects successfully calls
-    /// [`Self::forget`]; one that fails need do nothing, since the peer is
-    /// already scheduled for another try.
+    /// next backoff step. TCP success suspends retries while initialization
+    /// runs; only SessionUp clears the history. Connect failures leave the
+    /// next retry armed.
     fn take_due(&mut self, now: Instant) -> Vec<SocketAddr> {
         let mut due: Vec<SocketAddr> = Vec::new();
         for (addr, entry) in self.entries.iter_mut() {
-            if entry.due <= now {
+            if entry.due.is_some_and(|due| due <= now) {
                 entry.attempts = entry.attempts.saturating_add(1);
-                entry.due = now + Self::backoff_for(entry.attempts);
+                entry.due = Some(now + Self::backoff_for(entry.attempts));
                 due.push(*addr);
             }
         }
@@ -293,9 +306,20 @@ impl ReconnectQueue {
         self.entries.remove(addr);
     }
 
+    /// Retain attempts without a runnable deadline during initialization.
+    fn suspend(&mut self, addr: &SocketAddr) {
+        if let Some(entry) = self.entries.get_mut(addr) {
+            entry.due = None;
+        }
+    }
+
+    fn contains(&self, addr: &SocketAddr) -> bool {
+        self.entries.contains_key(addr)
+    }
+
     /// Earliest pending deadline, for sizing the event loop's sleep.
     fn next_due(&self) -> Option<Instant> {
-        self.entries.values().map(|e| e.due).min()
+        self.entries.values().filter_map(|e| e.due).min()
     }
 }
 
@@ -466,13 +490,46 @@ mod tests {
     }
 
     #[test]
+    fn pending_initialization_retains_history_without_a_retry_deadline() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        q.schedule(addr(1), now);
+        assert_eq!(q.take_due(now + RECONNECT_BASE), vec![addr(1)]);
+        q.suspend(&addr(1));
+        assert!(
+            q.contains(&addr(1)),
+            "offers must not bypass a pending retry"
+        );
+        assert!(q.next_due().is_none());
+        let later = now + Duration::from_secs(60);
+        assert!(q.take_due(later).is_empty());
+        q.schedule(addr(1), later);
+        assert!(q.take_due(later + RECONNECT_BASE).is_empty());
+        assert_eq!(q.take_due(later + Duration::from_secs(2)), vec![addr(1)]);
+    }
+
+    #[test]
+    fn pending_initialization_does_not_block_another_peers_retry() {
+        let now = Instant::now();
+        let mut q = ReconnectQueue::default();
+        q.schedule(addr(1), now);
+        q.schedule(addr(2), now);
+        let first = now + RECONNECT_BASE;
+        assert_eq!(q.take_due(first), vec![addr(1), addr(2)]);
+        q.suspend(&addr(1));
+        assert_eq!(q.next_due(), Some(first + Duration::from_secs(2)));
+        assert_eq!(q.take_due(first + Duration::from_secs(2)), vec![addr(2)]);
+    }
+
+    #[test]
     fn a_peer_reconnected_then_dropped_again_restarts_at_the_base_delay() {
         let now = Instant::now();
         let mut q = ReconnectQueue::default();
         q.schedule(addr(1), now);
         let first = now + RECONNECT_BASE;
         assert_eq!(q.take_due(first), vec![addr(1)]);
-        // Session came back up, so the queue forgets the peer entirely...
+        // TCP alone retains the history; SessionUp clears it.
+        q.suspend(&addr(1));
         q.forget(&addr(1));
         // ...and a later drop is a fresh incident, not attempt #2.
         q.schedule(addr(1), first);
@@ -504,5 +561,184 @@ mod interface_tests {
             config.shared.network.interface.as_deref(),
             Some("selected0")
         );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_runtime_tests {
+    use super::*;
+    use dlep_core::{DataItem, Message, MessageType, StatusCode};
+    use dlep_daemon::PeerOffer;
+    use dlep_fsm::{
+        FsmAction, FsmEvent, discovery_common::OfferEndpoint, session_modem::ModemSessionFsm,
+    };
+    use std::sync::Arc;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        time::timeout,
+    };
+
+    const WAIT: Duration = Duration::from_secs(3);
+
+    async fn read_message(peer: &mut TcpStream) -> Message {
+        timeout(WAIT, async {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).await.unwrap();
+            let mut bytes = header.to_vec();
+            bytes.resize(4 + u16::from_be_bytes([header[2], header[3]]) as usize, 0);
+            peer.read_exact(&mut bytes[4..]).await.unwrap();
+            Message::decode(bytes.into()).unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn lifecycle(events: &mut Receiver<DaemonEvent>, up: bool) {
+        timeout(WAIT, async {
+            loop {
+                match events.recv().await.unwrap() {
+                    DaemonEvent::SessionUp { .. } if up => break,
+                    DaemonEvent::SessionDown { .. } if !up => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn initialize(peer: &mut TcpStream, reject: bool) {
+        let init = read_message(peer).await;
+        assert_eq!(init.message_type, MessageType::SESSION_INITIALIZATION);
+        let mut modem = ModemSessionFsm::new();
+        modem.step(FsmEvent::TcpAccepted);
+        let mut response = modem
+            .step(FsmEvent::RecvMessage(init))
+            .into_iter()
+            .find_map(|a| {
+                if let FsmAction::SendMessage(message) = a {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        if reject {
+            for item in &mut response.data_items {
+                if let DataItem::Status { code, .. } = item {
+                    *code = StatusCode::REQUEST_DENIED;
+                }
+            }
+        }
+        peer.write_all(&response.encode().unwrap()).await.unwrap();
+        if reject {
+            assert_eq!(
+                read_message(peer).await.message_type,
+                MessageType::SESSION_TERMINATION
+            );
+            peer.write_all(
+                &Message::new(MessageType::SESSION_TERMINATION_RESPONSE)
+                    .encode()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_sessions_back_off_despite_offers_and_success_resets_delay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(config)
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let mut observed = daemon.subscribe();
+        let mut live_events = daemon.subscribe();
+        let (inject, mut events) = tokio::sync::broadcast::channel(128);
+        let mut tasks = tokio::task::JoinSet::new();
+        let forward = inject.clone();
+        // Forward actual daemon lifecycle events; inject repeated offers as an
+        // independently timed discovery source would, without mocking sessions.
+        tasks.spawn(async move {
+            while let Ok(event) = live_events.recv().await {
+                forward.send(event).unwrap();
+            }
+        });
+        let driver = daemon.clone();
+        tasks.spawn(async move {
+            run_event_loop(&driver, &mut events).await;
+        });
+
+        daemon.connect_static(addr).await.unwrap();
+        let (mut peer, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        initialize(&mut peer, true).await;
+        lifecycle(&mut observed, false).await;
+        let mut failed_at = Instant::now();
+        drop(peer);
+        tasks.spawn(async move {
+            loop {
+                // Frequent offers used to re-dial immediately during backoff.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let _ = inject.send(DaemonEvent::PeerDiscovered(PeerOffer {
+                    endpoints: vec![OfferEndpoint {
+                        addr,
+                        use_tls: false,
+                    }],
+                    peer_description: Some("rejecting-modem".into()),
+                }));
+            }
+        });
+
+        for (seconds, reject) in [(1, true), (2, true), (4, false)] {
+            let delay = Duration::from_secs(seconds);
+            let (mut peer, _) = timeout(delay + WAIT, listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                failed_at.elapsed() >= delay - Duration::from_millis(100),
+                "expected {delay:?} backoff, got {:?}",
+                failed_at.elapsed()
+            );
+            initialize(&mut peer, reject).await;
+            if reject {
+                lifecycle(&mut observed, false).await;
+                failed_at = Instant::now();
+            } else {
+                lifecycle(&mut observed, true).await;
+                // Offers must not open duplicates after successful initialization.
+                assert!(
+                    timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+                drop(peer);
+                lifecycle(&mut observed, false).await;
+                failed_at = Instant::now();
+            }
+        }
+        // A genuinely established session resets the accumulated 8 s delay.
+        let (peer, _) = timeout(WAIT, listener.accept())
+            .await
+            .expect("SessionUp did not reset backoff")
+            .unwrap();
+        assert!(failed_at.elapsed() >= RECONNECT_BASE - Duration::from_millis(100));
+        drop(peer);
+        tasks.shutdown().await;
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 }

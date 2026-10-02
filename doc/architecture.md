@@ -521,6 +521,20 @@ The order of work was:
     discovery resends and shutdown under ongoing low-TTL and malformed on-link
     traffic.
 
+21. Reconnect backoff through initialization. **Done** — TCP success suspends
+    an endpoint's retry deadline while retaining its attempt count. Only
+    `SessionUp` clears the history; `SessionDown` after failed initialization
+    resumes the retained delay from the failure time. Pending entries do not
+    wake the retry loop or prevent other endpoints from retrying. Discovery
+    offers skip endpoints already owned by the retry queue, preserving backoff
+    while leaving newly advertised endpoints eligible.
+
+    Queue tests cover suspended deadlines, delayed initialization failures,
+    independent peers, and reset after establishment. A real TCP regression
+    drives the router event loop against repeated initialization refusals and
+    frequent discovery offers, verifies 1-, 2-, and 4-second retry delays, then
+    confirms successful establishment resets the next retry to 1 second.
+
 ---
 
 ## 10. Open questions / risks
