@@ -81,6 +81,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
 
+  release:
+    name: release packages and CLI smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Online mode is needed for Cargo's temporary registry checksum lookup.
+      # This builds archives and verifies them without publishing anything.
+      - run: cargo package --workspace --locked
+      - run: python3 .github/scripts/check-release-packages.py
+      - name: Exercise installed release commands with strict GTSM
+        run: |
+          sudo env "PATH=$PATH" bash .github/scripts/test-network.sh \
+            python3 .github/scripts/release-smoke.py --bin-dir target/release-install/bin
+
   macos:
     name: macOS portable protocol crates
     runs-on: macos-latest

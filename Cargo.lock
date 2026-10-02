@@ -218,8 +218,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlep"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dlep-modem",
+ "dlep-router",
+ "tokio",
+]
+
+[[package]]
 name = "dlep-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "ipnet",
@@ -229,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "dlep-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dlep-core",
@@ -249,14 +260,14 @@ dependencies = [
 
 [[package]]
 name = "dlep-ext"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dlep-core",
 ]
 
 [[package]]
 name = "dlep-fsm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dlep-core",
@@ -267,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "dlep-modem"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -287,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "dlep-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dlep-core",
@@ -305,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "dlep-router"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

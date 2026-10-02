@@ -1,4 +1,4 @@
-#[path = "../../../tests/support/config.rs"]
+#[path = "support/config.rs"]
 mod support;
 
 #[test]

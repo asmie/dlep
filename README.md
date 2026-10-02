@@ -71,6 +71,22 @@ local commands, coverage artifacts, and the guarded audit exception.
 
 ## Run
 
+Version **0.2.0** provides a combined launcher and separate role-specific CLIs:
+
+```bash
+cargo install dlep --version 0.2.0 --locked
+dlep router --help
+dlep modem --help
+# Alternatively:
+cargo install dlep-router dlep-modem --version 0.2.0 --locked
+```
+
+For a source checkout, `cargo build --release --workspace --locked` builds all
+three commands. `dlep router` and `dlep modem` run the same implementations as
+the standalone binaries, with identical flags. The published 0.1.0 `dlep`
+command was a placeholder; see [release notes](CHANGELOG.md) and the
+[release validation guide](doc/releasing.md).
+
 Provision certificates and install the binaries with the capabilities described
 in the [deployment guide](doc/deployment.md) before using the example configs.
 Both binaries take a TOML configuration file:
@@ -88,10 +104,17 @@ CLI flags shared by both binaries:
 | `--interface`  | Select the discovery interface (overrides config).        |
 | `--log-level`  | Override the `DLEP_LOG` filter (`info`, `debug`, …).       |
 | `--no-tls`     | Force plain TCP regardless of config.                    |
+| `--cert`, `--key` | Override the TLS identity files.                     |
+| `--ca-bundle` | Override the trusted CA bundle.                          |
+| `--check-config` | Validate configuration and TLS material, then exit.   |
+| `--help` / `-h` | Show options without starting networking.              |
+| `--version` / `-V` | Show the installed version.                         |
 
 Logging precedence is `--log-level`, then `DLEP_LOG`, then `info`; `RUST_LOG`
-is not read. TLS paths, `--check-config`, and router-only `--peer` flags are
-listed in the [deployment guide](doc/deployment.md#3-configuration).
+is not read. `--config` also accepts `-c` and the role-specific
+`DLEP_ROUTER_CONFIG` / `DLEP_MODEM_CONFIG` environment variable; an explicit flag
+wins. Router-only `--peer ADDR` is repeatable and selects static connections.
+See the [deployment guide](doc/deployment.md#3-configuration) for details.
 
 A minimal plaintext development configuration for either role (select an
 interface present on your host):

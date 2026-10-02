@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["dlep", "rfc8175", "network", "routing"]
+categories = ["network-programming"]
 
 [[bin]]
 name = "dlep-router"

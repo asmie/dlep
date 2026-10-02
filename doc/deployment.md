@@ -9,6 +9,22 @@ and unit files live in [`examples/`](../examples/).
 Requires Linux and Rust 1.85+ (edition 2024). macOS CI covers the portable
 protocol crates, not the daemon transport. See [CI documentation](../.github/README.md).
 
+Install version 0.2.0 from crates.io after publication:
+
+```bash
+cargo install dlep-router dlep-modem --version 0.2.0 --locked
+```
+
+Alternatively, `cargo install dlep --version 0.2.0 --locked` installs a single
+launcher: `dlep router ...` and `dlep modem ...` accept all the corresponding
+standalone flags and run in-process. When granting capabilities to this combined
+binary, grant `cap_net_raw,cap_net_bind_service=ep` to the installed `dlep` path
+if it will run the modem on port 854. The supplied systemd units use the
+standalone executables. Cargo installs into `$CARGO_HOME/bin` (normally
+`$HOME/.cargo/bin`); copy binaries to `/usr/local/bin` if using those units.
+
+To build from a source checkout:
+
 ```bash
 cargo build --release --workspace --locked
 sudo install -m 0755 target/release/dlep-router target/release/dlep-modem /usr/local/bin/

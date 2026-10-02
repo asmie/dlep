@@ -1,9 +1,31 @@
+[package]
+name = "dlep"
+description = "DLEP (RFC 8175) router and modem daemons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["dlep", "rfc8175", "network", "routing"]
+categories = ["network-programming", "command-line-utilities"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+dlep-router = { path = "crates/dlep-router", version = "0.2.0" }
+dlep-modem = { path = "crates/dlep-modem", version = "0.2.0" }
+
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+default-members = [".", "crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["Piotr Olszewski <asmie@asmie.pl>"]
@@ -50,8 +72,8 @@ toml = "0.8"
 anyhow = "1.0.103"
 
 # internal crates
-dlep-core = { path = "crates/dlep-core", version = "0.1.0" }
-dlep-fsm = { path = "crates/dlep-fsm", version = "0.1.0" }
-dlep-net = { path = "crates/dlep-net", version = "0.1.0" }
-dlep-ext = { path = "crates/dlep-ext", version = "0.1.0" }
-dlep-daemon = { path = "crates/dlep-daemon", version = "0.1.0" }
+dlep-core = { path = "crates/dlep-core", version = "0.2.0" }
+dlep-fsm = { path = "crates/dlep-fsm", version = "0.2.0" }
+dlep-net = { path = "crates/dlep-net", version = "0.2.0" }
+dlep-ext = { path = "crates/dlep-ext", version = "0.2.0" }
+dlep-daemon = { path = "crates/dlep-daemon", version = "0.2.0" }

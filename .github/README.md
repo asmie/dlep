@@ -6,6 +6,12 @@ of the portable crates, and instrumented Linux tests. Cargo commands use the
 committed lockfile. Jobs have read-only repository permissions and deadlines;
 new pushes cancel obsolete runs for the same branch or pull request.
 
+The release job verifies all crates.io archives, compiles their test targets in
+an isolated extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
+under `target/release-install`, then checks every CLI flag and four local
+plaintext/mutual-TLS session scenarios in a disposable network namespace.
+It does not publish packages. See [release checks](../doc/releasing.md).
+
 The formatting job installs actionlint 1.7.12 from the official Linux x86-64
 release with a pinned SHA-256 checksum; `taiki-e/install-action` does not support
 this Go tool. Update the version and checksum together. The job also checks

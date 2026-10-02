@@ -505,8 +505,8 @@ mod tests {
             let decoded: T = toml::from_str(&serialized).unwrap();
             assert_eq!(toml::to_string(&decoded).unwrap(), serialized);
         }
-        roundtrip::<RouterConfig>(include_str!("../../../examples/router.toml"));
-        roundtrip::<ModemConfig>(include_str!("../../../examples/modem.toml"));
+        roundtrip::<RouterConfig>(include_str!("../examples/router.toml"));
+        roundtrip::<ModemConfig>(include_str!("../examples/modem.toml"));
         roundtrip::<RouterConfig>(
             "mode = 'static'\nstatic_peers = ['[::1]:854']\npeer_description = 'router ü'\n[network]\nbind_addr = '::1'\n[timers]\nheartbeat_interval_ms = 2000\n[tls]\nrequire_client_cert = true",
         );

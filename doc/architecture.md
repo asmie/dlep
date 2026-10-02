@@ -32,11 +32,13 @@ The implementation deliberately does **not** aim to:
 
 ## 3. Workspace layout
 
-The repository is a Cargo workspace with seven crates under `crates/`:
+The repository is a Cargo workspace with the root `dlep` launcher and seven
+component crates under `crates/`, all released together as version 0.2.0:
 
 ```
 dlep/
-├── Cargo.toml                   workspace manifest
+├── Cargo.toml                   launcher + workspace manifest
+├── src/main.rs                  dlep router / dlep modem dispatch
 ├── crates/
 │   ├── dlep-core/               wire types, data items, byte-level codec
 │   ├── dlep-fsm/                state machines (no I/O, no tokio)
@@ -60,6 +62,8 @@ dlep-modem  ─┘                ├─→ dlep-net ─┼─→ dlep-core
 ```
 
 `dlep-core` is the leaf; it has no internal dependencies and is intentionally minimal so it stays cheap to compile and to publish.
+The root launcher depends on both role packages and calls their CLI entry points
+in-process. It does not locate or spawn separately installed executables.
 
 ---
 
@@ -152,7 +156,10 @@ before a successful restart.
 
 ### 4.6 `dlep-router` and `dlep-modem`
 
-Thin binaries. Each one:
+Each package exposes a `run_from` CLI entry point in `src/lib.rs`, called by its
+thin Tokio `src/main.rs` wrapper or the combined `dlep` launcher. These entry
+points register process-wide logging/signals and should run once per process;
+embedders should use `dlep-daemon` instead. Each role:
 
 1. Parses CLI flags via `clap` (`--config`, `--interface`, `--log-level`,
    `--no-tls`, `--cert`, `--key`, `--ca-bundle`, `--check-config`; the

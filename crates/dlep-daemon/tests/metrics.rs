@@ -48,8 +48,7 @@ async fn event(
 
 #[test]
 fn toml_metrics_parse_units_and_validate_ranges() {
-    let example: ModemConfig =
-        toml::from_str(include_str!("../../../examples/modem.toml")).unwrap();
+    let example: ModemConfig = toml::from_str(include_str!("../examples/modem.toml")).unwrap();
     example.metrics.validate().unwrap();
     let c: ModemConfig = toml::from_str(
         r#"

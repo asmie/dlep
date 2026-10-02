@@ -1,5 +1,5 @@
 #![cfg(unix)]
-#[path = "../../../tests/support/shutdown.rs"]
+#[path = "support/shutdown.rs"]
 mod support;
 use nix::sys::signal::Signal;
 use support::Role;
