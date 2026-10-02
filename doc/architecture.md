@@ -141,6 +141,15 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 | `shutdown.rs` | Opt-in SIGINT/SIGTERM registration shared by the binaries; registering before networking retains shutdown requests during startup. Embedders manage their own signal policy. |
 | `lib.rs` | The public re-export surface. |
 
+Discovery send errors leave the task running for later probes or requests.
+Receive socket errors back off for 100 ms without blocking probe timers or
+shutdown. Explicit shutdown and closure of the shutdown channel both stop the
+task and cancel its timers. Paused-time tests inject send/receive failures at
+a private I/O boundary while driving the production FSMs and runtime. A real
+UDP bind-conflict test verifies best-effort modem discovery with usable static
+DLEP sessions, fatal failure for a named interface, and TCP-listener cleanup
+before a successful restart.
+
 ### 4.6 `dlep-router` and `dlep-modem`
 
 Thin binaries. Each one:
@@ -336,8 +345,8 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
-The last validated suite contains **422 passing tests**, including the monitor
-failure and IPv6 extension-parser regressions. The earlier 389-test coverage run measured
+The last validated suite contains **427 passing tests**, including monitor,
+IPv6 extension-parser, and discovery failure regressions. The earlier 389-test coverage run measured
 **94.3% lines, 93.3% regions, and 94.5% functions**; these are a snapshot,
 not a conformance score or a coverage gate. Coverage was not recollected for
 this checkpoint. Reports are produced on each CI run.

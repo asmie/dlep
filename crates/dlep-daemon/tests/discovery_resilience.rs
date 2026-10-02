@@ -153,3 +153,68 @@ async fn router_accepts_offers_resends_and_stops_under_bad_ttl_traffic() {
 async fn router_accepts_offers_resends_and_stops_under_malformed_on_link_traffic() {
     router_survives_junk(255).await;
 }
+
+#[tokio::test]
+async fn occupied_discovery_port_preserves_static_mode_or_cleans_up_failed_startup() {
+    use dlep_daemon::{DaemonError, ModemConfig, ModemDaemon, RouterConfig, RouterDaemon};
+
+    // No SO_REUSEADDR: this socket must exclude the modem's wildcard bind,
+    // regardless of the reuse flags that discovery normally uses.
+    let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let mut config = ModemConfig::default();
+    config.shared.network.use_tls = false;
+    config.shared.network.bind_addr = Ipv4Addr::LOCALHOST.into();
+    config.shared.network.tcp_port = 0;
+    config.shared.network.discovery_port = occupied.local_addr().unwrap().port();
+
+    // With no named interface, discovery is best effort. A failed UDP bind
+    // must leave the TCP/DLEP path usable for a statically configured router.
+    let modem = ModemDaemon::builder()
+        .config(config.clone())
+        .spawn()
+        .await
+        .unwrap();
+    let mut modem_events = modem.subscribe();
+    let mut router_config = RouterConfig::default();
+    router_config.shared.network.use_tls = false;
+    let router = RouterDaemon::builder()
+        .config(router_config)
+        .spawn()
+        .await
+        .unwrap();
+    let mut router_events = router.subscribe();
+    router.connect_static(modem.local_addr()).await.unwrap();
+    for events in [&mut modem_events, &mut router_events] {
+        assert!(matches!(
+            timeout(WAIT, events.recv()).await.unwrap().unwrap(),
+            DaemonEvent::SessionUp { .. }
+        ));
+    }
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
+
+    // An explicitly selected interface makes bind failure fatal. The TCP
+    // listener created earlier in startup must be released on this path.
+    config.shared.network.interface = Some("lo".into());
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = reserved.local_addr().unwrap();
+    config.shared.network.tcp_port = tcp_addr.port();
+    drop(reserved);
+    let error = ModemDaemon::builder()
+        .config(config.clone())
+        .spawn()
+        .await
+        .err()
+        .expect("occupied discovery port must reject named-interface startup");
+    assert!(
+        matches!(error, DaemonError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
+        "{error}"
+    );
+    let rebound =
+        std::net::TcpListener::bind(tcp_addr).expect("failed startup leaked its TCP listener");
+    drop(rebound);
+    drop(occupied);
+    // The same configuration succeeds once the UDP conflict is removed.
+    let modem = ModemDaemon::builder().config(config).spawn().await.unwrap();
+    modem.shutdown().await.unwrap();
+}

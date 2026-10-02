@@ -13,6 +13,9 @@
 //! generation tracking is needed here.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use dlep_fsm::events::{EmittedEvent, FsmAction, FsmEvent, SendTarget};
@@ -25,6 +28,34 @@ use tracing::{debug, warn};
 use crate::connections::ConnectedRouters;
 use crate::events::{DaemonEvent, PeerOffer};
 use crate::runtime::{DaemonError, EventTx};
+
+// Keep failure injection private; public callers still supply DiscoverySocket.
+trait DiscoveryIo: Send + Sync {
+    fn recv_with_metadata(&self) -> impl Future<Output = io::Result<ReceivedSignal>> + Send;
+    fn send_to_group(
+        &self,
+        signal: &dlep_core::Signal,
+    ) -> impl Future<Output = io::Result<()>> + Send;
+    fn send_unicast(
+        &self,
+        signal: &dlep_core::Signal,
+        dest: SocketAddr,
+    ) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+impl DiscoveryIo for DiscoverySocket {
+    async fn recv_with_metadata(&self) -> io::Result<ReceivedSignal> {
+        DiscoverySocket::recv_with_metadata(self).await
+    }
+
+    async fn send_to_group(&self, signal: &dlep_core::Signal) -> io::Result<()> {
+        DiscoverySocket::send_to_group(self, signal).await
+    }
+
+    async fn send_unicast(&self, signal: &dlep_core::Signal, dest: SocketAddr) -> io::Result<()> {
+        DiscoverySocket::send_unicast(self, signal, dest).await
+    }
+}
 
 /// Trait shared by the two discovery FSMs so the runtime can drive either
 /// one without taking a concrete type.
@@ -85,6 +116,7 @@ impl Drop for DiscoveryTimers {
 /// `initial_event` lets the caller kick the router-side FSM into Probing
 /// (`Some(FsmEvent::AppStartDiscovery)`) or leave the modem-side FSM in its
 /// default Listening state (`None`).
+/// A shutdown message or closure of the shutdown channel stops discovery.
 pub async fn run_discovery<F: DiscoveryFsm>(
     fsm: F,
     socket: DiscoverySocket,
@@ -96,8 +128,27 @@ pub async fn run_discovery<F: DiscoveryFsm>(
 }
 
 pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
-    mut fsm: F,
+    fsm: F,
     socket: DiscoverySocket,
+    initial_event: Option<FsmEvent>,
+    shutdown_rx: mpsc::Receiver<()>,
+    events_tx: EventTx,
+    connected_routers: Option<ConnectedRouters>,
+) -> Result<(), DaemonError> {
+    run_discovery_io(
+        fsm,
+        socket,
+        initial_event,
+        shutdown_rx,
+        events_tx,
+        connected_routers,
+    )
+    .await
+}
+
+async fn run_discovery_io<F: DiscoveryFsm>(
+    mut fsm: F,
+    socket: impl DiscoveryIo,
     initial_event: Option<FsmEvent>,
     mut shutdown_rx: mpsc::Receiver<()>,
     events_tx: EventTx,
@@ -161,7 +212,9 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
                 let actions = fsm.step(FsmEvent::TimerExpired(id, kind));
                 process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None).await?;
             }
-            Some(()) = shutdown_rx.recv() => {
+            // Losing the owner is also shutdown; otherwise the receive loop
+            // and periodic probe task outlive the last shutdown sender.
+            _ = shutdown_rx.recv() => {
                 let actions = fsm.step(FsmEvent::AppShutdown {
                     reason: dlep_core::StatusCode::SHUTTING_DOWN,
                 });
@@ -174,7 +227,7 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
 
 async fn process_actions(
     actions: Vec<FsmAction>,
-    socket: &DiscoverySocket,
+    socket: &impl DiscoveryIo,
     events_tx: &EventTx,
     timers: &mut DiscoveryTimers,
     timer_tx: &mpsc::Sender<(TimerId, TimerKind)>,
@@ -277,5 +330,297 @@ fn translate(emitted: EmittedEvent) -> Option<DaemonEvent> {
             peer_description,
         })),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dlep_core::{DataItem, Signal, SignalType};
+    use dlep_fsm::{
+        discovery_modem::ModemDiscoveryFsm,
+        discovery_router::{RouterDiscoveryConfig, RouterDiscoveryFsm},
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::time::{Instant, advance, timeout};
+
+    struct ScriptedIo {
+        input: tokio::sync::Mutex<mpsc::UnboundedReceiver<io::Result<ReceivedSignal>>>,
+        observed: Arc<Observed>,
+    }
+
+    #[derive(Default)]
+    struct Observed {
+        sends: Mutex<Vec<(Instant, SendTarget, Signal)>>,
+        failures: Mutex<usize>,
+        receives: AtomicUsize,
+    }
+
+    impl ScriptedIo {
+        fn new(
+            failures: usize,
+        ) -> (
+            Self,
+            mpsc::UnboundedSender<io::Result<ReceivedSignal>>,
+            Arc<Observed>,
+        ) {
+            let (input, rx) = mpsc::unbounded_channel();
+            let observed = Arc::new(Observed::default());
+            *observed.failures.lock().unwrap() = failures;
+            (
+                Self {
+                    input: tokio::sync::Mutex::new(rx),
+                    observed: observed.clone(),
+                },
+                input,
+                observed,
+            )
+        }
+
+        fn send(&self, signal: &Signal, target: SendTarget) -> io::Result<()> {
+            self.observed
+                .sends
+                .lock()
+                .unwrap()
+                .push((Instant::now(), target, signal.clone()));
+            let mut failures = self.observed.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DiscoveryIo for ScriptedIo {
+        async fn recv_with_metadata(&self) -> io::Result<ReceivedSignal> {
+            let result = self
+                .input
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("input stays open until shutdown");
+            self.observed.receives.fetch_add(1, Ordering::SeqCst);
+            result
+        }
+
+        async fn send_to_group(&self, signal: &Signal) -> io::Result<()> {
+            self.send(signal, SendTarget::DiscoveryGroup)
+        }
+
+        async fn send_unicast(&self, signal: &Signal, dest: SocketAddr) -> io::Result<()> {
+            self.send(signal, SendTarget::Unicast(dest))
+        }
+    }
+
+    fn router() -> RouterDiscoveryFsm {
+        RouterDiscoveryFsm::with_config(RouterDiscoveryConfig {
+            discovery_interval: Duration::from_secs(1),
+            ..Default::default()
+        })
+    }
+
+    fn incoming(kind: SignalType, from: &str) -> io::Result<ReceivedSignal> {
+        Ok(ReceivedSignal {
+            signal: Signal::new(kind),
+            from: from.parse().unwrap(),
+            ttl: 255,
+            local_addr: "192.0.2.10".parse().unwrap(),
+            interface_index: 7,
+        })
+    }
+
+    async fn settle() {
+        // Keep virtual time under test control while runtime/timer tasks poll.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn tick(ms: u64) {
+        advance(Duration::from_millis(ms)).await;
+        settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multicast_send_failures_preserve_periodic_retry_and_offer_delivery() {
+        let (socket, input, observed) = ScriptedIo::new(2);
+        let (stop, rx) = mpsc::channel(1);
+        let (events, mut received) = crate::runtime::new_event_channel();
+        let start = Instant::now();
+        let task = tokio::spawn(run_discovery_io(
+            router(),
+            socket,
+            Some(FsmEvent::AppStartDiscovery),
+            rx,
+            events,
+            None,
+        ));
+        settle().await;
+        assert_eq!(observed.sends.lock().unwrap().len(), 1);
+        for _ in 0..2 {
+            // Receiving offers remains possible even when probes fail to send.
+            input
+                .send(incoming(SignalType::PEER_OFFER, "192.0.2.1:12345"))
+                .unwrap();
+            settle().await;
+            let DaemonEvent::PeerDiscovered(offer) = received.try_recv().unwrap() else {
+                panic!("expected offer")
+            };
+            assert_eq!(offer.endpoints[0].addr, "192.0.2.1:854".parse().unwrap());
+            tick(1000).await;
+        }
+        assert_eq!(*observed.failures.lock().unwrap(), 0);
+        {
+            let sends = observed.sends.lock().unwrap();
+            assert_eq!(sends.len(), 3);
+            for (i, (at, target, signal)) in sends.iter().enumerate() {
+                assert_eq!(*at - start, Duration::from_secs(i as u64));
+                assert!(matches!(target, SendTarget::DiscoveryGroup));
+                assert_eq!(signal.signal_type, SignalType::PEER_DISCOVERY);
+            }
+        }
+        stop.send(()).await.unwrap();
+        timeout(Duration::from_millis(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(input.is_closed());
+        tick(2000).await;
+        assert_eq!(observed.sends.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_unicast_offer_does_not_block_other_peers_or_retries() {
+        let (socket, input, observed) = ScriptedIo::new(1);
+        let (stop, rx) = mpsc::channel(1);
+        let (events, _) = crate::runtime::new_event_channel();
+        let modem = ModemDiscoveryFsm::new("0.0.0.0:854".parse().unwrap(), "test".into(), false);
+        let task = tokio::spawn(run_discovery_io(modem, socket, None, rx, events, None));
+        for peer in ["192.0.2.1:10001", "192.0.2.2:10002", "192.0.2.1:10001"] {
+            input
+                .send(incoming(SignalType::PEER_DISCOVERY, peer))
+                .unwrap();
+            settle().await;
+        }
+        {
+            let sends = observed.sends.lock().unwrap();
+            assert_eq!(sends.len(), 3);
+            for ((_, target, signal), peer) in
+                sends
+                    .iter()
+                    .zip(["192.0.2.1:10001", "192.0.2.2:10002", "192.0.2.1:10001"])
+            {
+                assert!(
+                    matches!(target, SendTarget::Unicast(addr) if *addr == peer.parse::<SocketAddr>().unwrap())
+                );
+                assert_eq!(signal.signal_type, SignalType::PEER_OFFER);
+                assert!(signal.data_items.iter().any(|item| matches!(item,
+                    DataItem::Ipv4ConnectionPoint { addr, .. } if *addr == "192.0.2.10".parse::<std::net::Ipv4Addr>().unwrap())));
+            }
+        }
+        stop.send(()).await.unwrap();
+        timeout(Duration::from_millis(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receive_errors_back_off_without_delaying_probes_or_recovery() {
+        let (socket, input, observed) = ScriptedIo::new(0);
+        for _ in 0..11 {
+            input
+                .send(Err(io::Error::from(io::ErrorKind::ConnectionRefused)))
+                .unwrap();
+        }
+        input
+            .send(incoming(SignalType::PEER_OFFER, "192.0.2.1:854"))
+            .unwrap();
+        let (stop, rx) = mpsc::channel(1);
+        let (events, mut received) = crate::runtime::new_event_channel();
+        let task = tokio::spawn(run_discovery_io(
+            router(),
+            socket,
+            Some(FsmEvent::AppStartDiscovery),
+            rx,
+            events,
+            None,
+        ));
+        settle().await;
+        assert_eq!(observed.receives.load(Ordering::SeqCst), 1);
+        for retries in 1..=11 {
+            tick(99).await;
+            assert_eq!(observed.receives.load(Ordering::SeqCst), retries);
+            assert!(received.try_recv().is_err());
+            tick(1).await;
+            assert_eq!(observed.receives.load(Ordering::SeqCst), retries + 1);
+        }
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            DaemonEvent::PeerDiscovered(_)
+        ));
+        {
+            let sends = observed.sends.lock().unwrap();
+            assert_eq!(sends.len(), 2);
+            assert_eq!(sends[1].0 - sends[0].0, Duration::from_secs(1));
+        }
+        input
+            .send(incoming(SignalType::PEER_OFFER, "192.0.2.2:854"))
+            .unwrap();
+        settle().await;
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            DaemonEvent::PeerDiscovered(_)
+        ));
+        stop.send(()).await.unwrap();
+        timeout(Duration::from_millis(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_receive_backoff_handles_message_and_sender_drop() {
+        for drop_sender in [false, true] {
+            let (socket, input, observed) = ScriptedIo::new(0);
+            input
+                .send(Err(io::Error::from(io::ErrorKind::ConnectionRefused)))
+                .unwrap();
+            let (stop, rx) = mpsc::channel(1);
+            let (events, _) = crate::runtime::new_event_channel();
+            let task = tokio::spawn(run_discovery_io(
+                router(),
+                socket,
+                Some(FsmEvent::AppStartDiscovery),
+                rx,
+                events,
+                None,
+            ));
+            settle().await;
+            assert_eq!(observed.receives.load(Ordering::SeqCst), 1);
+            let now = Instant::now();
+            if !drop_sender {
+                stop.send(()).await.unwrap();
+            }
+            drop(stop);
+            timeout(Duration::from_millis(1), task)
+                .await
+                .expect("shutdown must interrupt receive backoff")
+                .unwrap()
+                .unwrap();
+            assert_eq!(Instant::now(), now);
+            assert!(input.is_closed());
+            tick(2000).await;
+            assert_eq!(observed.sends.lock().unwrap().len(), 1);
+        }
     }
 }
