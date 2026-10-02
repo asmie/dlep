@@ -23,8 +23,7 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
 >
 > Not yet implemented: IPv6 discovery transport, a modem backend that applies
-> requested link changes, and configurable session-wide metrics (the modem
-> still advertises placeholders in `Session Initialization Response`).
+> requested link changes, and command queuing when a transaction is busy.
 
 ## Goals
 
@@ -143,6 +142,24 @@ The modem-side API is symmetric, with
 error: routers may report Layer 3 changes but cannot originate metric items.
 `announce_destination` is router-side only. The modem denies destinations it
 does not know; successful responses create destinations at the router.
+
+Set `ModemConfig.metrics` (the TOML `[metrics]` section) to the initial
+session-wide values. Rates use bits/second and `latency_us` uses microseconds.
+The mandatory rates and latency default to zero; configure them for the actual
+link before deployment. Optional `resources`, `rlq_rx`, `rlq_tx`, and `mtu`
+default to unsupported and are omitted from the wire. Only configure optional
+metrics that the modem can supply. Percentages must be 0–100; configured current
+rates must not exceed their corresponding maximum rates. Invalid configuration
+fails `--check-config` and daemon startup.
+
+**API change:** the four optional `LinkMetrics` fields now use `Option`:
+write `mtu: Some(1500)` to supply a value. `Some(0)` is an explicit zero.
+For destination creation, `None` inherits the session value; for updates, it
+preserves the existing value. Events expose effective values, with `None` for
+unsupported metrics. Support is fixed at session initialization: the modem API
+rejects attempts to introduce undeclared metrics, and the router terminates a
+peer that sends them. Session metric updates apply supplied values to all
+existing destinations and the defaults for future destinations in that session.
 
 Layer 3 changes use `AddressChanges { added, removed }`; each side contains a
 `DestinationAddrs` set with IPv4/IPv6 addresses and attached subnets.

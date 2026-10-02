@@ -69,7 +69,7 @@ Both binaries read a TOML file via `--config/-c` (env:
 [`examples/router.toml`](../examples/router.toml) and
 [`examples/modem.toml`](../examples/modem.toml). All sections and fields
 are optional; defaults follow the RFC (port 854, TLS on, discovery on).
-Misspelled keys inside `[network]`/`[tls]`/`[timers]` are rejected at
+Misspelled keys inside `[network]`/`[tls]`/`[timers]`/`[metrics]` are rejected at
 parse time; top-level typos are silently ignored, so always finish an
 edit with `--check-config`.
 
@@ -93,6 +93,17 @@ edit with `--check-config`.
 | `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval |
 | `[timers]` | `session_init_timeout_ms` | `5000` | deadline for Session Initialization Response |
 | `[timers]` | `termination_timeout_ms` | `1000` | deadline for Session Termination Response |
+| `[metrics]` (modem) | `max_data_rate_rx_bps` / `max_data_rate_tx_bps` | `0` | maximum receive/transmit rates, bits/second |
+| `[metrics]` (modem) | `current_data_rate_rx_bps` / `current_data_rate_tx_bps` | `0` | current receive/transmit rates, bits/second |
+| `[metrics]` (modem) | `latency_us` | `0` | transmission delay, microseconds |
+| `[metrics]` (modem) | `resources` / `rlq_rx` / `rlq_tx` | omitted | supported resource/link quality percentages, 0–100 |
+| `[metrics]` (modem) | `mtu` | omitted | supported MTU, bytes |
+
+Configure mandatory rates and latency for your actual link. Only set optional
+metrics that the modem can supply: omitted optional fields declare them
+unsupported and keep them off the wire. Explicit zero remains a reported value.
+Support is fixed for each session; enabling another optional metric requires a
+new session. Configured current rates cannot exceed their maximum rates.
 
 DLEP transactions do not have individual deadlines (RFC 8175 §8). The session
 heartbeat mechanism detects a silent peer. Remove the previously introduced
@@ -110,7 +121,7 @@ dlep-modem  --config /etc/dlep/modem.toml  --check-config
 ```
 
 `configuration OK` on stdout and exit code 0 mean the TOML parses, static
-mode has peers, and all TLS material loads.
+mode has peers, modem metric values pass validation, and all TLS material loads.
 
 ## 4. Port 854 privileges
 

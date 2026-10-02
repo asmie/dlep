@@ -31,3 +31,19 @@ ca_bundle = "/etc/dlep/pki/ca.pem"
 
 [timers]
 heartbeat_interval_ms = 60000
+
+# Initial link metrics. Replace these illustrative values with actual link data.
+# Rates are bits/second; latency is microseconds. Without this section the five
+# mandatory metrics are zero. Current rates must not exceed maximum rates.
+[metrics]
+max_data_rate_rx_bps = 10000000
+max_data_rate_tx_bps = 10000000
+current_data_rate_rx_bps = 5000000
+current_data_rate_tx_bps = 5000000
+latency_us = 2500
+# Optional metrics declare support for the lifetime of each session. Uncomment
+# only values your modem can supply. Omitted values are not sent; zero is a value.
+# resources = 80  # percent, 0–100
+# rlq_rx = 95     # percent, 0–100
+# rlq_tx = 95     # percent, 0–100
+# mtu = 1500     # bytes

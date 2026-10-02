@@ -22,10 +22,10 @@ fn metrics() -> LinkMetrics {
         current_data_rate_rx_bps: 5_000,
         current_data_rate_tx_bps: 3_000,
         latency: Duration::from_micros(800),
-        resources: 70,
-        rlq_rx: 80,
-        rlq_tx: 90,
-        mtu: 1400,
+        resources: Some(70),
+        rlq_rx: Some(80),
+        rlq_tx: Some(90),
+        mtu: Some(1400),
     }
 }
 fn requested() -> LinkCharacteristics {
@@ -54,7 +54,10 @@ fn status(m: &Message) -> S {
 }
 fn sessions() -> (RouterSessionFsm, ModemSessionFsm) {
     let mut r = RouterSessionFsm::new();
-    let mut m = ModemSessionFsm::new();
+    let mut m = ModemSessionFsm::with_config(dlep_fsm::SessionConfig {
+        initial_metrics: metrics(),
+        ..Default::default()
+    });
     m.step(E::TcpAccepted);
     let init = sent(&r.step(E::TcpConnected), M::SESSION_INITIALIZATION);
     let reply = sent(

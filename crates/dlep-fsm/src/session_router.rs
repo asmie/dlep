@@ -129,6 +129,11 @@ impl RouterSessionFsm {
                             if initializing {
                                 return Ok(());
                             }
+                            if msg.data_items.iter().map(DataItem::type_id).any(|t| {
+                                (12..=20).contains(&t.0) && !self.session_metric_types.contains(&t)
+                            }) {
+                                return Err(StatusCode::INVALID_DATA);
+                            }
                             if msg.message_type == MessageType::LINK_CHARACTERISTICS_RESPONSE {
                                 let received: HashSet<_> = msg
                                     .data_items

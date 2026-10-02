@@ -138,6 +138,7 @@ pub fn session_config_from_timers(
         session_init_timeout: Duration::from_millis(timers.session_init_timeout_ms.into()),
         termination_timeout: Duration::from_millis(timers.termination_timeout_ms.into()),
         advertised_extensions,
+        initial_metrics: Default::default(),
     }
 }
 

@@ -38,6 +38,13 @@ fn fast_timers() -> TimersConfig {
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        metrics: dlep_daemon::MetricsConfig {
+            resources: Some(100),
+            rlq_rx: Some(100),
+            rlq_tx: Some(100),
+            mtu: Some(1500),
+            ..Default::default()
+        },
         shared: SharedConfig {
             network: NetworkConfig {
                 // Pin to loopback so the test doesn't depend on the
@@ -280,10 +287,10 @@ fn sample_metrics() -> LinkMetrics {
         current_data_rate_rx_bps: 80_000_000,
         current_data_rate_tx_bps: 80_000_000,
         latency: Duration::from_micros(2_500),
-        resources: 85,
-        rlq_rx: 95,
-        rlq_tx: 95,
-        mtu: 1500,
+        resources: Some(85),
+        rlq_rx: Some(95),
+        rlq_tx: Some(95),
+        mtu: Some(1500),
     }
 }
 

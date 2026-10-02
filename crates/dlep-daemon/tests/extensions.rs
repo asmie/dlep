@@ -92,6 +92,7 @@ impl DlepExtension for TestExt {
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        metrics: Default::default(),
         shared: SharedConfig {
             network: NetworkConfig {
                 bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),

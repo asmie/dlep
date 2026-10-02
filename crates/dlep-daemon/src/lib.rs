@@ -18,7 +18,8 @@ pub use cli::{
     ConfigCheckError, ConfigLoadError, check_modem_config, check_router_config, load_toml_config,
 };
 pub use config::{
-    DiscoveryMode, ModemConfig, NetworkConfig, RouterConfig, SharedConfig, TimersConfig, TlsConfig,
+    DiscoveryMode, MetricsConfig, ModemConfig, NetworkConfig, RouterConfig, SharedConfig,
+    TimersConfig, TlsConfig,
 };
 pub use events::{
     AddressChanges, DaemonEvent, DestinationAddrs, DestinationEvent, DestinationId,

@@ -355,7 +355,7 @@ The order of work was:
     - **`Destination Announce` was on the wrong role.** `ModemDaemon::announce_destination` existed, took a MAC, discarded it and returned `Ok(())` — a public method that silently did nothing, advertised in both the README and §7. But §12.13 makes Destination Announce *router*-originated ("MAY be sent by a router to announce such an interest"), and §12.14 obliges the *modem* to answer it. The no-op is gone; `RouterDaemon::announce_destination` sends the message under a per-destination transaction, and the modem answers and emits `DestinationEvent::Announced` (another previously-dead variant) so its application can decide whether to follow up with a `Destination_Up`. A malformed announce with no MAC now terminates the session with Invalid Data.
     - **The router binary could never reconnect.** `run_event_loop` inserted each peer into a `connected` dedup set and never removed it, and the `SessionDown` arm only logged, so a modem restart orphaned the router until the process was restarted — re-discovery hit the dedup `continue` and was skipped forever. The root cause was an API gap: `DaemonEvent::SessionDown` carried only a `StatusCode`, so the loop could not tell *which* peer had dropped. `SessionDown` now carries `PeerInfo`, and the loop evicts the dead peer and re-dials it via a `ReconnectQueue` (1 s base, doubling, 30 s cap; `forget` on `SessionUp` so each drop starts a fresh sequence). The queue takes its clock as a parameter, so the backoff is unit-tested without sleeping.
 
-    Follow-ups: make session-wide metrics configurable instead of the `PLACEHOLDER_*` constants in `build_session_initialization_response`; IPv6 discovery; a modem backend capable of applying requested link changes. Note also that the new `AppSessionUpdate` / `AppAnnounceDestination` arms follow the existing convention of *silently dropping* a command when the transaction slot is busy (`tracing::debug!` + empty action vec) — the same wart tracked below for `AppDropDestination`. It should be fixed for all of them at once, by queueing or by surfacing a busy error.
+    Follow-ups: IPv6 discovery; a modem backend capable of applying requested link changes. Session-wide metric configuration and support declarations are implemented below. Note also that the new `AppSessionUpdate` / `AppAnnounceDestination` arms follow the existing convention of *silently dropping* a command when the transaction slot is busy (`tracing::debug!` + empty action vec) — the same wart tracked below for `AppDropDestination`. It should be fixed for all of them at once, by queueing or by surfacing a busy error.
 
 11. **Link Characteristics Request/Response (RFC 8175 §12.18–12.19).**
     The router API targets one session and accepts optional receive rate,
@@ -405,6 +405,24 @@ The order of work was:
     peer/session context. Tests cover all four families, initialization,
     consistency errors, delayed acknowledgement, resubscription, both session
     directions, and identical address sets on different modem sessions.
+
+14. Configurable session metrics and optional metric support. **Done** —
+    `ModemConfig.metrics` / TOML `[metrics]` supplies initialization values;
+    `SessionConfig.initial_metrics` is the equivalent FSM API. Mandatory rates
+    and latency default to zero; optional Resources, both Relative Link Quality
+    fields, and MTU default to unsupported. `LinkMetrics` represents optional
+    values with `Option`, distinguishing omission from explicit zero.
+
+    The modem validates configuration before opening sockets and validates
+    metric commands before enqueueing. Optional metric support stays fixed for
+    each session. The router checks all subsequent metric-bearing messages
+    against that declaration and terminates on undeclared items. Destination
+    and session updates merge supplied fields, retaining omitted optional
+    values; newly added destinations inherit current session defaults.
+    Link Characteristics replies use the complete effective metric set.
+    Tests cover mixed support, explicit zero, default inheritance, partial
+    updates, pending Up updates, invalid input without state mutation, and
+    configured values reaching the application through real sessions.
 
 ---
 

@@ -19,6 +19,8 @@ use crate::timers::TimerId;
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub peer_description: String,
+    /// Initial modem metrics and fixed optional metric support for this session.
+    pub initial_metrics: LinkMetrics,
     pub heartbeat_interval_ms: u32,
     pub session_init_timeout: Duration,
     pub termination_timeout: Duration,
@@ -40,6 +42,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             peer_description: "dlep-router".into(),
+            initial_metrics: LinkMetrics::default(),
             heartbeat_interval_ms: 60_000,
             session_init_timeout: Duration::from_millis(5_000),
             termination_timeout: Duration::from_millis(1_000),
@@ -141,7 +144,7 @@ pub fn build_link_characteristics_request(
 }
 
 /// RFC 8175 §12.19 requires current metrics, including on Request Denied.
-/// The modem currently declares every core metric during initialization.
+/// Include every metric declared during initialization, using effective values.
 pub fn build_link_characteristics_response(
     mac: MacAddress,
     status: StatusCode,
@@ -360,19 +363,19 @@ pub fn merge_link_metrics(msg: &Message, m: &mut LinkMetrics) -> bool {
                 found = true;
             }
             DataItem::Resources(v) => {
-                m.resources = *v;
+                m.resources = Some(*v);
                 found = true;
             }
             DataItem::RelativeLinkQualityReceive(v) => {
-                m.rlq_rx = *v;
+                m.rlq_rx = Some(*v);
                 found = true;
             }
             DataItem::RelativeLinkQualityTransmit(v) => {
-                m.rlq_tx = *v;
+                m.rlq_tx = Some(*v);
                 found = true;
             }
             DataItem::Mtu(v) => {
-                m.mtu = *v;
+                m.mtu = Some(*v);
                 found = true;
             }
             _ => {}
@@ -389,7 +392,7 @@ pub fn extract_destination_addrs(msg: &Message) -> DestinationAddrs {
     addresses
 }
 
-fn push_metric_items(mut msg: Message, m: &LinkMetrics) -> Message {
+pub(crate) fn push_metric_items(mut msg: Message, m: &LinkMetrics) -> Message {
     msg = msg.with_item(DataItem::MaxDataRateReceive(m.max_data_rate_rx_bps));
     msg = msg.with_item(DataItem::MaxDataRateTransmit(m.max_data_rate_tx_bps));
     msg = msg.with_item(DataItem::CurrentDataRateReceive(m.current_data_rate_rx_bps));
@@ -397,10 +400,18 @@ fn push_metric_items(mut msg: Message, m: &LinkMetrics) -> Message {
         m.current_data_rate_tx_bps,
     ));
     msg = msg.with_item(DataItem::Latency(m.latency));
-    msg = msg.with_item(DataItem::Resources(m.resources));
-    msg = msg.with_item(DataItem::RelativeLinkQualityReceive(m.rlq_rx));
-    msg = msg.with_item(DataItem::RelativeLinkQualityTransmit(m.rlq_tx));
-    msg = msg.with_item(DataItem::Mtu(m.mtu));
+    if let Some(value) = m.resources {
+        msg = msg.with_item(DataItem::Resources(value));
+    }
+    if let Some(value) = m.rlq_rx {
+        msg = msg.with_item(DataItem::RelativeLinkQualityReceive(value));
+    }
+    if let Some(value) = m.rlq_tx {
+        msg = msg.with_item(DataItem::RelativeLinkQualityTransmit(value));
+    }
+    if let Some(value) = m.mtu {
+        msg = msg.with_item(DataItem::Mtu(value));
+    }
     msg
 }
 
@@ -423,10 +434,10 @@ mod tests {
             current_data_rate_rx_bps: 50_000_000,
             current_data_rate_tx_bps: 50_000_000,
             latency: Duration::from_micros(2_500),
-            resources: 80,
-            rlq_rx: 95,
-            rlq_tx: 95,
-            mtu: 1500,
+            resources: Some(80),
+            rlq_rx: Some(95),
+            rlq_tx: Some(95),
+            mtu: Some(1500),
         }
     }
 
@@ -446,7 +457,7 @@ mod tests {
         let extracted = extract_link_metrics(&msg).expect("metrics present");
         assert_eq!(extracted.current_data_rate_rx_bps, 50_000_000);
         assert_eq!(extracted.latency, Duration::from_micros(2_500));
-        assert_eq!(extracted.mtu, 1500);
+        assert_eq!(extracted.mtu, Some(1500));
     }
 
     #[test]

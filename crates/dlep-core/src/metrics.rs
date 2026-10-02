@@ -1,4 +1,4 @@
-//! Per-destination link metrics — RFC 8175 §11.3 Data Items, reduced to a
+//! Session and destination link metrics — RFC 8175 §13.12–13.20, reduced to a
 //! single plain-old-data struct.
 //!
 //! Lives in `dlep-core` (alongside the wire data items) so the FSM, the
@@ -7,17 +7,31 @@
 
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, Default)]
+/// The five mandatory metrics are always supplied. Optional `None` values mean
+/// unsupported at initialization, or omitted (unchanged/inherited) in updates.
+/// `Some(0)` is a reported zero, not an absent value. Optional metric support
+/// cannot change during a session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LinkMetrics {
     pub max_data_rate_rx_bps: u64,
     pub max_data_rate_tx_bps: u64,
     pub current_data_rate_rx_bps: u64,
     pub current_data_rate_tx_bps: u64,
     pub latency: Duration,
-    pub resources: u8,
-    pub rlq_rx: u8,
-    pub rlq_tx: u8,
-    pub mtu: u16,
+    pub resources: Option<u8>,
+    pub rlq_rx: Option<u8>,
+    pub rlq_tx: Option<u8>,
+    pub mtu: Option<u16>,
+}
+
+impl LinkMetrics {
+    /// Whether every supplied optional field was declared at initialization.
+    pub fn supported_by(&self, initial: &Self) -> bool {
+        (self.resources.is_none() || initial.resources.is_some())
+            && (self.rlq_rx.is_none() || initial.rlq_rx.is_some())
+            && (self.rlq_tx.is_none() || initial.rlq_tx.is_some())
+            && (self.mtu.is_none() || initial.mtu.is_some())
+    }
 }
 
 /// Requested changes in RFC 8175 §12.18. At least one field must be present;

@@ -21,15 +21,6 @@ use crate::transaction::TransactionTracker;
 use crate::validation::{validate_message, validate_transaction};
 use dlep_core::LinkMetrics;
 
-/// Placeholder link metrics advertised in Session Initialization Response.
-/// M5 wires `ModemDaemon::add_destination` to surface real values; M3 just
-/// needs the session to come up. RFC 8175 §11.2 mandates all of these in
-/// the Response, so we cannot omit them.
-const PLACEHOLDER_DATA_RATE_BPS: u64 = 1_000_000_000;
-const PLACEHOLDER_RESOURCES: u8 = 100;
-const PLACEHOLDER_RLQ: u8 = 100;
-const PLACEHOLDER_MTU: u16 = 1500;
-
 /// Modem-side session states (RFC 8175 §7.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModemSessionState {
@@ -47,6 +38,7 @@ pub struct ModemSessionFsm {
     pub destinations: HashMap<MacAddress, DestinationState>,
     pub peer_addresses: DestinationAddrs,
     local_addresses: DestinationAddrs,
+    session_metrics: LinkMetrics,
     config: SessionConfig,
     termination_reason: StatusCode,
     /// Peer's announced heartbeat interval, captured from the Heartbeat
@@ -92,6 +84,7 @@ impl ModemSessionFsm {
             destinations: HashMap::new(),
             peer_addresses: DestinationAddrs::default(),
             local_addresses: DestinationAddrs::default(),
+            session_metrics: config.initial_metrics,
             config,
             termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
@@ -277,6 +270,15 @@ impl ModemSessionFsm {
                 },
             ) => {
                 use crate::transaction::RequestKind;
+                if !self.valid_metrics(&metrics) {
+                    return Vec::new();
+                }
+                let mut effective = self.session_metrics;
+                crate::session_common::merge_link_metrics(
+                    &build_session_update(&metrics),
+                    &mut effective,
+                );
+                let metrics = effective;
                 let addrs = addrs.canonical();
                 if (AddressChanges {
                     added: addrs.clone(),
@@ -362,10 +364,16 @@ impl ModemSessionFsm {
             // log+drop (symmetric to the Up dedup-guard) so we never advertise
             // an Update for a destination the router never saw an Up for.
             (ModemSessionState::InSession, FsmEvent::AppUpdateMetrics { mac, metrics }) => {
+                if !self.valid_metrics(&metrics) {
+                    return Vec::new();
+                }
                 let Some(destination) = self.destinations.get_mut(&mac) else {
                     return Vec::new();
                 };
-                destination.metrics = metrics;
+                crate::session_common::merge_link_metrics(
+                    &build_session_update(&metrics),
+                    &mut destination.metrics,
+                );
                 if !destination.announced || self.tx.destination_busy(&mac) {
                     destination.pending_metrics = true;
                     return Vec::new();
@@ -604,16 +612,21 @@ impl ModemSessionFsm {
             // transaction slot until the Response arrives.
             (ModemSessionState::InSession, FsmEvent::AppSessionUpdate { metrics }) => {
                 use crate::transaction::RequestKind;
+                if !self.valid_metrics(&metrics) {
+                    return Vec::new();
+                }
                 if self.tx.open_session(RequestKind::SessionUpdate).is_err() {
                     tracing::debug!("session_update while another session request is pending");
                     return Vec::new();
                 }
                 // Subsequent Link Characteristics Responses must report the
                 // same effective metrics we just advertised for every link.
+                let message = build_session_update(&metrics);
+                crate::session_common::merge_link_metrics(&message, &mut self.session_metrics);
                 for destination in self.destinations.values_mut() {
-                    destination.metrics = metrics;
+                    crate::session_common::merge_link_metrics(&message, &mut destination.metrics);
                 }
-                vec![FsmAction::SendMessage(build_session_update(&metrics))]
+                vec![FsmAction::SendMessage(message)]
             }
             (ModemSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
                 self.termination_reason = reason;
@@ -682,6 +695,11 @@ impl ModemSessionFsm {
         }
     }
 
+    fn valid_metrics(&self, metrics: &LinkMetrics) -> bool {
+        metrics.supported_by(&self.config.initial_metrics)
+            && build_session_update(metrics).encode().is_ok()
+    }
+
     fn protocol_error(&mut self, status: DataItem) -> Vec<FsmAction> {
         let DataItem::Status { code, .. } = &status else {
             unreachable!()
@@ -721,28 +739,22 @@ impl ModemSessionFsm {
 }
 
 fn build_session_initialization_response(config: &SessionConfig) -> Message {
-    Message::new(MessageType::SESSION_INITIALIZATION_RESPONSE)
-        .with_item(DataItem::Status {
-            code: StatusCode::SUCCESS,
-            text: String::new(),
-        })
-        .with_item(DataItem::HeartbeatInterval(local_heartbeat_interval(
-            config,
-        )))
-        .with_item(DataItem::PeerType {
-            flags: PeerFlags::default(),
-            description: config.peer_description.clone(),
-        })
-        .with_item(DataItem::ExtensionsSupported(
-            config.advertised_extensions.clone(),
-        ))
-        .with_item(DataItem::Mtu(PLACEHOLDER_MTU))
-        .with_item(DataItem::MaxDataRateReceive(PLACEHOLDER_DATA_RATE_BPS))
-        .with_item(DataItem::MaxDataRateTransmit(PLACEHOLDER_DATA_RATE_BPS))
-        .with_item(DataItem::CurrentDataRateReceive(PLACEHOLDER_DATA_RATE_BPS))
-        .with_item(DataItem::CurrentDataRateTransmit(PLACEHOLDER_DATA_RATE_BPS))
-        .with_item(DataItem::Latency(Duration::from_micros(0)))
-        .with_item(DataItem::Resources(PLACEHOLDER_RESOURCES))
-        .with_item(DataItem::RelativeLinkQualityReceive(PLACEHOLDER_RLQ))
-        .with_item(DataItem::RelativeLinkQualityTransmit(PLACEHOLDER_RLQ))
+    crate::session_common::push_metric_items(
+        Message::new(MessageType::SESSION_INITIALIZATION_RESPONSE)
+            .with_item(DataItem::Status {
+                code: StatusCode::SUCCESS,
+                text: String::new(),
+            })
+            .with_item(DataItem::HeartbeatInterval(local_heartbeat_interval(
+                config,
+            )))
+            .with_item(DataItem::PeerType {
+                flags: PeerFlags::default(),
+                description: config.peer_description.clone(),
+            })
+            .with_item(DataItem::ExtensionsSupported(
+                config.advertised_extensions.clone(),
+            )),
+        &config.initial_metrics,
+    )
 }

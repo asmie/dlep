@@ -19,6 +19,13 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        metrics: dlep_daemon::MetricsConfig {
+            resources: Some(100),
+            rlq_rx: Some(100),
+            rlq_tx: Some(100),
+            mtu: Some(1500),
+            ..Default::default()
+        },
         shared: SharedConfig {
             network: NetworkConfig {
                 bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -128,10 +135,10 @@ async fn tls_session_establishes_and_carries_destination_lifecycle() {
         current_data_rate_rx_bps: 500_000_000,
         current_data_rate_tx_bps: 500_000_000,
         latency: Duration::from_micros(2_500),
-        resources: 90,
-        rlq_rx: 100,
-        rlq_tx: 100,
-        mtu: 1500,
+        resources: Some(90),
+        rlq_rx: Some(100),
+        rlq_tx: Some(100),
+        mtu: Some(1500),
     };
 
     modem
@@ -220,10 +227,10 @@ async fn mtls_session_requires_and_accepts_client_certificate() {
         current_data_rate_rx_bps: 500_000_000,
         current_data_rate_tx_bps: 500_000_000,
         latency: Duration::from_micros(2_500),
-        resources: 90,
-        rlq_rx: 100,
-        rlq_tx: 100,
-        mtu: 1500,
+        resources: Some(90),
+        rlq_rx: Some(100),
+        rlq_tx: Some(100),
+        mtu: Some(1500),
     };
 
     modem

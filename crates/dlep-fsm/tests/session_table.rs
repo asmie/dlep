@@ -28,18 +28,24 @@ const DEFAULT_PEER_HEARTBEAT: Duration = Duration::from_millis(60_000);
 
 fn router_at(state: RouterSessionState) -> RouterSessionFsm {
     let mut fsm = RouterSessionFsm::new();
-    fsm.state = state;
     if matches!(
         state,
         RouterSessionState::InSession | RouterSessionState::Terminating
     ) {
-        fsm.peer_heartbeat_interval = Some(DEFAULT_PEER_HEARTBEAT);
+        fsm.step(FsmEvent::TcpConnected);
+        fsm.step(FsmEvent::RecvMessage(make_init_response(
+            StatusCode::SUCCESS,
+        )));
     }
+    fsm.state = state;
     fsm
 }
 
 fn modem_at(state: ModemSessionState) -> ModemSessionFsm {
-    let mut fsm = ModemSessionFsm::new();
+    let mut fsm = ModemSessionFsm::with_config(dlep_fsm::SessionConfig {
+        initial_metrics: sample_metrics_dest(),
+        ..Default::default()
+    });
     fsm.state = state;
     if matches!(
         state,
@@ -64,6 +70,9 @@ fn make_init_response(status: StatusCode) -> dlep_core::Message {
         })
         .with_item(DataItem::ExtensionsSupported(Vec::new()))
         .with_item(DataItem::Mtu(1500))
+        .with_item(DataItem::Resources(100))
+        .with_item(DataItem::RelativeLinkQualityReceive(100))
+        .with_item(DataItem::RelativeLinkQualityTransmit(100))
         .with_item(DataItem::MaxDataRateReceive(1_000_000))
         .with_item(DataItem::MaxDataRateTransmit(1_000_000))
         .with_item(DataItem::CurrentDataRateReceive(1_000_000))
@@ -100,10 +109,10 @@ fn sample_metrics_dest() -> LinkMetrics {
         current_data_rate_rx_bps: 500_000,
         current_data_rate_tx_bps: 500_000,
         latency: std::time::Duration::from_micros(1_000),
-        resources: 90,
-        rlq_rx: 100,
-        rlq_tx: 100,
-        mtu: 1500,
+        resources: Some(90),
+        rlq_rx: Some(100),
+        rlq_tx: Some(100),
+        mtu: Some(1500),
     }
 }
 
@@ -1152,10 +1161,14 @@ fn make_session_update(metrics: &LinkMetrics) -> dlep_core::Message {
             metrics.current_data_rate_tx_bps,
         ))
         .with_item(DataItem::Latency(metrics.latency))
-        .with_item(DataItem::Resources(metrics.resources))
-        .with_item(DataItem::RelativeLinkQualityReceive(metrics.rlq_rx))
-        .with_item(DataItem::RelativeLinkQualityTransmit(metrics.rlq_tx))
-        .with_item(DataItem::Mtu(metrics.mtu))
+        .with_item(DataItem::Resources(metrics.resources.unwrap()))
+        .with_item(DataItem::RelativeLinkQualityReceive(
+            metrics.rlq_rx.unwrap(),
+        ))
+        .with_item(DataItem::RelativeLinkQualityTransmit(
+            metrics.rlq_tx.unwrap(),
+        ))
+        .with_item(DataItem::Mtu(metrics.mtu.unwrap()))
 }
 
 /// Pull the first `SendMessage` of the given type out of an action batch.
@@ -1215,7 +1228,7 @@ fn router_in_session_session_update_emits_session_wide_metrics() {
         })
         .expect("expected Emit(SessionMetricsUpdate)");
     assert_eq!(emitted.current_data_rate_rx_bps, 500_000);
-    assert_eq!(emitted.mtu, 1500);
+    assert_eq!(emitted.mtu, Some(1500));
 }
 
 #[test]

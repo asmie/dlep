@@ -12,7 +12,13 @@ fn mac() -> MacAddress {
 }
 fn sessions() -> (RouterSessionFsm, ModemSessionFsm) {
     let mut r = RouterSessionFsm::new();
-    let mut m = ModemSessionFsm::new();
+    let mut m = ModemSessionFsm::with_config(dlep_fsm::SessionConfig {
+        initial_metrics: LinkMetrics {
+            mtu: Some(1500),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     m.step(FsmEvent::TcpAccepted);
     let init = sent(
         r.step(FsmEvent::TcpConnected),
@@ -279,7 +285,7 @@ fn declined_destination_can_be_announced_then_updated() {
     let _up = m.step(FsmEvent::AppAddDestination {
         mac: mac(),
         metrics: LinkMetrics {
-            mtu: 1400,
+            mtu: Some(1400),
             ..LinkMetrics::default()
         },
         addrs: DestinationAddrs::default(),
@@ -299,17 +305,17 @@ fn declined_destination_can_be_announced_then_updated() {
     );
     r.step(FsmEvent::RecvMessage(response));
     assert!(m.destinations[&mac()].announced);
-    assert_eq!(r.destinations[&mac()].metrics.mtu, 1400);
+    assert_eq!(r.destinations[&mac()].metrics.mtu, Some(1400));
     let update = sent(
         m.step(FsmEvent::AppUpdateMetrics {
             mac: mac(),
             metrics: LinkMetrics {
-                mtu: 1300,
+                mtu: Some(1300),
                 ..LinkMetrics::default()
             },
         }),
         MessageType::DESTINATION_UPDATE,
     );
     r.step(FsmEvent::RecvMessage(update));
-    assert_eq!(r.destinations[&mac()].metrics.mtu, 1300);
+    assert_eq!(r.destinations[&mac()].metrics.mtu, Some(1300));
 }

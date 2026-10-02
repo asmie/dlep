@@ -20,6 +20,7 @@ use crate::session::{
 };
 
 pub struct ModemDaemon {
+    initial_metrics: LinkMetrics,
     events_tx: EventTx,
     /// Address the listen socket actually bound to (resolves `tcp_port = 0`).
     local_addr: SocketAddr,
@@ -66,6 +67,7 @@ impl ModemDaemon {
         metrics: LinkMetrics,
         addresses: dlep_fsm::DestinationAddrs,
     ) -> Result<(), DaemonError> {
+        self.validate_metrics(&metrics)?;
         let changes = dlep_fsm::AddressChanges {
             added: addresses.canonical(),
             removed: Default::default(),
@@ -100,6 +102,7 @@ impl ModemDaemon {
         id: DestinationId,
         metrics: LinkMetrics,
     ) -> Result<(), DaemonError> {
+        self.validate_metrics(&metrics)?;
         self.fanout(SessionCommand::UpdateDestination { mac: id.0, metrics })
             .await
     }
@@ -116,8 +119,11 @@ impl ModemDaemon {
     /// Push session-wide metric changes to every connected router via a
     /// Session Update Message (RFC 8175 §12.7). These are the session-level
     /// defaults, distinct from the per-destination metrics carried by
-    /// [`Self::update_destination`].
+    /// [`Self::update_destination`]. Omitted optional values remain unchanged;
+    /// supplied optional metrics must be declared in `ModemConfig.metrics`.
+    /// Updates affect current sessions, not configuration for future sessions.
     pub async fn update_session_metrics(&self, metrics: LinkMetrics) -> Result<(), DaemonError> {
+        self.validate_metrics(&metrics)?;
         self.fanout(SessionCommand::SessionUpdate { metrics }).await
     }
 
@@ -136,6 +142,16 @@ impl ModemDaemon {
             changes: changes.canonical(),
         })
         .await
+    }
+
+    fn validate_metrics(&self, metrics: &LinkMetrics) -> Result<(), DaemonError> {
+        if !metrics.supported_by(&self.initial_metrics) {
+            return Err(DaemonError::Config(
+                "optional metric was not declared in ModemConfig.metrics".into(),
+            ));
+        }
+        dlep_fsm::session_common::build_session_update(metrics).encode()?;
+        Ok(())
     }
 
     /// Fan a command to every active session. Snapshot the sender list under
@@ -223,6 +239,8 @@ impl ModemBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
+        cfg.metrics.validate().map_err(DaemonError::Config)?;
+        let initial_metrics = cfg.metrics.link_metrics();
         let extensions_for_accept = self.extensions.clone();
 
         let bind_addr = SocketAddr::new(cfg.shared.network.bind_addr, cfg.shared.network.tcp_port);
@@ -274,6 +292,7 @@ impl ModemBuilder {
             events_tx.clone(),
             cfg.shared.timers.clone(),
             cfg.peer_description.clone(),
+            initial_metrics,
             session_cmds.clone(),
             tasks.clone(),
             extensions_for_accept,
@@ -282,6 +301,7 @@ impl ModemBuilder {
         ));
 
         Ok(ModemDaemon {
+            initial_metrics,
             events_tx,
             local_addr,
             session_cmds,
@@ -354,6 +374,7 @@ async fn modem_accept_loop(
     events_tx: EventTx,
     timers: TimersConfig,
     peer_description: String,
+    initial_metrics: LinkMetrics,
     session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     extensions: ExtensionRegistry,
@@ -399,8 +420,9 @@ async fn modem_accept_loop(
                 is_tls: transport.is_tls(),
                 peer_description: None,
             };
-            let cfg =
+            let mut cfg =
                 session_config_from_timers(&timers, peer_description, extensions.advertised());
+            cfg.initial_metrics = initial_metrics;
             let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
             {
                 let mut senders = commands.lock().await;

@@ -46,6 +46,8 @@ where
 /// Errors surfaced by `--check-config` style validation.
 #[derive(Debug, Error)]
 pub enum ConfigCheckError {
+    #[error("invalid modem metrics: {0}")]
+    Metrics(String),
     #[error(transparent)]
     Tls(#[from] TlsSetupError),
     #[error("mode = \"static\" requires at least one entry in static_peers")]
@@ -66,6 +68,7 @@ pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
 
 /// Validate a modem configuration without starting the daemon.
 pub fn check_modem_config(cfg: &ModemConfig) -> Result<(), ConfigCheckError> {
+    cfg.metrics.validate().map_err(ConfigCheckError::Metrics)?;
     if cfg.shared.network.use_tls {
         server_config(&cfg.shared.tls)?;
     }

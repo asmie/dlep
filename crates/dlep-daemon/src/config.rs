@@ -143,8 +143,55 @@ impl Default for RouterConfig {
     }
 }
 
+/// Initial session-wide modem metrics. Rates are bits/second, latency is
+/// microseconds, resource/link quality values are percentages, and MTU is bytes.
+/// Omitted optional values declare that metric unsupported for the session.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsConfig {
+    pub max_data_rate_rx_bps: u64,
+    pub max_data_rate_tx_bps: u64,
+    pub current_data_rate_rx_bps: u64,
+    pub current_data_rate_tx_bps: u64,
+    pub latency_us: u64,
+    pub resources: Option<u8>,
+    pub rlq_rx: Option<u8>,
+    pub rlq_tx: Option<u8>,
+    pub mtu: Option<u16>,
+}
+
+impl MetricsConfig {
+    pub fn link_metrics(&self) -> dlep_core::LinkMetrics {
+        dlep_core::LinkMetrics {
+            max_data_rate_rx_bps: self.max_data_rate_rx_bps,
+            max_data_rate_tx_bps: self.max_data_rate_tx_bps,
+            current_data_rate_rx_bps: self.current_data_rate_rx_bps,
+            current_data_rate_tx_bps: self.current_data_rate_tx_bps,
+            latency: std::time::Duration::from_micros(self.latency_us),
+            resources: self.resources,
+            rlq_rx: self.rlq_rx,
+            rlq_tx: self.rlq_tx,
+            mtu: self.mtu,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.current_data_rate_rx_bps > self.max_data_rate_rx_bps
+            || self.current_data_rate_tx_bps > self.max_data_rate_tx_bps
+        {
+            return Err("current data rate must not exceed maximum data rate".into());
+        }
+        dlep_fsm::session_common::build_session_update(&self.link_metrics())
+            .encode()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModemConfig {
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     #[serde(flatten)]
     pub shared: SharedConfig,
     #[serde(default = "default_modem_peer_description")]
@@ -154,6 +201,7 @@ pub struct ModemConfig {
 impl Default for ModemConfig {
     fn default() -> Self {
         Self {
+            metrics: MetricsConfig::default(),
             shared: SharedConfig::default(),
             peer_description: default_modem_peer_description(),
         }
