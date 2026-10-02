@@ -383,11 +383,18 @@ impl DiscoverySocket {
             });
             match outcome {
                 Ok(Ok((bytes_read, from, ttl_opt, local, interface_index))) => {
+                    // Missing metadata is a receive error, not evidence that
+                    // this packet arrived on a different interface. Report it
+                    // so the caller can apply its I/O error/backoff policy.
+                    let interface_index =
+                        interface_index.filter(|index| *index != 0).ok_or_else(|| {
+                            io::Error::other("missing packet ingress interface index")
+                        })?;
                     if self
                         .interface
                         .map(|i| i.index)
                         .or_else(|| self.interface_v6.map(|i| i.index))
-                        .is_some_and(|index| Some(index) != interface_index)
+                        .is_some_and(|index| index != interface_index)
                     {
                         // Filter before decode; unrelated interface traffic must
                         // not reach the discovery FSM, even when malformed.
@@ -415,9 +422,7 @@ impl DiscoverySocket {
                         local_addr: local.ok_or_else(|| {
                             io::Error::other("missing packet interface information")
                         })?,
-                        interface_index: interface_index.filter(|index| *index != 0).ok_or_else(
-                            || io::Error::other("missing packet ingress interface index"),
-                        )?,
+                        interface_index,
                     });
                 }
                 Ok(Err(e)) => return Err(e),
@@ -440,6 +445,154 @@ mod tests {
             multicast_loop: true,
             join_group: true,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MissingMetadata {
+        Ttl,
+        PacketInfo,
+    }
+
+    async fn missing_metadata_returns_error_and_receive_recovers(
+        ip: IpAddr,
+        selected_interface: bool,
+        missing: MissingMetadata,
+    ) {
+        use crate::addr::InterfaceSpec;
+        use dlep_core::SignalType;
+        use nix::sys::socket::{setsockopt, sockopt};
+        use std::time::Duration;
+
+        let receiver = match ip {
+            IpAddr::V4(_) => {
+                let mut params = loopback_params(0);
+                params.join_group = false;
+                if !selected_interface {
+                    params.interface_v4 = Ipv4Addr::UNSPECIFIED;
+                }
+                DiscoverySocket::bind(&params).unwrap()
+            }
+            IpAddr::V6(local_address) => DiscoverySocket::bind_v6(
+                &DiscoveryParamsV6 {
+                    group: "ff02::1:7".parse().unwrap(),
+                    local_address,
+                    port: 0,
+                    group_port: None,
+                    multicast_loop: true,
+                    join_group: false,
+                },
+                &InterfaceSpec::Any,
+            )
+            .unwrap(),
+        };
+        let set_metadata = |enabled| {
+            let fd = receiver.fd.get_ref();
+            match (ip, missing) {
+                (IpAddr::V4(_), MissingMetadata::Ttl) => {
+                    setsockopt(fd, sockopt::Ipv4RecvTtl, &enabled)
+                }
+                (IpAddr::V6(_), MissingMetadata::Ttl) => {
+                    setsockopt(fd, sockopt::Ipv6RecvHopLimit, &enabled)
+                }
+                (IpAddr::V4(_), MissingMetadata::PacketInfo) => {
+                    setsockopt(fd, sockopt::Ipv4PacketInfo, &enabled)
+                }
+                (IpAddr::V6(_), MissingMetadata::PacketInfo) => {
+                    setsockopt(fd, sockopt::Ipv6RecvPacketInfo, &enabled)
+                }
+            }
+            .unwrap();
+        };
+        let sender = std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let socket = socket2::SockRef::from(&sender);
+        if ip.is_ipv6() {
+            socket.set_unicast_hops_v6(255).unwrap();
+        } else {
+            socket.set_ttl(255).unwrap();
+        }
+        let dest = SocketAddr::new(ip, receiver.local_port());
+        let valid = Signal::new(SignalType::PEER_DISCOVERY).encode().unwrap();
+
+        set_metadata(false);
+        sender.send_to(&valid, dest).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), receiver.recv_with_metadata())
+            .await
+            .expect("missing metadata must return an error, not silently wait for another packet")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let expected = match missing {
+            MissingMetadata::Ttl => "TTL/hop-limit",
+            MissingMetadata::PacketInfo => "interface",
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+
+        // Restore the socket option, not the socket itself: an errored receive
+        // must consume that datagram and leave subsequent packets usable.
+        set_metadata(true);
+        sender.send_to(&valid, dest).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), receiver.recv_with_metadata())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.signal.signal_type, SignalType::PEER_DISCOVERY);
+        assert_eq!(received.from, sender.local_addr().unwrap());
+        assert_eq!(received.ttl, 255);
+        assert_eq!(received.local_addr, ip);
+        let loopback = InterfaceSpec::Any
+            .resolve_v4(Ipv4Addr::LOCALHOST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.interface_index, loopback.index);
+    }
+
+    #[tokio::test]
+    async fn ipv4_missing_ttl_returns_error_and_receive_recovers() {
+        missing_metadata_returns_error_and_receive_recovers(
+            Ipv4Addr::LOCALHOST.into(),
+            true,
+            MissingMetadata::Ttl,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ipv6_missing_hop_limit_returns_error_and_receive_recovers() {
+        missing_metadata_returns_error_and_receive_recovers(
+            Ipv6Addr::LOCALHOST.into(),
+            true,
+            MissingMetadata::Ttl,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ipv4_selected_interface_missing_packet_info_returns_error_and_receive_recovers() {
+        missing_metadata_returns_error_and_receive_recovers(
+            Ipv4Addr::LOCALHOST.into(),
+            true,
+            MissingMetadata::PacketInfo,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ipv4_any_interface_missing_packet_info_returns_error_and_receive_recovers() {
+        missing_metadata_returns_error_and_receive_recovers(
+            Ipv4Addr::LOCALHOST.into(),
+            false,
+            MissingMetadata::PacketInfo,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ipv6_missing_packet_info_returns_error_and_receive_recovers() {
+        missing_metadata_returns_error_and_receive_recovers(
+            Ipv6Addr::LOCALHOST.into(),
+            true,
+            MissingMetadata::PacketInfo,
+        )
+        .await;
     }
 
     async fn rejects_bad_packets_before_accepting_valid_signal(ip: IpAddr) {

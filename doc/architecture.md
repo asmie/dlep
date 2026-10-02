@@ -358,8 +358,8 @@ Two additional transport regressions exercise the TLS accept deadline with
 real IPv4/IPv6 sockets and strict GTSM. A silent TCP peer times out and releases
 its socket and monitor registration while another TLS peer on the same listener
 completes its handshake and remains usable. These tests do not change production
-behavior; the coverage percentages above predate them. The local full suite now
-passes **429 tests**, with formatting, clippy, and Rust 1.85 checks passing.
+behavior; the coverage percentages above predate them. That checkpoint's local
+full suite passed **429 tests**, with formatting, clippy, and Rust 1.85 checks passing.
 The [audit run for `3e006eb`](https://github.com/asmie/dlep/actions/runs/37048857781)
 passes, but its Linux test job reported a connection reset in the modem shutdown
 regression. Local stress testing reproduced the reset during initialization:
@@ -369,7 +369,21 @@ now let the modem allocate its own port and wait for its listening-address log.
 The stalled-TLS case also waits for a server handshake record before signalling
 shutdown, proving the connection has been accepted. Both shutdown suites passed
 200 repetitions each with four suites running concurrently (1,600 test
-executions total). Verification of this fix in pushed-commit CI is still pending.
+executions total). Pushed commit `166a5e9` subsequently passed every
+[CI job](https://github.com/asmie/dlep/actions/runs/37053643843), including Linux
+tests, coverage collection/upload, workflow lint, formatting, clippy, Rust 1.85,
+and portable macOS tests, plus the
+[dependency audit](https://github.com/asmie/dlep/actions/runs/37053643857).
+
+Five further real-UDP regressions disable TTL/hop-limit or packet-info reporting
+to check missing-metadata errors and recovery on the same socket. They exposed
+an error-classification bug: with a selected interface, absent packet info was
+silently treated as traffic from another interface. The receive path now reports
+the missing ingress index before applying the interface filter. Valid traffic
+from other interfaces remains filtered before decoding. The full local suite
+passes **434 tests**; formatting, clippy with warnings denied, and Rust 1.85
+checks for all targets/features also pass. Coverage was not recollected for
+this checkpoint.
 
 | Layer | Where | Coverage |
 |---|---|---|
