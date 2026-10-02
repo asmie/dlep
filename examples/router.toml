@@ -2,8 +2,8 @@
 # Copy to /etc/dlep/router.toml and adjust paths and addresses.
 # See doc/deployment.md for the full walkthrough.
 #
-# Note: misspelled keys are silently ignored at the top level — validate
-# edits with `dlep-router --config <file> --check-config` (or dlep-modem).
+# Unknown keys and sections are rejected. Validate all configuration values
+# with `dlep-router --config <file> --check-config` (or dlep-modem).
 
 # How the router finds its modem:
 #   "discovery" — RFC 8175 UDP multicast Peer Discovery (default)
@@ -39,5 +39,7 @@ cert = "/etc/dlep/pki/router.pem"
 key = "/etc/dlep/pki/router.key"
 
 [timers]
+# Heartbeat/discovery intervals must be >= 1000 ms.
+# session_init_timeout_ms and termination_timeout_ms must be > 0.
 heartbeat_interval_ms = 60000
 discovery_interval_ms = 5000

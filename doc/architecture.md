@@ -495,6 +495,19 @@ The order of work was:
     prompt shutdown during stalled TLS. Cancellation tests exercise blocked
     registration for both router sessions and discovery tasks.
 
+19. Configuration validation. **Done** — strict file schemas reject unknown
+    top-level keys and sections, as well as settings for the wrong role. These
+    schemas avoid Serde's unsupported combination of flattening and unknown-field
+    rejection; the public `shared` struct layout and TOML serialization stay the
+    same. Default and partial configurations remain supported.
+
+    `TimersConfig::validate` is shared by config checks and daemon startup,
+    before socket creation. Heartbeat and discovery intervals must be at least
+    1000 ms; initialization and termination deadlines must be positive. Tests
+    cover invalid values, accepted boundaries, file-path diagnostics, preserved
+    values through serialization, examples, and both actual `--check-config`
+    executables. Existing timer defaults are unchanged.
+
 ---
 
 ## 10. Open questions / risks

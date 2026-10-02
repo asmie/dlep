@@ -132,8 +132,10 @@ pub struct TlsConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimersConfig {
+    /// At least 1000 ms (RFC 8175 §7.3.1).
     #[serde(default = "default_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u32,
+    /// At least 1000 ms (RFC 8175 §7.1).
     #[serde(default = "default_discovery_interval_ms")]
     pub discovery_interval_ms: u32,
     /// Deadline waiting for Session Initialization Response after Session
@@ -145,6 +147,26 @@ pub struct TimersConfig {
     /// Termination is sent.
     #[serde(default = "default_termination_timeout_ms")]
     pub termination_timeout_ms: u32,
+}
+
+impl TimersConfig {
+    /// Reject values that would disable failure detection or flood discovery.
+    /// Called for both file checks and programmatically configured daemons.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value, minimum) in [
+            ("heartbeat_interval_ms", self.heartbeat_interval_ms, 1_000),
+            ("discovery_interval_ms", self.discovery_interval_ms, 1_000),
+            ("session_init_timeout_ms", self.session_init_timeout_ms, 1),
+            ("termination_timeout_ms", self.termination_timeout_ms, 1),
+        ] {
+            if value < minimum {
+                return Err(format!(
+                    "timers.{name} must be at least {minimum} ms (got {value})"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_heartbeat_interval_ms() -> u32 {
@@ -172,6 +194,7 @@ impl Default for TimersConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedConfig {
     #[serde(default)]
     pub network: NetworkConfig,
@@ -190,6 +213,7 @@ pub enum DiscoveryMode {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(from = "RouterConfigFile")]
 pub struct RouterConfig {
     #[serde(flatten)]
     pub shared: SharedConfig,
@@ -258,6 +282,7 @@ impl MetricsConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(from = "ModemConfigFile")]
 pub struct ModemConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -277,6 +302,70 @@ impl Default for ModemConfig {
     }
 }
 
+// Serde's deny_unknown_fields does not support flattened structs. Deserialize
+// a strict, flat file schema while preserving the public `shared` layout and
+// the existing flattened serialization format.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouterConfigFile {
+    #[serde(default)]
+    network: NetworkConfig,
+    #[serde(default)]
+    tls: TlsConfig,
+    #[serde(default)]
+    timers: TimersConfig,
+    #[serde(default)]
+    mode: DiscoveryMode,
+    #[serde(default)]
+    static_peers: Vec<SocketAddr>,
+    #[serde(default = "default_router_peer_description")]
+    peer_description: String,
+}
+
+impl From<RouterConfigFile> for RouterConfig {
+    fn from(file: RouterConfigFile) -> Self {
+        Self {
+            shared: SharedConfig {
+                network: file.network,
+                tls: file.tls,
+                timers: file.timers,
+            },
+            mode: file.mode,
+            static_peers: file.static_peers,
+            peer_description: file.peer_description,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModemConfigFile {
+    #[serde(default)]
+    network: NetworkConfig,
+    #[serde(default)]
+    tls: TlsConfig,
+    #[serde(default)]
+    timers: TimersConfig,
+    #[serde(default)]
+    metrics: MetricsConfig,
+    #[serde(default = "default_modem_peer_description")]
+    peer_description: String,
+}
+
+impl From<ModemConfigFile> for ModemConfig {
+    fn from(file: ModemConfigFile) -> Self {
+        Self {
+            shared: SharedConfig {
+                network: file.network,
+                tls: file.tls,
+                timers: file.timers,
+            },
+            metrics: file.metrics,
+            peer_description: file.peer_description,
+        }
+    }
+}
+
 fn default_router_peer_description() -> String {
     "dlep-router".into()
 }
@@ -288,6 +377,61 @@ fn default_modem_peer_description() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_top_level_keys_and_sections_are_rejected() {
+        for (text, unknown) in [
+            ("peer_descripton = 'typo'", "peer_descripton"),
+            ("[netwrok]\nuse_tls = false", "netwrok"),
+            ("[timer]", "timer"),
+            ("[shared.network]\nuse_tls = false", "shared"),
+        ] {
+            for error in [
+                toml::from_str::<RouterConfig>(text).unwrap_err(),
+                toml::from_str::<ModemConfig>(text).unwrap_err(),
+            ] {
+                assert!(error.to_string().contains(unknown), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_for_the_wrong_role_are_rejected() {
+        assert!(toml::from_str::<RouterConfig>("[metrics]\nlatency_us = 10").is_err());
+        assert!(toml::from_str::<ModemConfig>("mode = 'static'").is_err());
+        assert!(toml::from_str::<ModemConfig>("static_peers = ['127.0.0.1:854']").is_err());
+    }
+
+    #[test]
+    fn strict_file_schema_preserves_examples_and_serialized_values() {
+        fn preserves_supplied_values(actual: &toml::Value, supplied: &toml::Value) {
+            if let toml::Value::Table(fields) = supplied {
+                for (name, value) in fields {
+                    preserves_supplied_values(&actual[name], value);
+                }
+            } else {
+                assert_eq!(actual, supplied);
+            }
+        }
+        fn roundtrip<T: serde::de::DeserializeOwned + Serialize>(text: &str) {
+            let config: T = toml::from_str(text).unwrap();
+            let serialized = toml::to_string(&config).unwrap();
+            preserves_supplied_values(
+                &toml::from_str::<toml::Value>(&serialized).unwrap(),
+                &toml::from_str::<toml::Value>(text).unwrap(),
+            );
+            let decoded: T = toml::from_str(&serialized).unwrap();
+            assert_eq!(toml::to_string(&decoded).unwrap(), serialized);
+        }
+        roundtrip::<RouterConfig>(include_str!("../../../examples/router.toml"));
+        roundtrip::<ModemConfig>(include_str!("../../../examples/modem.toml"));
+        roundtrip::<RouterConfig>(
+            "mode = 'static'\nstatic_peers = ['[::1]:854']\npeer_description = 'router ü'\n[network]\nbind_addr = '::1'\n[timers]\nheartbeat_interval_ms = 2000\n[tls]\nrequire_client_cert = true",
+        );
+        roundtrip::<ModemConfig>(
+            "peer_description = 'modem ü'\n[network]\ntcp_port = 9999\n[timers]\ndiscovery_interval_ms = 3000\n[metrics]\nresources = 0\nmtu = 1500\n[tls]\ncert = 'modem.pem'",
+        );
+    }
 
     #[test]
     fn partial_network_section_uses_defaults() {

@@ -46,6 +46,8 @@ where
 /// Errors surfaced by `--check-config` style validation.
 #[derive(Debug, Error)]
 pub enum ConfigCheckError {
+    #[error("invalid timers: {0}")]
+    Timers(String),
     #[error("invalid discovery interface: {0}")]
     Interface(#[source] std::io::Error),
     #[error("invalid modem metrics: {0}")]
@@ -59,6 +61,10 @@ pub enum ConfigCheckError {
 /// Validate a router configuration without starting the daemon: TLS
 /// material must load when `use_tls` is on, and static mode needs peers.
 pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
+    cfg.shared
+        .timers
+        .validate()
+        .map_err(ConfigCheckError::Timers)?;
     cfg.shared
         .network
         .validate_discovery_interface()
@@ -74,6 +80,10 @@ pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
 
 /// Validate a modem configuration without starting the daemon.
 pub fn check_modem_config(cfg: &ModemConfig) -> Result<(), ConfigCheckError> {
+    cfg.shared
+        .timers
+        .validate()
+        .map_err(ConfigCheckError::Timers)?;
     cfg.shared
         .network
         .validate_discovery_interface()

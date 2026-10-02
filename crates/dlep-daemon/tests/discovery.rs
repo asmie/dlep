@@ -52,7 +52,7 @@ fn loopback_modem_config() -> ModemConfig {
             timers: TimersConfig {
                 // Fast resend so the test closes quickly even if the first
                 // multicast probe is dropped (UDP).
-                discovery_interval_ms: 200,
+                discovery_interval_ms: 1_000,
                 ..TimersConfig::default()
             },
             ..SharedConfig::default()
@@ -71,7 +71,7 @@ fn loopback_router_config() -> RouterConfig {
                 ..NetworkConfig::default()
             },
             timers: TimersConfig {
-                discovery_interval_ms: 200,
+                discovery_interval_ms: 1_000,
                 ..TimersConfig::default()
             },
             ..SharedConfig::default()

@@ -255,6 +255,10 @@ impl ModemBuilder {
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
         cfg.shared
+            .timers
+            .validate()
+            .map_err(|e| DaemonError::Config(format!("invalid timers: {e}")))?;
+        cfg.shared
             .network
             .validate_discovery_interface()
             .map_err(|e| DaemonError::Config(e.to_string()))?;

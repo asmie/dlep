@@ -104,6 +104,10 @@ discovery_interval_ms = 5000
 
 The full schema (network, TLS, timers, plus router/modem-specific keys) is
 documented in [§6 of `doc/architecture.md`](doc/architecture.md#6-configuration).
+Unknown keys and sections are rejected, including at the top level. Run
+`--check-config` after editing. Heartbeat and discovery intervals must be at
+least 1000 ms; initialization and termination timeouts must be positive.
+Daemon builders enforce the same timer limits for programmatic configuration.
 
 > Port **854** is below 1024 and requires `CAP_NET_BIND_SERVICE` on Linux
 > (`setcap cap_net_bind_service=+ep` on the binary, or

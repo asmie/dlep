@@ -69,9 +69,10 @@ Both binaries read a TOML file via `--config/-c` (env:
 [`examples/router.toml`](../examples/router.toml) and
 [`examples/modem.toml`](../examples/modem.toml). All sections and fields
 are optional; defaults follow the RFC (port 854, TLS on, discovery on).
-Misspelled keys inside `[network]`/`[tls]`/`[timers]`/`[metrics]` are rejected at
-parse time; top-level typos are silently ignored, so always finish an
-edit with `--check-config`.
+Unknown keys and sections are rejected at parse time, including top-level
+typos and settings for the wrong role (such as `[metrics]` on the router).
+Finish each edit with `--check-config` to validate timer values, interfaces,
+metrics, and TLS material as well.
 
 | Section | Field | Default | Meaning |
 |---|---|---|---|
@@ -89,10 +90,10 @@ edit with `--check-config`.
 | `[tls]` | `cert` / `key` | none | identity (modem: required; router: mTLS) |
 | `[tls]` | `ca_bundle` | none | trust roots (router: required; modem: for mTLS) |
 | `[tls]` | `require_client_cert` | `false` | modem requires router client certs |
-| `[timers]` | `heartbeat_interval_ms` | `60000` | RFC 8175 heartbeat interval |
-| `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval |
-| `[timers]` | `session_init_timeout_ms` | `5000` | deadline for Session Initialization Response |
-| `[timers]` | `termination_timeout_ms` | `1000` | deadline for Session Termination Response |
+| `[timers]` | `heartbeat_interval_ms` | `60000` | heartbeat interval, minimum 1000 ms |
+| `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval, minimum 1000 ms |
+| `[timers]` | `session_init_timeout_ms` | `5000` | positive deadline for Session Initialization Response |
+| `[timers]` | `termination_timeout_ms` | `1000` | positive deadline for Session Termination Response |
 | `[metrics]` (modem) | `max_data_rate_rx_bps` / `max_data_rate_tx_bps` | `0` | maximum receive/transmit rates, bits/second |
 | `[metrics]` (modem) | `current_data_rate_rx_bps` / `current_data_rate_tx_bps` | `0` | current receive/transmit rates, bits/second |
 | `[metrics]` (modem) | `latency_us` | `0` | transmission delay, microseconds |
@@ -160,7 +161,13 @@ dlep-modem  --config /etc/dlep/modem.toml  --check-config
 
 `configuration OK` on stdout and exit code 0 mean the TOML parses, static
 mode has peers, any explicit discovery interface is usable on this host, modem
-metric values pass validation, and all TLS material loads.
+metric values and timers pass validation, and all TLS material loads.
+
+Timer limits are checked by `--check-config` and by both daemon builders before
+opening sockets. Heartbeat and discovery intervals below 1000 ms are rejected
+(RFC 8175 §7.3.1 and §7.1); initialization and termination timeouts must be at
+least 1 ms. Errors name the field, minimum, and supplied value. Zero does not
+disable a timer. Existing defaults remain unchanged.
 
 ## 4. Port 854 privileges
 

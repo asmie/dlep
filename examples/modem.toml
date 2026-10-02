@@ -2,8 +2,8 @@
 # Copy to /etc/dlep/modem.toml and adjust paths and addresses.
 # See doc/deployment.md for the full walkthrough.
 #
-# Note: misspelled keys are silently ignored at the top level — validate
-# edits with `dlep-modem --config <file> --check-config` (or dlep-router).
+# Unknown keys and sections are rejected. Validate all configuration values
+# with `dlep-modem --config <file> --check-config` (or dlep-router).
 
 # Free-text description sent in the Peer Type data item.
 peer_description = "dlep-modem"
@@ -36,6 +36,8 @@ require_client_cert = true
 ca_bundle = "/etc/dlep/pki/ca.pem"
 
 [timers]
+# Heartbeat/discovery intervals must be >= 1000 ms.
+# session_init_timeout_ms and termination_timeout_ms must be > 0.
 heartbeat_interval_ms = 60000
 
 # Initial link metrics. Replace these illustrative values with actual link data.
