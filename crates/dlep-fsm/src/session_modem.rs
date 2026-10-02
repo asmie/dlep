@@ -1,3 +1,4 @@
+use crate::{AddressChanges, DestinationAddrs};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -44,6 +45,8 @@ pub struct ModemSessionFsm {
     pub state: ModemSessionState,
     pub tx: TransactionTracker,
     pub destinations: HashMap<MacAddress, DestinationState>,
+    pub peer_addresses: DestinationAddrs,
+    local_addresses: DestinationAddrs,
     config: SessionConfig,
     termination_reason: StatusCode,
     /// Peer's announced heartbeat interval, captured from the Heartbeat
@@ -65,6 +68,7 @@ pub struct DestinationState {
     pub pending_metrics: bool,
     pub metrics: LinkMetrics,
     pub addrs: crate::events::DestinationAddrs,
+    pub advertised_addrs: DestinationAddrs,
 }
 
 impl Default for ModemSessionFsm {
@@ -86,6 +90,8 @@ impl ModemSessionFsm {
             state: ModemSessionState::Listening,
             tx: TransactionTracker::default(),
             destinations: HashMap::new(),
+            peer_addresses: DestinationAddrs::default(),
+            local_addresses: DestinationAddrs::default(),
             config,
             termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
@@ -115,6 +121,10 @@ impl ModemSessionFsm {
                 let checked =
                     validate_message(msg, false, initializing, &self.config.advertised_extensions)
                         .and_then(|()| {
+                            if initializing || msg.message_type == MessageType::SESSION_UPDATE {
+                                let mut addresses = self.peer_addresses.clone();
+                                AddressChanges::from_message(msg).apply_strict(&mut addresses)?;
+                            }
                             if initializing {
                                 return Ok(());
                             }
@@ -161,6 +171,7 @@ impl ModemSessionFsm {
             (ModemSessionState::AwaitingSessionInit, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::SESSION_INITIALIZATION =>
             {
+                self.peer_addresses = AddressChanges::from_message(&msg).added;
                 self.peer_heartbeat_interval = extract_heartbeat_interval(&msg);
                 self.peer_extensions = match extract_extensions_supported(&msg) {
                     Some(ids) => ids,
@@ -191,6 +202,15 @@ impl ModemSessionFsm {
                 actions.push(FsmAction::Emit(EmittedEvent::SessionUp {
                     peer_extensions: self.peer_extensions.clone(),
                 }));
+                if !self.peer_addresses.is_empty() {
+                    actions.push(FsmAction::Emit(EmittedEvent::SessionAddressesUpdate {
+                        changes: Box::new(AddressChanges {
+                            added: self.peer_addresses.clone(),
+                            removed: DestinationAddrs::default(),
+                        }),
+                        addresses: self.peer_addresses.clone(),
+                    }));
+                }
                 actions
             }
             (
@@ -257,6 +277,19 @@ impl ModemSessionFsm {
                 },
             ) => {
                 use crate::transaction::RequestKind;
+                let addrs = addrs.canonical();
+                if (AddressChanges {
+                    added: addrs.clone(),
+                    removed: Default::default(),
+                })
+                .validate()
+                .is_err()
+                    || build_destination_up(mac, &metrics, &addrs)
+                        .encode()
+                        .is_err()
+                {
+                    return Vec::new();
+                }
                 if self.destinations.contains_key(&mac) {
                     return Vec::new();
                 }
@@ -274,7 +307,8 @@ impl ModemSessionFsm {
                         announced: false,
                         pending_metrics: false,
                         metrics,
-                        addrs: addrs.clone(),
+                        addrs: addrs.canonical(),
+                        advertised_addrs: addrs.canonical(),
                     },
                 );
                 vec![FsmAction::SendMessage(build_destination_up(
@@ -296,11 +330,17 @@ impl ModemSessionFsm {
                     if status == StatusCode::SUCCESS {
                         if let Some(d) = self.destinations.get_mut(&mac) {
                             d.announced = true;
-                            if d.pending_metrics {
-                                actions.push(FsmAction::SendMessage(build_destination_update(
-                                    mac, &d.metrics,
-                                )));
+                            let changes = AddressChanges::between(&d.advertised_addrs, &d.addrs);
+                            if d.pending_metrics || !changes.is_empty() {
+                                let message = if d.pending_metrics {
+                                    build_destination_update(mac, &d.metrics)
+                                } else {
+                                    Message::new(MessageType::DESTINATION_UPDATE)
+                                        .with_item(DataItem::MacAddress(mac))
+                                };
+                                actions.push(FsmAction::SendMessage(changes.append_to(message)));
                                 d.pending_metrics = false;
+                                d.advertised_addrs = d.addrs.clone();
                             }
                         }
                     } else {
@@ -333,6 +373,39 @@ impl ModemSessionFsm {
                 vec![FsmAction::SendMessage(build_destination_update(
                     mac, &metrics,
                 ))]
+            }
+            (ModemSessionState::InSession, FsmEvent::AppUpdateAddresses { mac, changes }) => {
+                if changes.validate().is_err() {
+                    return Vec::new();
+                }
+                let Some(destination) = self.destinations.get_mut(&mac) else {
+                    return Vec::new();
+                };
+                let mut desired = destination.addrs.clone();
+                changes.apply_lenient(&mut desired);
+                // Retained snapshots must also fit a later Up/Announce response.
+                if build_destination_up(mac, &destination.metrics, &desired)
+                    .encode()
+                    .is_err()
+                {
+                    return Vec::new();
+                }
+                destination.addrs = desired;
+                if !destination.announced || self.tx.destination_busy(&mac) {
+                    return Vec::new();
+                }
+                let effective =
+                    AddressChanges::between(&destination.advertised_addrs, &destination.addrs);
+                if effective.is_empty() {
+                    return Vec::new();
+                }
+                destination.advertised_addrs = destination.addrs.clone();
+                vec![FsmAction::SendMessage(
+                    effective.append_to(
+                        Message::new(MessageType::DESTINATION_UPDATE)
+                            .with_item(DataItem::MacAddress(mac)),
+                    ),
+                )]
             }
             // InSession: app asks us to tear down a previously announced
             // destination. RFC 8175 §11.5 — open a per-destination transaction
@@ -412,6 +485,16 @@ impl ModemSessionFsm {
                 let mut actions = vec![FsmAction::SendMessage(build_session_update_response(
                     StatusCode::SUCCESS,
                 ))];
+                let changes = AddressChanges::from_message(&msg);
+                changes
+                    .apply_strict(&mut self.peer_addresses)
+                    .expect("validated peer addresses");
+                if !changes.is_empty() {
+                    actions.push(FsmAction::Emit(EmittedEvent::SessionAddressesUpdate {
+                        changes: Box::new(changes),
+                        addresses: self.peer_addresses.clone(),
+                    }));
+                }
                 if let Some(reset) =
                     heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
                 {
@@ -446,10 +529,14 @@ impl ModemSessionFsm {
                     });
                     destination.announced = true;
                     destination.pending_metrics = false;
+                    destination.advertised_addrs = destination.addrs.clone();
                 }
                 let mut actions = vec![
                     FsmAction::SendMessage(response),
-                    FsmAction::Emit(EmittedEvent::DestinationAnnounced { mac }),
+                    FsmAction::Emit(EmittedEvent::DestinationAnnounced {
+                        mac,
+                        requested_addresses: AddressChanges::from_message(&msg),
+                    }),
                 ];
                 if let Some(reset) =
                     heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
@@ -478,6 +565,13 @@ impl ModemSessionFsm {
                     self.peer_heartbeat_interval,
                 ));
                 actions
+            }
+            (ModemSessionState::InSession, FsmEvent::AppSessionAddresses { changes }) => {
+                crate::session_common::apply_local_address_update(
+                    &mut self.tx,
+                    &mut self.local_addresses,
+                    changes,
+                )
             }
             // Negotiated extension traffic also keeps the session alive.
             (ModemSessionState::InSession, FsmEvent::RecvExtensionMessage) => {

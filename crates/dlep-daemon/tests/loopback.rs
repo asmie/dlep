@@ -492,7 +492,7 @@ async fn router_announce_destination_is_acknowledged_by_modem() {
         .expect("announce_destination");
     await_destination_event(
         &mut modem_events,
-        |d| matches!(d, DestinationEvent::Announced { id: got } if *got == id),
+        |d| matches!(d, DestinationEvent::Announced { id: got, .. } if *got == id),
     )
     .await;
 

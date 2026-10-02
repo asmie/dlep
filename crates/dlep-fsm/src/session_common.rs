@@ -90,6 +90,33 @@ pub fn build_session_update_response(status: StatusCode) -> Message {
     })
 }
 
+/// Originate an address-only Session Update on either role. Applications may
+/// repeat desired changes; only actual changes are sent, avoiding inconsistent
+/// wire updates. Busy commands follow the existing no-queue convention.
+pub fn apply_local_address_update(
+    tx: &mut crate::transaction::TransactionTracker,
+    local: &mut DestinationAddrs,
+    changes: crate::AddressChanges,
+) -> Vec<FsmAction> {
+    if tx.session_busy() || changes.validate().is_err() {
+        return Vec::new();
+    }
+    let mut desired = local.clone();
+    changes.apply_lenient(&mut desired);
+    let effective = crate::AddressChanges::between(local, &desired);
+    if effective.is_empty() {
+        return Vec::new();
+    }
+    let message = effective.append_to(Message::new(MessageType::SESSION_UPDATE));
+    if message.encode().is_err() {
+        return Vec::new();
+    }
+    tx.open_session(crate::transaction::RequestKind::SessionUpdate)
+        .expect("checked transaction");
+    *local = desired;
+    vec![FsmAction::SendMessage(message)]
+}
+
 /// RFC 8175 §12.18: only the characteristics explicitly requested are sent.
 pub fn build_link_characteristics_request(
     mac: MacAddress,
@@ -354,21 +381,12 @@ pub fn merge_link_metrics(msg: &Message, m: &mut LinkMetrics) -> bool {
     found
 }
 
-/// Collect every `Ipv4Address` / `Ipv6Address` / `Ipv4AttachedSubnet` /
-/// `Ipv6AttachedSubnet` Data Item with `add == true`. Remove-style entries
-/// (`add == false`) are ignored for M5.
+/// Construct an initial destination snapshot, tolerating destination-level
+/// address inconsistencies as required by §13.8.1–13.11.1.
 pub fn extract_destination_addrs(msg: &Message) -> DestinationAddrs {
-    let mut out = DestinationAddrs::default();
-    for item in &msg.data_items {
-        match item {
-            DataItem::Ipv4Address { add: true, addr } => out.v4.push(*addr),
-            DataItem::Ipv6Address { add: true, addr } => out.v6.push(*addr),
-            DataItem::Ipv4AttachedSubnet { add: true, subnet } => out.v4_subnets.push(*subnet),
-            DataItem::Ipv6AttachedSubnet { add: true, subnet } => out.v6_subnets.push(*subnet),
-            _ => {}
-        }
-    }
-    out
+    let mut addresses = DestinationAddrs::default();
+    crate::AddressChanges::from_message(msg).apply_lenient(&mut addresses);
+    addresses
 }
 
 fn push_metric_items(mut msg: Message, m: &LinkMetrics) -> Message {

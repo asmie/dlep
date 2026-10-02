@@ -1056,6 +1056,7 @@ fn modem_in_session_app_drop_destination_sends_down() {
             pending_metrics: false,
             metrics: sample_metrics_dest(),
             addrs: DestinationAddrs::default(),
+            advertised_addrs: DestinationAddrs::default(),
         },
     );
     let actions = fsm.step(FsmEvent::AppDropDestination {
@@ -1086,6 +1087,7 @@ fn modem_in_session_destination_down_response_removes_local() {
             pending_metrics: false,
             metrics: sample_metrics_dest(),
             addrs: DestinationAddrs::default(),
+            advertised_addrs: DestinationAddrs::default(),
         },
     );
     let _ = fsm.step(FsmEvent::AppDropDestination {
@@ -1106,6 +1108,7 @@ fn router_in_session_destination_down_responds_and_emits() {
     fsm.destinations.insert(
         dest_mac(),
         dlep_fsm::session_router::DestinationState {
+            addrs: DestinationAddrs::default(),
             up: true,
             metrics: sample_metrics_dest(),
         },
@@ -1327,7 +1330,7 @@ fn modem_in_session_destination_announce_emits_announced() {
     let actions = fsm.step(FsmEvent::RecvMessage(make_destination_announce(dest_mac())));
     assert!(actions.iter().any(|a| matches!(
         a,
-        FsmAction::Emit(EmittedEvent::DestinationAnnounced { mac }) if *mac == dest_mac()
+        FsmAction::Emit(EmittedEvent::DestinationAnnounced { mac, .. }) if *mac == dest_mac()
     )));
 }
 

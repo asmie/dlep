@@ -54,10 +54,43 @@ impl ModemDaemon {
         id: DestinationId,
         metrics: LinkMetrics,
     ) -> Result<(), DaemonError> {
+        self.add_destination_with_addresses(id, metrics, dlep_fsm::DestinationAddrs::default())
+            .await
+    }
+
+    /// Advertise a destination together with its initial IPv4/IPv6 addresses
+    /// and attached subnets. Subsequent changes use update_destination_addresses.
+    pub async fn add_destination_with_addresses(
+        &self,
+        id: DestinationId,
+        metrics: LinkMetrics,
+        addresses: dlep_fsm::DestinationAddrs,
+    ) -> Result<(), DaemonError> {
+        let changes = dlep_fsm::AddressChanges {
+            added: addresses.canonical(),
+            removed: Default::default(),
+        };
+        crate::runtime::validate_address_changes(&changes)?;
+        dlep_fsm::session_common::build_destination_up(id.0, &metrics, &changes.added).encode()?;
         self.fanout(SessionCommand::AddDestination {
             mac: id.0,
             metrics,
-            addrs: dlep_fsm::DestinationAddrs::default(),
+            addrs: changes.added,
+        })
+        .await
+    }
+
+    /// Send effective address additions/removals to subscribed routers. Changes
+    /// during Up acknowledgement are coalesced and sent once Up completes.
+    pub async fn update_destination_addresses(
+        &self,
+        id: DestinationId,
+        changes: dlep_fsm::AddressChanges,
+    ) -> Result<(), DaemonError> {
+        crate::runtime::validate_address_changes(&changes)?;
+        self.fanout(SessionCommand::UpdateDestinationAddresses {
+            mac: id.0,
+            changes: changes.canonical(),
         })
         .await
     }
@@ -86,6 +119,23 @@ impl ModemDaemon {
     /// [`Self::update_destination`].
     pub async fn update_session_metrics(&self, metrics: LinkMetrics) -> Result<(), DaemonError> {
         self.fanout(SessionCommand::SessionUpdate { metrics }).await
+    }
+
+    /// Advertise local peer-address/subnet changes on one session. This sends
+    /// an address-only Session Update; it does not alter destination metrics.
+    /// Repeated adds/absent removes are local no-ops. Busy session transactions
+    /// follow the current no-queue command convention.
+    pub async fn update_session_addresses(
+        &self,
+        session_id: dlep_ext::SessionId,
+        changes: dlep_fsm::AddressChanges,
+    ) -> Result<(), DaemonError> {
+        crate::runtime::validate_address_changes(&changes)?;
+        self.fanout(SessionCommand::UpdateSessionAddresses {
+            session_id,
+            changes: changes.canonical(),
+        })
+        .await
     }
 
     /// Fan a command to every active session. Snapshot the sender list under

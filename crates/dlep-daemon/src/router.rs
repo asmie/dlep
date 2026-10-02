@@ -253,6 +253,23 @@ impl RouterDaemon {
         ))
     }
 
+    /// Advertise local peer-address/subnet changes on one session. This sends
+    /// an address-only Session Update; it does not alter destination metrics.
+    /// Repeated adds/absent removes are local no-ops. Busy session transactions
+    /// follow the current no-queue command convention.
+    pub async fn update_session_addresses(
+        &self,
+        session_id: dlep_ext::SessionId,
+        changes: dlep_fsm::AddressChanges,
+    ) -> Result<(), DaemonError> {
+        crate::runtime::validate_address_changes(&changes)?;
+        self.fanout(SessionCommand::UpdateSessionAddresses {
+            session_id,
+            changes: changes.canonical(),
+        })
+        .await
+    }
+
     /// Fan a command to every active session. Snapshot the sender list under
     /// the lock so we don't hold the mutex across `await`; a session that
     /// already exited and dropped its receiver is not the caller's problem.

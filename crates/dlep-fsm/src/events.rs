@@ -1,9 +1,7 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 pub use dlep_core::{LinkCharacteristics, LinkMetrics};
 use dlep_core::{MacAddress, Message, Signal, StatusCode};
-use ipnet::{Ipv4Net, Ipv6Net};
 
 use crate::timers::{TimerId, TimerKind};
 
@@ -18,18 +16,7 @@ pub enum SendTarget {
     Unicast(std::net::SocketAddr),
 }
 
-/// Address / subnet payload accompanying a destination. All four vectors
-/// may be empty — the modem reports only what it knows. The `add` flag is
-/// implicit (true for the Up / Update direction); the FSM never emits
-/// remove-style entries until a follow-up plan adds the `Address Remove`
-/// path.
-#[derive(Clone, Debug, Default)]
-pub struct DestinationAddrs {
-    pub v4: Vec<Ipv4Addr>,
-    pub v6: Vec<Ipv6Addr>,
-    pub v4_subnets: Vec<Ipv4Net>,
-    pub v6_subnets: Vec<Ipv6Net>,
-}
+pub use crate::addresses::{AddressChanges, DestinationAddrs};
 
 /// Inbound events consumed by any FSM.
 #[derive(Debug)]
@@ -66,6 +53,13 @@ pub enum FsmEvent {
     AppUpdateMetrics {
         mac: MacAddress,
         metrics: LinkMetrics,
+    },
+    AppUpdateAddresses {
+        mac: MacAddress,
+        changes: AddressChanges,
+    },
+    AppSessionAddresses {
+        changes: AddressChanges,
     },
     AppAnnounceDestination {
         mac: MacAddress,
@@ -144,6 +138,15 @@ pub enum EmittedEvent {
         mac: MacAddress,
         metrics: LinkMetrics,
     },
+    DestinationAddressesUpdate {
+        mac: MacAddress,
+        changes: Box<AddressChanges>,
+        addresses: DestinationAddrs,
+    },
+    SessionAddressesUpdate {
+        changes: Box<AddressChanges>,
+        addresses: DestinationAddrs,
+    },
     /// Reply to the router's Link Characteristics Request, including the
     /// current metrics even when the requested change was denied.
     LinkCharacteristicsResponse {
@@ -162,5 +165,6 @@ pub enum EmittedEvent {
     /// interested in — inbound Destination Announce (RFC 8175 §12.13).
     DestinationAnnounced {
         mac: MacAddress,
+        requested_addresses: AddressChanges,
     },
 }

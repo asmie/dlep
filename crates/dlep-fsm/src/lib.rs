@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+pub mod addresses;
 pub mod discovery_common;
 pub mod discovery_modem;
 pub mod discovery_router;
@@ -19,6 +20,7 @@ pub mod timers;
 pub mod transaction;
 pub mod validation;
 
+pub use addresses::AddressChanges;
 pub use events::{
     DestinationAddrs, FsmAction, FsmEvent, LinkCharacteristics, LinkMetrics, SendTarget,
 };

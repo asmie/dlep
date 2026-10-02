@@ -6,7 +6,7 @@ use std::sync::Arc;
 use dlep_core::{ExtensionId, MacAddress, StatusCode};
 use ipnet::{Ipv4Net, Ipv6Net};
 
-pub use dlep_fsm::{LinkCharacteristics, LinkMetrics};
+pub use dlep_fsm::{AddressChanges, DestinationAddrs, LinkCharacteristics, LinkMetrics};
 
 /// Opaque destination identifier. Today it is a MAC address; this wrapper
 /// lets the API evolve (e.g. for logical-destination extensions).
@@ -55,8 +55,14 @@ pub enum DestinationEvent {
         text: String,
         metrics: LinkMetrics,
     },
+    AddressesChanged {
+        id: DestinationId,
+        changes: AddressChanges,
+        addresses: DestinationAddrs,
+    },
     Announced {
         id: DestinationId,
+        requested_addresses: AddressChanges,
     },
     Down {
         id: DestinationId,
@@ -98,6 +104,12 @@ pub enum DaemonEvent {
         peer: PeerInfo,
         event: MetricsEvent,
     },
+    SessionAddresses {
+        session_id: dlep_ext::SessionId,
+        peer: PeerInfo,
+        changes: AddressChanges,
+        addresses: DestinationAddrs,
+    },
     Extension(Arc<dyn Any + Send + Sync>),
 }
 
@@ -138,6 +150,18 @@ impl fmt::Debug for DaemonEvent {
                 .field("session_id", session_id)
                 .field("peer", peer)
                 .field("event", event)
+                .finish(),
+            Self::SessionAddresses {
+                session_id,
+                peer,
+                changes,
+                addresses,
+            } => f
+                .debug_struct("SessionAddresses")
+                .field("session_id", session_id)
+                .field("peer", peer)
+                .field("changes", changes)
+                .field("addresses", addresses)
                 .finish(),
             Self::Extension(_) => f.debug_tuple("Extension").field(&"<opaque>").finish(),
         }

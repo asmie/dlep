@@ -144,6 +144,23 @@ error: routers may report Layer 3 changes but cannot originate metric items.
 `announce_destination` is router-side only. The modem denies destinations it
 does not know; successful responses create destinations at the router.
 
+Layer 3 changes use `AddressChanges { added, removed }`; each side contains a
+`DestinationAddrs` set with IPv4/IPv6 addresses and attached subnets.
+`ModemDaemon::add_destination_with_addresses` supplies the initial destination
+snapshot, and `update_destination_addresses` sends later changes. Both daemons
+provide `update_session_addresses(session_id, changes)` for local peer addresses
+on one session, using address-only Session Update messages.
+
+Applications receive `DestinationEvent::AddressesChanged` or
+`DaemonEvent::SessionAddresses`, with effective changes and the resulting full
+snapshot, plus peer/session attribution. Initialization addresses and Announce
+Response addresses are retained. `DestinationEvent::Announced` now also carries
+`requested_addresses`; existing exhaustive patterns need that field or `..`.
+Address-only updates preserve metrics. Destination changes made before Up is
+acknowledged are coalesced; changes made while a router has withdrawn interest
+are retained for a later Announce. Session address commands still follow the
+existing no-queue rule when another session transaction is in progress.
+
 `RouterDaemon::drop_destination(session_id, destination)` withdraws interest
 from one modem. The modem acknowledges with Destination Down Response, stops
 reporting that destination on this session, and emits a `DestinationEvent::Down`.

@@ -86,6 +86,7 @@ State machines for both the discovery phase and the session phase, on both the r
 
 | Module | Responsibility |
 |---|---|
+| `addresses.rs` | IPv4/IPv6 peer and destination address/subnet sets, additions/removals, canonical subnet identity, and strict versus tolerant consistency checks. |
 | `events.rs` | `FsmEvent` (inbound: parsed messages, transport lifecycle, timer expiry, app commands), `FsmAction` (outbound: send message, start/cancel timer, reset heartbeat, close TCP, emit public-API event). |
 | `timers.rs` | `TimerId` (opaque handle) and `TimerKind` (`Heartbeat`, `HeartbeatMissed`, `SessionInit`, `Termination`, `Discovery`). |
 | `transaction.rs` | `TransactionTracker` — enforces the RFC rule that at most one session-level request and one per-destination request may be in flight at a time. Violation → `StatusCode::UNEXPECTED_MESSAGE` (129). |
@@ -382,6 +383,28 @@ The order of work was:
     is used; peer failure is detected through the session heartbeat. Tests cover
     both Up- and Announce-originated destinations, resubscription, in-flight
     updates, conflicting transactions, invalid input, and session isolation.
+
+13. **Layer 3 address and attached-subnet changes (RFC 8175 §13.8–13.11).**
+    `AddressChanges` separates additions and removals for all four item types.
+    Both FSMs retain addresses learned during initialization and apply peer
+    Session Updates atomically. Duplicate peer additions and unknown peer
+    removals terminate with Invalid Data. Destination inconsistencies are
+    nonfatal: duplicate additions, unknown removals, contradictory operations,
+    and attempts to claim another destination's or the peer's addresses are
+    ignored while valid changes and metrics continue. Subnet identity uses its
+    network prefix, independent of host bits in the encoded address.
+
+    The modem API can advertise initial destination addresses and subsequent
+    changes; both daemons can originate session address changes. Address-only
+    updates preserve metrics. Pending Up address changes coalesce until its
+    acknowledgement; withdrawn destinations retain their latest local snapshot
+    for Announce. Applications receive explicit deltas plus full snapshots via
+    `DestinationEvent::AddressesChanged` and `DaemonEvent::SessionAddresses`.
+    Announce request address hints, including removals, are available in
+    `DestinationEvent::Announced.requested_addresses`. Every event carries its
+    peer/session context. Tests cover all four families, initialization,
+    consistency errors, delayed acknowledgement, resubscription, both session
+    directions, and identical address sets on different modem sessions.
 
 ---
 

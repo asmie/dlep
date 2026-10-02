@@ -401,6 +401,13 @@ pub async fn run_session<F: SessionFsm>(
                     Some(SessionCommand::UpdateDestination { mac, metrics }) => {
                         FsmEvent::AppUpdateMetrics { mac, metrics }
                     }
+                    Some(SessionCommand::UpdateDestinationAddresses { mac, changes }) => {
+                        FsmEvent::AppUpdateAddresses { mac, changes }
+                    }
+                    Some(SessionCommand::UpdateSessionAddresses { session_id: target, changes }) => {
+                        if target != session_id { continue; }
+                        FsmEvent::AppSessionAddresses { changes }
+                    }
                     Some(SessionCommand::DropDestination { mac, reason }) => {
                         FsmEvent::AppDropDestination { mac, reason }
                     }
@@ -735,11 +742,36 @@ fn translate_emitted(
                 metrics: *metrics,
             },
         }),
-        EmittedEvent::DestinationAnnounced { mac } => Some(DaemonEvent::Destination {
+        EmittedEvent::SessionAddressesUpdate { changes, addresses } => {
+            Some(DaemonEvent::SessionAddresses {
+                session_id,
+                peer: peer.clone(),
+                changes: (**changes).clone(),
+                addresses: addresses.clone(),
+            })
+        }
+        EmittedEvent::DestinationAddressesUpdate {
+            mac,
+            changes,
+            addresses,
+        } => Some(DaemonEvent::Destination {
+            session_id,
+            peer: peer.clone(),
+            event: DestinationEvent::AddressesChanged {
+                id: DestinationId(*mac),
+                changes: (**changes).clone(),
+                addresses: addresses.clone(),
+            },
+        }),
+        EmittedEvent::DestinationAnnounced {
+            mac,
+            requested_addresses,
+        } => Some(DaemonEvent::Destination {
             session_id,
             peer: peer.clone(),
             event: DestinationEvent::Announced {
                 id: DestinationId(*mac),
+                requested_addresses: requested_addresses.clone(),
             },
         }),
         EmittedEvent::SessionMetricsUpdate { metrics } => Some(DaemonEvent::Metrics {

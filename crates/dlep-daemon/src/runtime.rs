@@ -29,6 +29,14 @@ pub enum SessionCommand {
         mac: MacAddress,
         metrics: LinkMetrics,
     },
+    UpdateDestinationAddresses {
+        mac: MacAddress,
+        changes: dlep_fsm::AddressChanges,
+    },
+    UpdateSessionAddresses {
+        session_id: dlep_ext::SessionId,
+        changes: dlep_fsm::AddressChanges,
+    },
     /// Modem-side: drop a destination at the peer router.
     DropDestination { mac: MacAddress, reason: StatusCode },
     /// Router-side: withdraw interest in a destination on one session only.
@@ -84,4 +92,19 @@ pub fn new_event_channel() -> (EventTx, EventRx) {
 
 pub fn new_command_channel<C>() -> (CommandTx<C>, CommandRx<C>) {
     mpsc::channel(COMMAND_CHANNEL_CAPACITY)
+}
+
+/// Validate public address batches before queueing work for a session.
+pub(crate) fn validate_address_changes(
+    changes: &dlep_fsm::AddressChanges,
+) -> Result<(), DaemonError> {
+    changes
+        .validate()
+        .map_err(|_| DaemonError::Config("duplicate or conflicting address changes".into()))?;
+    changes
+        .append_to(dlep_core::Message::new(
+            dlep_core::MessageType::SESSION_UPDATE,
+        ))
+        .encode()?;
+    Ok(())
 }

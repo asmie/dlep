@@ -1,3 +1,4 @@
+use crate::{AddressChanges, DestinationAddrs};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -9,9 +10,9 @@ use crate::session_common::merge_link_metrics;
 use crate::session_common::{
     SessionConfig, build_destination_announce, build_destination_down_response,
     build_destination_up_response, build_heartbeat, build_session_termination,
-    build_session_termination_response, build_session_update_response, extract_destination_addrs,
-    extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
-    extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    build_session_termination_response, build_session_update_response, extract_destination_mac,
+    extract_extensions_supported, extract_heartbeat_interval, extract_status,
+    heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::timers::{TimerId, TimerKind};
 use crate::transaction::TransactionTracker;
@@ -50,6 +51,8 @@ pub struct RouterSessionFsm {
     pub destinations: HashMap<MacAddress, DestinationState>,
     pub session_metrics: LinkMetrics,
     session_metric_types: HashSet<dlep_core::DataItemType>,
+    pub peer_addresses: DestinationAddrs,
+    local_addresses: DestinationAddrs,
     config: SessionConfig,
     termination_reason: StatusCode,
     /// Peer's interval, populated by a validated initialization response.
@@ -63,10 +66,11 @@ pub struct RouterSessionFsm {
     pub peer_extensions: Vec<dlep_core::ExtensionId>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DestinationState {
     pub up: bool,
     pub metrics: LinkMetrics,
+    pub addrs: DestinationAddrs,
 }
 
 impl Default for RouterSessionFsm {
@@ -87,6 +91,8 @@ impl RouterSessionFsm {
             destinations: HashMap::new(),
             session_metrics: LinkMetrics::default(),
             session_metric_types: HashSet::new(),
+            peer_addresses: DestinationAddrs::default(),
+            local_addresses: DestinationAddrs::default(),
             config,
             termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
@@ -116,6 +122,10 @@ impl RouterSessionFsm {
                 let checked =
                     validate_message(msg, true, initializing, &self.config.advertised_extensions)
                         .and_then(|()| {
+                            if initializing || msg.message_type == MessageType::SESSION_UPDATE {
+                                let mut addresses = self.peer_addresses.clone();
+                                AddressChanges::from_message(msg).apply_strict(&mut addresses)?;
+                            }
                             if initializing {
                                 return Ok(());
                             }
@@ -183,6 +193,7 @@ impl RouterSessionFsm {
                         text: "initialization did not succeed".into(),
                     })
                 } else {
+                    self.peer_addresses = AddressChanges::from_message(&msg).added;
                     merge_link_metrics(&msg, &mut self.session_metrics);
                     self.session_metric_types = msg
                         .data_items
@@ -220,6 +231,15 @@ impl RouterSessionFsm {
                     actions.push(FsmAction::Emit(EmittedEvent::SessionMetricsUpdate {
                         metrics: self.session_metrics,
                     }));
+                    if !self.peer_addresses.is_empty() {
+                        actions.push(FsmAction::Emit(EmittedEvent::SessionAddressesUpdate {
+                            changes: Box::new(AddressChanges {
+                                added: self.peer_addresses.clone(),
+                                removed: DestinationAddrs::default(),
+                            }),
+                            addresses: self.peer_addresses.clone(),
+                        }));
+                    }
                     actions
                 }
             }
@@ -282,9 +302,17 @@ impl RouterSessionFsm {
                 let mac = extract_destination_mac(&msg).expect("validated MAC");
                 let mut metrics = self.session_metrics;
                 merge_link_metrics(&msg, &mut metrics);
-                let addrs = extract_destination_addrs(&msg);
-                self.destinations
-                    .insert(mac, DestinationState { up: true, metrics });
+                let mut addrs = DestinationAddrs::default();
+                self.destination_address_changes(mac, &msg)
+                    .apply_lenient(&mut addrs);
+                self.destinations.insert(
+                    mac,
+                    DestinationState {
+                        up: true,
+                        metrics,
+                        addrs: addrs.clone(),
+                    },
+                );
                 let mut actions = vec![
                     FsmAction::SendMessage(build_destination_up_response(mac, StatusCode::SUCCESS)),
                     FsmAction::Emit(EmittedEvent::DestinationUp {
@@ -300,26 +328,38 @@ impl RouterSessionFsm {
                 }
                 actions
             }
-            // Apply only metrics present in the update.
+            // Apply metric and address deltas independently; omissions retain
+            // previous values. Destination inconsistencies are nonfatal (§13).
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_UPDATE =>
             {
                 let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let changes = self.destination_address_changes(mac, &msg);
                 let destination = self
                     .destinations
                     .get_mut(&mac)
                     .expect("validated destination");
-                merge_link_metrics(&msg, &mut destination.metrics);
-                let metrics = destination.metrics;
-                let mut actions = vec![FsmAction::Emit(EmittedEvent::DestinationUpdate {
-                    mac,
-                    metrics,
-                })];
-                if let Some(reset) =
-                    heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
-                {
-                    actions.push(reset);
+                let old = destination.addrs.clone();
+                changes.apply_lenient(&mut destination.addrs);
+                let changes = AddressChanges::between(&old, &destination.addrs);
+                let mut actions = Vec::new();
+                if merge_link_metrics(&msg, &mut destination.metrics) {
+                    actions.push(FsmAction::Emit(EmittedEvent::DestinationUpdate {
+                        mac,
+                        metrics: destination.metrics,
+                    }));
                 }
+                if !changes.is_empty() {
+                    actions.push(FsmAction::Emit(EmittedEvent::DestinationAddressesUpdate {
+                        mac,
+                        changes: Box::new(changes),
+                        addresses: destination.addrs.clone(),
+                    }));
+                }
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
                 actions
             }
             // Remove the validated destination and acknowledge the peer.
@@ -392,6 +432,16 @@ impl RouterSessionFsm {
                 let mut actions = vec![FsmAction::SendMessage(build_session_update_response(
                     StatusCode::SUCCESS,
                 ))];
+                let changes = AddressChanges::from_message(&msg);
+                changes
+                    .apply_strict(&mut self.peer_addresses)
+                    .expect("validated peer addresses");
+                if !changes.is_empty() {
+                    actions.push(FsmAction::Emit(EmittedEvent::SessionAddressesUpdate {
+                        changes: Box::new(changes),
+                        addresses: self.peer_addresses.clone(),
+                    }));
+                }
                 if merge_link_metrics(&msg, &mut self.session_metrics) {
                     for destination in self.destinations.values_mut() {
                         merge_link_metrics(&msg, &mut destination.metrics);
@@ -429,12 +479,21 @@ impl RouterSessionFsm {
                 if extract_status(&msg) == Some(StatusCode::SUCCESS) {
                     let mut metrics = self.session_metrics;
                     merge_link_metrics(&msg, &mut metrics);
-                    self.destinations
-                        .insert(mac, DestinationState { up: true, metrics });
+                    let mut addrs = DestinationAddrs::default();
+                    self.destination_address_changes(mac, &msg)
+                        .apply_lenient(&mut addrs);
+                    self.destinations.insert(
+                        mac,
+                        DestinationState {
+                            up: true,
+                            metrics,
+                            addrs: addrs.clone(),
+                        },
+                    );
                     actions.push(FsmAction::Emit(EmittedEvent::DestinationUp {
                         mac,
                         metrics,
-                        addrs: extract_destination_addrs(&msg),
+                        addrs,
                     }));
                 }
                 actions.extend(heartbeat_reset_action(
@@ -497,6 +556,13 @@ impl RouterSessionFsm {
                     self.peer_heartbeat_interval,
                 ));
                 actions
+            }
+            (RouterSessionState::InSession, FsmEvent::AppSessionAddresses { changes }) => {
+                crate::session_common::apply_local_address_update(
+                    &mut self.tx,
+                    &mut self.local_addresses,
+                    changes,
+                )
             }
             // Negotiated extension traffic also keeps the session alive.
             (RouterSessionState::InSession, FsmEvent::RecvExtensionMessage) => {
@@ -620,6 +686,46 @@ impl RouterSessionFsm {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Do not steal an address already associated with another destination or
+    /// the peer in this session. Such destination inconsistencies are ignored,
+    /// while valid changes and unrelated metrics continue to be processed.
+    fn destination_address_changes(&self, mac: MacAddress, msg: &Message) -> AddressChanges {
+        let mut changes = AddressChanges::from_message(msg);
+        changes.added.v4.retain(|a| {
+            changes.removed.v4.contains(a)
+                || (!self.peer_addresses.v4.contains(a)
+                    && !self
+                        .destinations
+                        .iter()
+                        .any(|(m, d)| *m != mac && d.addrs.v4.contains(a)))
+        });
+        changes.added.v6.retain(|a| {
+            changes.removed.v6.contains(a)
+                || (!self.peer_addresses.v6.contains(a)
+                    && !self
+                        .destinations
+                        .iter()
+                        .any(|(m, d)| *m != mac && d.addrs.v6.contains(a)))
+        });
+        changes.added.v4_subnets.retain(|a| {
+            changes.removed.v4_subnets.contains(a)
+                || (!self.peer_addresses.v4_subnets.contains(a)
+                    && !self
+                        .destinations
+                        .iter()
+                        .any(|(m, d)| *m != mac && d.addrs.v4_subnets.contains(a)))
+        });
+        changes.added.v6_subnets.retain(|a| {
+            changes.removed.v6_subnets.contains(a)
+                || (!self.peer_addresses.v6_subnets.contains(a)
+                    && !self
+                        .destinations
+                        .iter()
+                        .any(|(m, d)| *m != mac && d.addrs.v6_subnets.contains(a)))
+        });
+        changes
     }
 
     fn protocol_error(&mut self, status: DataItem) -> Vec<FsmAction> {
