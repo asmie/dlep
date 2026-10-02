@@ -137,9 +137,6 @@ pub fn session_config_from_timers(
         heartbeat_interval_ms: timers.heartbeat_interval_ms,
         session_init_timeout: Duration::from_millis(timers.session_init_timeout_ms.into()),
         termination_timeout: Duration::from_millis(timers.termination_timeout_ms.into()),
-        link_characteristics_timeout: Duration::from_millis(
-            timers.link_characteristics_timeout_ms.into(),
-        ),
         advertised_extensions,
     }
 }

@@ -10,7 +10,7 @@ use dlep_fsm::session_common::{
 };
 use dlep_fsm::session_modem::{ModemSessionFsm, ModemSessionState};
 use dlep_fsm::session_router::{RouterSessionFsm, RouterSessionState};
-use dlep_fsm::{DestinationAddrs, FsmAction as A, FsmEvent as E, TimerKind};
+use dlep_fsm::{DestinationAddrs, FsmAction as A, FsmEvent as E};
 
 fn mac() -> MacAddress {
     MacAddress::new_eui48([2, 0, 0, 0, 0, 1])
@@ -77,10 +77,7 @@ fn down(router: &mut RouterSessionFsm) -> Message {
     assert!(matches!(message.data_items[0], DataItem::MacAddress(_)));
     assert!(!actions.iter().any(|a| matches!(
         a,
-        A::StartTimer {
-            kind: TimerKind::Transaction(_),
-            ..
-        } | A::Emit(EmittedEvent::DestinationDown { .. })
+        A::StartTimer { .. } | A::Emit(EmittedEvent::DestinationDown { .. })
     )));
     assert!(router.destinations.contains_key(&mac()));
     message

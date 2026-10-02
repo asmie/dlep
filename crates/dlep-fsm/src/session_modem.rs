@@ -492,6 +492,7 @@ impl ModemSessionFsm {
                 ModemSessionState::InSession,
                 FsmEvent::TimerExpired(_, TimerKind::HeartbeatMissed),
             ) => {
+                self.termination_reason = StatusCode::TIMED_OUT;
                 self.state = ModemSessionState::Terminating;
                 vec![
                     FsmAction::CancelTimer(TIMER_HEARTBEAT),

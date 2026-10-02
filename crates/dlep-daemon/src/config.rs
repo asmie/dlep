@@ -76,9 +76,6 @@ pub struct TimersConfig {
     /// Termination is sent.
     #[serde(default = "default_termination_timeout_ms")]
     pub termination_timeout_ms: u32,
-    /// Router deadline for a Link Characteristics Response (link changes may be slow).
-    #[serde(default = "default_link_characteristics_timeout_ms")]
-    pub link_characteristics_timeout_ms: u32,
 }
 
 fn default_heartbeat_interval_ms() -> u32 {
@@ -94,10 +91,6 @@ fn default_termination_timeout_ms() -> u32 {
     1_000
 }
 
-fn default_link_characteristics_timeout_ms() -> u32 {
-    60_000
-}
-
 impl Default for TimersConfig {
     fn default() -> Self {
         Self {
@@ -105,7 +98,6 @@ impl Default for TimersConfig {
             discovery_interval_ms: default_discovery_interval_ms(),
             session_init_timeout_ms: default_session_init_timeout_ms(),
             termination_timeout_ms: default_termination_timeout_ms(),
-            link_characteristics_timeout_ms: default_link_characteristics_timeout_ms(),
         }
     }
 }
@@ -201,6 +193,18 @@ mod tests {
         assert!(matches!(router.mode, DiscoveryMode::Discovery));
         let modem: ModemConfig = toml::from_str("").expect("empty modem config");
         assert_eq!(modem.peer_description, "dlep-modem");
+    }
+
+    #[test]
+    fn removed_transaction_timeout_is_rejected() {
+        let error =
+            toml::from_str::<RouterConfig>("[timers]\nlink_characteristics_timeout_ms = 60000\n")
+                .expect_err("transaction deadlines are not supported");
+        assert!(
+            error
+                .to_string()
+                .contains("link_characteristics_timeout_ms")
+        );
     }
 
     #[test]

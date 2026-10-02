@@ -93,7 +93,11 @@ edit with `--check-config`.
 | `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval |
 | `[timers]` | `session_init_timeout_ms` | `5000` | deadline for Session Initialization Response |
 | `[timers]` | `termination_timeout_ms` | `1000` | deadline for Session Termination Response |
-| `[timers]` | `link_characteristics_timeout_ms` | `60000` | router deadline for Link Characteristics Response; must be positive when requesting changes |
+
+DLEP transactions do not have individual deadlines (RFC 8175 §8). The session
+heartbeat mechanism detects a silent peer. Remove the previously introduced
+`[timers].link_characteristics_timeout_ms` setting if present; it is no longer
+supported and configuration parsing rejects it.
 
 CLI flags override the file: `--interface`, `--no-tls`, `--cert`, `--key`,
 `--ca-bundle`, and (router) `--peer ADDR` (repeatable; implies static mode).

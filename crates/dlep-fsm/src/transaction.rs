@@ -3,6 +3,8 @@
 //! At any time there may be at most ONE outstanding session-level request
 //! and at most ONE outstanding per-destination request per destination.
 //! Violating this → terminate with `StatusCode::UNEXPECTED_MESSAGE` (129).
+//! Transactions have no individual deadline (§8); only a matching response
+//! or session reset releases them. Session heartbeats detect peer failure.
 
 use std::collections::HashMap;
 

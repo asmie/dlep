@@ -87,7 +87,7 @@ State machines for both the discovery phase and the session phase, on both the r
 | Module | Responsibility |
 |---|---|
 | `events.rs` | `FsmEvent` (inbound: parsed messages, transport lifecycle, timer expiry, app commands), `FsmAction` (outbound: send message, start/cancel timer, reset heartbeat, close TCP, emit public-API event). |
-| `timers.rs` | `TimerId` (opaque handle) and `TimerKind` (`Heartbeat`, `HeartbeatMissed`, `SessionInit`, `Termination`, `Transaction(MacAddress)`, `Discovery`). |
+| `timers.rs` | `TimerId` (opaque handle) and `TimerKind` (`Heartbeat`, `HeartbeatMissed`, `SessionInit`, `Termination`, `Discovery`). |
 | `transaction.rs` | `TransactionTracker` — enforces the RFC rule that at most one session-level request and one per-destination request may be in flight at a time. Violation → `StatusCode::UNEXPECTED_MESSAGE` (129). |
 | `session_router.rs` | `RouterSessionFsm` (`Closed → TcpConnecting → SessionInitPending → InSession → Terminating → Terminated`). |
 | `session_modem.rs` | `ModemSessionFsm` (`Listening → AwaitingSessionInit → InSession → Terminating → Terminated`). |
@@ -359,16 +359,17 @@ The order of work was:
 11. **Link Characteristics Request/Response (RFC 8175 §12.18–12.19).**
     The router API targets one session and accepts optional receive rate,
     transmit rate, and latency changes (at least one is required). Requests
-    occupy a per-destination transaction slot, with an independent configurable
-    60-second deadline. Responses cancel the deadline, update stored metrics,
+    occupy a per-destination transaction slot until a response or session reset,
+    without an independent deadline (RFC §8). Responses update stored metrics
     and emit a session-attributed `DestinationEvent::LinkCharacteristicsResponse`
     containing status, text, and metrics. The router requires the complete set
     of core metrics declared by that peer during initialization. The modem
     currently has no link-control backend, so it immediately replies Request
     Denied with the current destination metrics. It does not fabricate a
     successful physical link change. Tests cover denial and success replies,
-    missing/undeclared metrics, serialization, independent destination timers,
-    timeout despite heartbeats, and targeting modems sharing a MAC.
+    missing/undeclared metrics, serialization across destinations, responses
+    delayed for minutes while the peer remains active, heartbeat-based failure
+    detection, and targeting modems sharing a MAC.
 
 12. **Router-originated Destination Down (RFC 8175 §12.15–12.16).**
     `RouterDaemon::drop_destination(session_id, destination)` withdraws interest
@@ -386,15 +387,9 @@ The order of work was:
 
 ## 10. Open questions / risks
 
-- **Link Characteristics timeout correction pending.** The configurable request
-  deadline introduced in item 11 conflicts with RFC 8175 §8, which says DLEP
-  transactions do not time out independently. Remove that deadline in a separate
-  correction; use the session heartbeat mechanism for peer failure. The new
-  router-originated Down exchange follows §8 without a transaction deadline.
-
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.
 - **Privileged binding to port 854.** Port 854 is below 1024 and requires `CAP_NET_BIND_SERVICE` on Linux, or running behind an unprivileged user with `setcap cap_net_bind_service=+ep` on the binary, or a systemd unit with `AmbientCapabilities=CAP_NET_BIND_SERVICE`. Documented in `doc/deployment.md` §4 (M9).
 - **IPv4 vs IPv6.** Wire encoding handles both from day one (`Ipv4ConnectionPoint` / `Ipv6ConnectionPoint` etc.), and the GTSM helpers in `dlep-net/src/gtsm.rs` already have `IPV6_UNICAST_HOPS` / `IPV6_MULTICAST_HOPS` paths. **The discovery transport is still IPv4-only**: `dlep-net/src/discovery.rs` contains no IPv6 code, so `NetworkConfig::discovery_v6_group` is currently a dead config key — it parses and is then read by nothing. Setting it silently does nothing, which is worse than rejecting it; wiring v6 discovery (or rejecting the key until then) is outstanding work.
 - **Silent drops when a transaction slot is busy.** `AppDropDestination`, `AppSessionUpdate` and `AppAnnounceDestination` all `tracing::debug!` and return an empty action vector if a request for the same scope is already in flight. The caller gets `Ok(())` and no indication the command evaporated. For `AppDropDestination` this means a destination can stay up forever from the router's view if the drop races the preceding `Destination_Up`. All three need the same fix — queue the command, or surface a busy error through the public API — and it should be one change, not three.
-- **M4 follow-up: missed-deadline integration test.** The negative-path scenario "peer completes Session Init, then goes silent ⇒ session terminates with `TIMED_OUT` after `2 × interval`" is covered at the FSM-table level (`router_in_session_to_terminating_on_missed_deadline` and the modem analogue) and indirectly by the loopback heartbeat keepalive test, but no integration test drives a real TCP peer that selectively goes silent. Building one requires a partial-DLEP fake-peer harness (~80–120 LOC: hand-encode Init / Init Response, manage a `tokio::net::TcpListener`, race a `tokio::time::sleep` against the missed-deadline). Tracked here so it doesn't get lost.
+- **Heartbeat failure coverage.** `silent_peer_is_detected_by_heartbeat_while_request_is_pending` uses an independent TCP peer that completes initialization, starts a destination transaction, and then goes silent. It verifies termination and `SessionDown(TIMED_OUT)`. A virtual-time transport test verifies that a response delayed for three minutes is accepted while the peer continues communicating.

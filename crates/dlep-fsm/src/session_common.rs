@@ -22,8 +22,6 @@ pub struct SessionConfig {
     pub heartbeat_interval_ms: u32,
     pub session_init_timeout: Duration,
     pub termination_timeout: Duration,
-    /// Link changes may take longer than ordinary protocol exchanges.
-    pub link_characteristics_timeout: Duration,
     /// `ExtensionId`s this side announces in the Session Initialization
     /// / Session Initialization Response `ExtensionsSupported` data item.
     /// Empty by default — populated by `dlep-daemon` from the registered
@@ -45,7 +43,6 @@ impl Default for SessionConfig {
             heartbeat_interval_ms: 60_000,
             session_init_timeout: Duration::from_millis(5_000),
             termination_timeout: Duration::from_millis(1_000),
-            link_characteristics_timeout: Duration::from_secs(60),
             advertised_extensions: Vec::new(),
         }
     }

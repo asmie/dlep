@@ -219,8 +219,9 @@ impl RouterDaemon {
 
     /// Request rate/latency changes from one modem (RFC 8175 §12.18).
     /// Use the session ID from SessionUp/Destination events. Completion is
-    /// delivered as DestinationEvent::LinkCharacteristicsResponse; a missing
-    /// response terminates that session after link_characteristics_timeout_ms.
+    /// delivered as DestinationEvent::LinkCharacteristicsResponse. Per RFC §8,
+    /// the transaction has no deadline: a slow peer remains valid while its
+    /// heartbeats continue. Session reset discards outstanding transactions.
     /// Like existing destination commands, busy/unknown destinations or stale
     /// session IDs are not queued. Await completion before requesting again.
     pub async fn request_link_characteristics(
@@ -232,11 +233,6 @@ impl RouterDaemon {
         if requested.is_empty() {
             return Err(DaemonError::Config(
                 "at least one link characteristic must be requested".into(),
-            ));
-        }
-        if self.timers.link_characteristics_timeout_ms == 0 {
-            return Err(DaemonError::Config(
-                "link_characteristics_timeout_ms must be positive".into(),
             ));
         }
         // Reject unencodable application values before they reach the session.

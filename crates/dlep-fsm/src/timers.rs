@@ -1,5 +1,3 @@
-use dlep_core::MacAddress;
-
 /// Opaque, FSM-assigned timer handle. The runtime uses it to match expiry
 /// deliveries back to the FSM that scheduled them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -23,8 +21,6 @@ pub enum TimerKind {
     SessionInit,
     /// Waiting for Session Termination Response.
     Termination,
-    /// Per-destination in-flight request deadline.
-    Transaction(MacAddress),
     /// Periodic discovery Peer Discovery send.
     Discovery,
 }

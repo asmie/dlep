@@ -10,7 +10,7 @@ use dlep_fsm::session_common::{
 };
 use dlep_fsm::session_modem::{ModemSessionFsm, ModemSessionState};
 use dlep_fsm::session_router::{RouterSessionFsm, RouterSessionState};
-use dlep_fsm::{DestinationAddrs, FsmAction as A, FsmEvent as E, TimerId, TimerKind};
+use dlep_fsm::{DestinationAddrs, FsmAction as A, FsmEvent as E, TimerKind};
 
 fn mac(n: u8) -> MacAddress {
     MacAddress::new_eui48([2, 0, 0, 0, 0, n])
@@ -77,28 +77,13 @@ fn add(r: &mut RouterSessionFsm, m: &mut ModemSessionFsm, mac: MacAddress) {
     let ack = sent(&r.step(E::RecvMessage(up)), M::DESTINATION_UP_RESPONSE);
     m.step(E::RecvMessage(ack));
 }
-fn request(r: &mut RouterSessionFsm, mac: MacAddress) -> (Message, TimerId) {
+fn request(r: &mut RouterSessionFsm, mac: MacAddress) -> Message {
     let actions = r.step(E::AppRequestLinkCharacteristics {
         mac,
         requested: requested(),
     });
-    let id = actions
-        .iter()
-        .find_map(|a| match a {
-            A::StartTimer {
-                id,
-                kind: TimerKind::Transaction(m),
-                duration,
-                periodic,
-            } if *m == mac => {
-                assert_eq!(*duration, Duration::from_secs(60));
-                assert!(!periodic);
-                Some(*id)
-            }
-            _ => None,
-        })
-        .unwrap();
-    (sent(&actions, M::LINK_CHARACTERISTICS_REQUEST), id)
+    assert!(!actions.iter().any(|a| matches!(a, A::StartTimer { .. })));
+    sent(&actions, M::LINK_CHARACTERISTICS_REQUEST)
 }
 
 #[test]
@@ -124,7 +109,7 @@ fn request_encodes_only_selected_characteristics_including_zero() {
 #[test]
 fn modem_denies_change_with_all_current_metrics_and_router_completes_transaction() {
     let (mut r, mut m) = sessions();
-    let (message, timer) = request(&mut r, mac(1));
+    let message = request(&mut r, mac(1));
     let response = sent(
         &m.step(E::RecvMessage(message)),
         M::LINK_CHARACTERISTICS_RESPONSE,
@@ -133,21 +118,12 @@ fn modem_denies_change_with_all_current_metrics_and_router_completes_transaction
     assert_eq!(response.data_items.len(), 11); // MAC + Status + nine declared metrics
     assert_eq!(m.destinations[&mac(1)].metrics.latency, metrics().latency);
     let actions = r.step(E::RecvMessage(response));
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, A::CancelTimer(id) if *id == timer))
-    );
     assert!(actions.iter().any(|a| matches!(a, A::Emit(EmittedEvent::LinkCharacteristicsResponse { status: S::REQUEST_DENIED, metrics: got, .. }) if got.latency == metrics().latency)));
     assert!(!r.tx.destination_busy(&mac(1)));
     assert_eq!(r.state(), RouterSessionState::InSession);
     assert_eq!(m.state(), ModemSessionState::InSession);
-    // Completion permits a later request; a stale timeout cannot kill it.
+    // Completion releases the transaction slot for a later request.
     request(&mut r, mac(1));
-    assert!(
-        r.step(E::TimerExpired(timer, TimerKind::Transaction(mac(1))))
-            .is_empty()
-    );
 }
 
 #[test]
@@ -182,7 +158,7 @@ fn response_reports_session_updates_as_current_metrics() {
     );
     let ack = sent(&r.step(E::RecvMessage(update)), M::SESSION_UPDATE_RESPONSE);
     m.step(E::RecvMessage(ack));
-    let (message, _) = request(&mut r, mac(1));
+    let message = request(&mut r, mac(1));
     let response = sent(
         &m.step(E::RecvMessage(message)),
         M::LINK_CHARACTERISTICS_RESPONSE,
@@ -263,12 +239,11 @@ fn unsolicited_response_and_conflicting_request_are_rejected() {
 }
 
 #[test]
-fn concurrent_destinations_have_independent_timers_and_heartbeat_does_not_extend_request() {
+fn concurrent_transactions_remain_pending_while_heartbeats_continue() {
     let (mut r, mut m) = sessions();
     add(&mut r, &mut m, mac(2));
-    let (_, first) = request(&mut r, mac(1));
-    let (_, second) = request(&mut r, mac(2));
-    assert_ne!(first, second);
+    request(&mut r, mac(1));
+    request(&mut r, mac(2));
     assert!(
         r.step(E::AppRequestLinkCharacteristics {
             mac: mac(1),
@@ -276,13 +251,59 @@ fn concurrent_destinations_have_independent_timers_and_heartbeat_does_not_extend
         })
         .is_empty()
     );
-    r.step(E::RecvMessage(Message::new(M::HEARTBEAT)));
-    let actions = r.step(E::TimerExpired(first, TimerKind::Transaction(mac(1))));
+    for _ in 0..100 {
+        r.step(E::RecvMessage(Message::new(M::HEARTBEAT)));
+        assert!(r.tx.destination_busy(&mac(1)));
+        assert!(r.tx.destination_busy(&mac(2)));
+        assert_eq!(r.state(), RouterSessionState::InSession);
+    }
+    r.step(E::RecvMessage(build_link_characteristics_response(
+        mac(2),
+        S::SUCCESS,
+        &metrics(),
+    )));
+    assert!(r.tx.destination_busy(&mac(1)));
+    assert!(!r.tx.destination_busy(&mac(2)));
+    r.step(E::RecvMessage(build_link_characteristics_response(
+        mac(1),
+        S::SUCCESS,
+        &metrics(),
+    )));
+    assert!(!r.tx.destination_busy(&mac(1)));
+}
+
+#[test]
+fn heartbeat_failure_ends_pending_transaction_and_preserves_down_reason() {
+    let (mut r, mut m) = sessions();
+    request(&mut r, mac(1));
+    let actions = r.step(E::TimerExpired(
+        dlep_fsm::TIMER_HEARTBEAT_MISSED,
+        TimerKind::HeartbeatMissed,
+    ));
     assert_eq!(
         status(&sent(&actions, M::SESSION_TERMINATION)),
         S::TIMED_OUT
     );
-    assert_eq!(r.state(), RouterSessionState::Terminating);
+    let actions = r.step(E::RecvMessage(Message::new(
+        M::SESSION_TERMINATION_RESPONSE,
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, A::Emit(EmittedEvent::SessionDown(S::TIMED_OUT))))
+    );
+    m.step(E::TimerExpired(
+        dlep_fsm::TIMER_HEARTBEAT_MISSED,
+        TimerKind::HeartbeatMissed,
+    ));
+    let actions = m.step(E::RecvMessage(Message::new(
+        M::SESSION_TERMINATION_RESPONSE,
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, A::Emit(EmittedEvent::SessionDown(S::TIMED_OUT))))
+    );
 }
 
 #[test]

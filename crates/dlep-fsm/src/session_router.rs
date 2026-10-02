@@ -50,8 +50,6 @@ pub struct RouterSessionFsm {
     pub destinations: HashMap<MacAddress, DestinationState>,
     pub session_metrics: LinkMetrics,
     session_metric_types: HashSet<dlep_core::DataItemType>,
-    link_timers: HashMap<MacAddress, TimerId>,
-    next_link_timer: u32,
     config: SessionConfig,
     termination_reason: StatusCode,
     /// Peer's interval, populated by a validated initialization response.
@@ -89,8 +87,6 @@ impl RouterSessionFsm {
             destinations: HashMap::new(),
             session_metrics: LinkMetrics::default(),
             session_metric_types: HashSet::new(),
-            link_timers: HashMap::new(),
-            next_link_timer: 100,
             config,
             termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
@@ -466,25 +462,9 @@ impl RouterSessionFsm {
                 self.tx
                     .open_destination(mac, crate::transaction::RequestKind::LinkCharacteristics)
                     .expect("checked idle transaction");
-                // Never reuse an active ID; runtime generations reject queued
-                // expiries from cancelled timers after wraparound.
-                let id = loop {
-                    let candidate = TimerId::new(self.next_link_timer);
-                    self.next_link_timer = self.next_link_timer.wrapping_add(1).max(100);
-                    if !self.link_timers.values().any(|id| *id == candidate) {
-                        break candidate;
-                    }
-                };
-                self.link_timers.insert(mac, id);
-                vec![
-                    FsmAction::SendMessage(message),
-                    FsmAction::StartTimer {
-                        id,
-                        kind: TimerKind::Transaction(mac),
-                        duration: self.config.link_characteristics_timeout,
-                        periodic: false,
-                    },
-                ]
+                // RFC 8175 §8: transactions remain pending until a matching
+                // response or session reset; heartbeats detect peer failure.
+                vec![FsmAction::SendMessage(message)]
             }
             (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::LINK_CHARACTERISTICS_RESPONSE =>
@@ -505,35 +485,18 @@ impl RouterSessionFsm {
                     })
                     .expect("validated status");
                 self.tx.close_destination(&mac);
-                let mut actions = Vec::new();
-                if let Some(id) = self.link_timers.remove(&mac) {
-                    actions.push(FsmAction::CancelTimer(id));
-                }
-                actions.push(FsmAction::Emit(EmittedEvent::LinkCharacteristicsResponse {
-                    mac,
-                    status,
-                    text,
-                    metrics,
-                }));
+                let mut actions =
+                    vec![FsmAction::Emit(EmittedEvent::LinkCharacteristicsResponse {
+                        mac,
+                        status,
+                        text,
+                        metrics,
+                    })];
                 actions.extend(heartbeat_reset_action(
                     TIMER_HEARTBEAT_MISSED,
                     self.peer_heartbeat_interval,
                 ));
                 actions
-            }
-            (
-                RouterSessionState::InSession,
-                FsmEvent::TimerExpired(id, TimerKind::Transaction(mac)),
-            ) => {
-                if self.link_timers.get(&mac) != Some(&id) {
-                    return Vec::new();
-                }
-                self.link_timers.remove(&mac);
-                self.tx.close_destination(&mac);
-                self.protocol_error(DataItem::Status {
-                    code: StatusCode::TIMED_OUT,
-                    text: "Link Characteristics Response timed out".into(),
-                })
             }
             // Negotiated extension traffic also keeps the session alive.
             (RouterSessionState::InSession, FsmEvent::RecvExtensionMessage) => {
@@ -554,6 +517,7 @@ impl RouterSessionFsm {
                 RouterSessionState::InSession,
                 FsmEvent::TimerExpired(_, TimerKind::HeartbeatMissed),
             ) => {
+                self.termination_reason = StatusCode::TIMED_OUT;
                 self.state = RouterSessionState::Terminating;
                 vec![
                     FsmAction::CancelTimer(TIMER_HEARTBEAT),

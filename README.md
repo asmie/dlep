@@ -157,9 +157,11 @@ requests rate or latency changes from one modem. `LinkCharacteristics` has
 optional receive rate, transmit rate, and latency fields; supply at least one.
 Listen for `DestinationEvent::LinkCharacteristicsResponse` to obtain the status,
 status text, and current metrics. A response must include every core metric the
-peer declared during initialization. The request deadline defaults to 60 seconds
-and is configurable with `[timers].link_characteristics_timeout_ms`; expiry
-terminates the session even if the peer is still sending heartbeats.
+peer declared during initialization. Requests remain pending until a response
+arrives or the session resets; RFC 8175 §8 does not permit independent
+transaction deadlines. Peer silence is detected by the session heartbeat
+mechanism. The former `[timers].link_characteristics_timeout_ms` setting has
+been removed and is rejected if present in a configuration file.
 
 The bundled modem cannot change physical link parameters. It returns
 `Request Denied` with current destination metrics, keeping the session alive.
