@@ -307,6 +307,89 @@ mod tests {
         gtsm_exchange("[::1]:0").await;
     }
 
+    async fn stalled_tls_accept_times_out_without_disrupting_another_peer(bind: &str) {
+        use crate::tls::test_helpers::{client_config_for, self_signed_for_ip, server_config_for};
+
+        let listener = TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pki = self_signed_for_ip(addr.ip());
+        let acceptor =
+            Acceptor::tls(listener, server_config_for(pki.cert_der, pki.key_der)).unwrap();
+        let monitor = acceptor.monitor.as_ref().unwrap();
+        assert_eq!(Arc::strong_count(monitor), 1);
+
+        // Establish conforming TCP but never send a TLS ClientHello. Retain
+        // the peer so EOF cannot accidentally stand in for the timeout.
+        let mut stalled_peer = timeout(Duration::from_secs(2), Connector::plain().connect(addr))
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = timeout(Duration::from_secs(2), acceptor.accept_pending())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending.peer_addr().unwrap(),
+            stalled_peer.local_addr().unwrap()
+        );
+        assert_eq!(Arc::strong_count(monitor), 2);
+        let started = tokio::time::Instant::now();
+        let stalled = tokio::spawn(pending.handshake());
+
+        // A separate handshake on the same listener must finish while the
+        // first is stalled. Drive both sides under one outer safety deadline.
+        let connector = Connector::tls(client_config_for(pki.roots));
+        let (client, server) = timeout(Duration::from_secs(3), async {
+            tokio::join!(connector.connect(addr), acceptor.accept())
+        })
+        .await
+        .expect("stalled handshake blocked a healthy peer");
+        let mut client = client.unwrap();
+        let mut server = server.unwrap();
+        assert!(client.is_tls() && server.is_tls());
+        assert!(!stalled.is_finished());
+        assert_eq!(Arc::strong_count(monitor), 3);
+
+        let error = timeout(TLS_HANDSHAKE_TIMEOUT + Duration::from_secs(2), stalled)
+            .await
+            .expect("TLS handshake exceeded its built-in deadline")
+            .unwrap()
+            .err()
+            .expect("silent TCP peer cannot complete TLS");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= TLS_HANDSHAKE_TIMEOUT);
+        // The failed handshake must release its registration and duplicate fd,
+        // leaving only the acceptor and the healthy session on this monitor.
+        assert_eq!(Arc::strong_count(monitor), 2);
+        let mut buf = [0; 2];
+        assert_eq!(
+            timeout(Duration::from_secs(2), stalled_peer.read(&mut buf))
+                .await
+                .expect("timed-out handshake retained its TCP socket")
+                .unwrap(),
+            0
+        );
+
+        server.write_all(b"ok").await.unwrap();
+        timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+            .await
+            .expect("timeout disrupted the healthy connection")
+            .unwrap();
+        assert_eq!(&buf, b"ok");
+        drop(server);
+        assert_eq!(Arc::strong_count(monitor), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_tls_accept_ipv4_times_out_and_releases_registration() {
+        stalled_tls_accept_times_out_without_disrupting_another_peer("127.0.0.1:0").await;
+    }
+
+    #[tokio::test]
+    async fn stalled_tls_accept_ipv6_times_out_and_releases_registration() {
+        stalled_tls_accept_times_out_without_disrupting_another_peer("[::1]:0").await;
+    }
+
     async fn low_ttl_resets_only_matching_session(bind: &str, connect_addr: Option<&str>) {
         let listener = TcpListener::bind(bind).await.unwrap();
         let mut addr = listener.local_addr().unwrap();

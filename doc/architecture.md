@@ -351,8 +351,19 @@ passed **427 tests** and successfully uploaded its reports. It measured
 code and certificate helpers gives an estimated **94.04% production-line
 coverage**. Branch coverage was not collected. These are a snapshot, not a
 conformance score or a coverage gate. The review report records the calculation
-and remaining blind spots. This CI run still failed its audit-policy presence
-check because `.cargo/audit.toml` was not included in the commit.
+and remaining blind spots. That run failed its audit-policy presence check;
+the policy was subsequently committed in `3e006eb`.
+
+Two additional transport regressions exercise the TLS accept deadline with
+real IPv4/IPv6 sockets and strict GTSM. A silent TCP peer times out and releases
+its socket and monitor registration while another TLS peer on the same listener
+completes its handshake and remains usable. These tests do not change production
+behavior; the coverage percentages above predate them. The local full suite now
+passes **429 tests**, with formatting, clippy, and Rust 1.85 checks passing.
+The [audit run for `3e006eb`](https://github.com/asmie/dlep/actions/runs/37048857781)
+passes, but its Linux test job reported a connection reset in the modem shutdown
+regression. That failure still needs investigation; the same test passed under
+CI coverage and in the local full run.
 
 | Layer | Where | Coverage |
 |---|---|---|
