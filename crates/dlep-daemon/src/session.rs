@@ -26,6 +26,7 @@ use tokio_util::codec::Decoder;
 use tracing::debug;
 
 use crate::config::TimersConfig;
+use crate::connections::ConnectionTracker;
 use crate::events::{DaemonEvent, PeerInfo};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionCommand, SessionRequest,
@@ -83,6 +84,7 @@ impl<'a> ExtensionCtx for SessionCtx<'a> {
 /// Ensures a terminal notification on every exit, including I/O errors and
 /// task cancellation. Explicit FSM shutdown marks the guard complete.
 struct SessionLifecycle {
+    connection: Option<ConnectionTracker>,
     session_id: SessionId,
     peer: PeerInfo,
     events_tx: EventTx,
@@ -282,6 +284,33 @@ impl Drop for TimerSet {
 /// mislabel the session.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session<F: SessionFsm>(
+    fsm: F,
+    transport: Box<dyn Transport>,
+    initial_event: FsmEvent,
+    commands: mpsc::Receiver<SessionRequest>,
+    events_tx: EventTx,
+    peer: PeerInfo,
+    extensions: ExtensionRegistry,
+    role: Role,
+    session_id_counter: SessionIdCounter,
+) -> Result<(), DaemonError> {
+    run_session_tracked(
+        fsm,
+        transport,
+        initial_event,
+        commands,
+        events_tx,
+        peer,
+        extensions,
+        role,
+        session_id_counter,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_session_tracked<F: SessionFsm>(
     mut fsm: F,
     transport: Box<dyn Transport>,
     initial_event: FsmEvent,
@@ -291,6 +320,7 @@ pub async fn run_session<F: SessionFsm>(
     extensions: ExtensionRegistry,
     role: Role,
     session_id_counter: SessionIdCounter,
+    connection: Option<ConnectionTracker>,
 ) -> Result<(), DaemonError> {
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut read_buf = BytesMut::with_capacity(4096);
@@ -299,6 +329,7 @@ pub async fn run_session<F: SessionFsm>(
     let session_id = next_session_id(&session_id_counter);
     let is_router_side = role.is_router();
     let mut lifecycle = SessionLifecycle {
+        connection,
         session_id,
         peer: peer.clone(),
         events_tx: events_tx.clone(),
@@ -324,8 +355,7 @@ pub async fn run_session<F: SessionFsm>(
         &extensions,
         session_id,
         is_router_side,
-        &mut lifecycle.active_exts,
-        &mut lifecycle.down_emitted,
+        &mut lifecycle,
         &mut pending_sends,
     )
     .await?
@@ -350,7 +380,7 @@ pub async fn run_session<F: SessionFsm>(
                         let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
                         if process_actions(actions, &mut writer, &mut timers, &timer_expiry_tx,
                             &events_tx, &peer, &extensions, session_id, is_router_side,
-                            &mut lifecycle.active_exts, &mut lifecycle.down_emitted, &mut pending_sends).await? { break; }
+                            &mut lifecycle, &mut pending_sends).await? { break; }
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -376,7 +406,7 @@ pub async fn run_session<F: SessionFsm>(
                         let actions = fsm.step(event);
                         let close = process_actions(actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer, &extensions, session_id, is_router_side,
-                            &mut lifecycle.active_exts, &mut lifecycle.down_emitted, &mut pending_sends).await?;
+                            &mut lifecycle, &mut pending_sends).await?;
                         if close { break; }
                         flush_pending_sends(&mut pending_sends, &mut writer).await?;
                     }
@@ -386,7 +416,7 @@ pub async fn run_session<F: SessionFsm>(
                             actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer,
                             &extensions, session_id, is_router_side,
-                            &mut lifecycle.active_exts, &mut lifecycle.down_emitted, &mut pending_sends,
+                            &mut lifecycle, &mut pending_sends,
                         ).await?;
                         break;
                     }
@@ -453,7 +483,7 @@ pub async fn run_session<F: SessionFsm>(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
-                    &mut lifecycle.active_exts, &mut lifecycle.down_emitted, &mut pending_sends,
+                    &mut lifecycle, &mut pending_sends,
                 ).await?;
                 if let Some(receipt) = receipt { let _ = receipt.send(Some((session_id, outcome))); }
                 if closed { break; }
@@ -479,7 +509,7 @@ pub async fn run_session<F: SessionFsm>(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
-                    &mut lifecycle.active_exts, &mut lifecycle.down_emitted, &mut pending_sends,
+                    &mut lifecycle, &mut pending_sends,
                 ).await? {
                     break;
                 }
@@ -525,10 +555,11 @@ async fn process_actions(
     extensions: &ExtensionRegistry,
     session_id: SessionId,
     is_router_side: bool,
-    active_exts: &mut Vec<Arc<dyn DlepExtension>>,
-    down_emitted: &mut bool,
+    lifecycle: &mut SessionLifecycle,
     pending_sends: &mut Vec<Message>,
 ) -> Result<bool, DaemonError> {
+    let active_exts = &mut lifecycle.active_exts;
+    let down_emitted = &mut lifecycle.down_emitted;
     let mut close = false;
     for action in actions {
         match action {
@@ -605,6 +636,9 @@ async fn process_actions(
                 //    intersection).
                 if let EmittedEvent::SessionUp { peer_extensions } = &emitted {
                     *active_exts = extensions.negotiate(peer_extensions);
+                    if let Some(connection) = &lifecycle.connection {
+                        connection.established();
+                    }
                 }
 
                 // 2. Broadcast the public lifecycle event FIRST so

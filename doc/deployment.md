@@ -238,9 +238,12 @@ After a session drops, the router binary waits 1 second before retrying, then
 doubles the delay after unsuccessful retries, up to 30 seconds. Opening TCP
 suspends further attempts while DLEP initialization is pending; it does not
 clear the failure history. Rejection or failure during initialization resumes
-the retained delay from `SessionDown`. Successful DLEP initialization resets
+the retained delay when the session closes. Successful DLEP initialization resets
 it. Discovery offers do not bypass the delay for that endpoint; new endpoints
-remain eligible for connection.
+remain eligible for connection. Reconnection uses retained daemon connection
+state, so event-stream lag does not strand a disconnected peer or lose a
+successful initialization's backoff reset. Other application events can still
+be lost when a broadcast subscriber falls behind.
 
 ## 7. Troubleshooting
 

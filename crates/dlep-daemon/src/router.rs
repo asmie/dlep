@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -5,18 +6,19 @@ use dlep_core::StatusCode;
 use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
 use dlep_fsm::session_router::RouterSessionFsm;
 use dlep_net::{ClientConfig, Connector};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::config::{NetworkConfig, RouterConfig, TimersConfig};
+use crate::connections::{ConnectionTracker, ConnectionTx, PeerConnectionState};
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
     new_event_channel,
 };
 use crate::session::{
-    SessionIdCounter, new_session_id_counter, run_session, session_config_from_timers,
+    SessionIdCounter, new_session_id_counter, run_session_tracked, session_config_from_timers,
 };
 
 type SessionTaskHandle = JoinHandle<Result<(), DaemonError>>;
@@ -25,6 +27,7 @@ type SessionTaskHandle = JoinHandle<Result<(), DaemonError>>;
 /// background task handles.
 pub struct RouterDaemon {
     events_tx: EventTx,
+    connections: ConnectionTx,
     timers: TimersConfig,
     network: NetworkConfig,
     /// Per-active-session command channels, used to fan out shutdown.
@@ -50,6 +53,16 @@ impl RouterDaemon {
 
     pub fn subscribe(&self) -> EventRx {
         self.events_tx.subscribe()
+    }
+
+    /// Subscribe to retained connection state for reconnect decisions. Unlike
+    /// `subscribe()`, this feed cannot lag or lose the latest lifecycle state.
+    /// Changes may coalesce; `establishment_count` preserves successful
+    /// initializations even when a session is already closed when read.
+    /// Read the initial snapshot as well as subsequent changes. Drop watch
+    /// borrow guards before awaiting to avoid blocking session state updates.
+    pub fn connection_states(&self) -> watch::Receiver<HashMap<SocketAddr, PeerConnectionState>> {
+        self.connections.subscribe()
     }
 
     pub async fn start_discovery(&self) -> Result<(), DaemonError> {
@@ -147,7 +160,8 @@ impl RouterDaemon {
         let events_tx = self.events_tx.clone();
         let mut commands = self.session_cmds.lock().await;
         let mut tasks = self.tasks.lock().await;
-        let handle = tokio::spawn(run_session(
+        let tracker = ConnectionTracker::new(self.connections.clone(), peer_info.addr);
+        let handle = tokio::spawn(run_session_tracked(
             fsm,
             transport,
             dlep_fsm::FsmEvent::TcpConnected,
@@ -157,6 +171,7 @@ impl RouterDaemon {
             self.extensions.clone(),
             Role::Router,
             self.session_id_counter.clone(),
+            Some(tracker),
         ));
 
         commands.retain(|tx| !tx.is_closed());
@@ -353,6 +368,7 @@ impl RouterBuilder {
         let (events_tx, _events_rx) = new_event_channel();
         Ok(RouterDaemon {
             events_tx,
+            connections: watch::channel(HashMap::new()).0,
             timers: cfg.shared.timers.clone(),
             network: cfg.shared.network.clone(),
             session_cmds: Arc::new(Mutex::new(Vec::new())),
@@ -386,6 +402,39 @@ mod cancellation_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_session_updates_state_even_when_broadcast_lags() {
+        let daemon = router().await;
+        let mut events = daemon.subscribe();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let addr = listener.local_addr().unwrap();
+        daemon.connect_static(addr).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        // Registration is visible before the session's first poll.
+        assert_eq!(
+            daemon.connection_states().borrow()[&addr].active_sessions,
+            1
+        );
+        let task = daemon.tasks.lock().await.pop().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        for _ in 0..=crate::runtime::EVENT_CHANNEL_CAPACITY {
+            daemon
+                .events_tx
+                .send(crate::DaemonEvent::Extension(Arc::new(())))
+                .unwrap();
+        }
+        assert!(matches!(
+            events.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+        // A late subscriber sees the terminal state without any event replay.
+        let states = daemon.connection_states();
+        assert_eq!(states.borrow()[&addr], PeerConnectionState::default());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_connection_never_leaves_an_unregistered_session() {
         let daemon = router().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -415,6 +464,7 @@ mod cancellation_tests {
         drop(held);
         assert!(daemon.session_cmds.lock().await.is_empty());
         assert!(daemon.tasks.lock().await.is_empty());
+        assert!(daemon.connection_states().borrow().is_empty());
         daemon.shutdown().await.unwrap();
     }
 

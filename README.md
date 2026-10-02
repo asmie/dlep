@@ -235,6 +235,9 @@ The router binary retries dropped sessions with exponential backoff (1 second,
 doubling to a 30-second cap). TCP connection success preserves that retry
 history while DLEP initialization is pending; only `SessionUp` resets it.
 Repeated discovery offers for a queued endpoint do not bypass the delay.
+Reconnect decisions use `RouterDaemon::connection_states()`, a retained state
+feed independent of the lossy public event broadcast. Missing `SessionUp` or
+`SessionDown` events therefore cannot prevent reconnection or backoff reset.
 
 `[network].interface` / `--interface` selects discovery group membership,
 multicast egress, unicast reply source, and accepted ingress interface. For

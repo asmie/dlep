@@ -131,6 +131,7 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 |---|---|
 | `config.rs` | `RouterConfig`, `ModemConfig`, plus shared `NetworkConfig`, `TlsConfig`, `TimersConfig`. All `serde::Deserialize` for TOML. |
 | `events.rs` | Public `DaemonEvent` enum (`PeerDiscovered`, `SessionUp`, `SessionDown`, `Destination`, `Metrics`, `Extension`), plus `DestinationId`, `LinkMetrics`, `PeerInfo`. `SessionUp`, `SessionDown`, `Destination`, and `Metrics` carry both `PeerInfo` and a `SessionId` so a multi-session embedder can attribute events across reconnects. `DaemonEvent: Clone` (required by `tokio::sync::broadcast`); `Debug` is hand-written because `Arc<dyn Any + Send + Sync>` does not derive `Debug`. |
+| `connections.rs` | Retained router endpoint state via `watch`: active task counts and cumulative successful initializations, updated directly by session guards. Reconnect decisions do not depend on the public event bus. |
 | `runtime.rs` | Channel plumbing: `EventTx = broadcast::Sender<DaemonEvent>` for the public event bus, `mpsc` for internal commands. `DaemonError` lives here too. |
 | `discovery.rs` | `run_discovery` background task: owns a `DiscoverySocket` + a discovery FSM (router or modem), bridges socket I/O to FSM events, applies GTSM filtering on inbound packets, drives periodic Peer_Discovery resends via `DiscoveryTimers`, and translates `EmittedEvent::PeerDiscovered` into `DaemonEvent::PeerDiscovered`. |
 | `session.rs` | The `SessionFsm` trait that the runtime drives, with blanket impls for the router and modem session FSMs. |
@@ -235,7 +236,11 @@ the capability; network tests run in an isolated network namespace.
 
 ### 5.11 Channels: broadcast for events, mpsc for commands
 
-The public event bus is `tokio::sync::broadcast::Sender<DaemonEvent>` with a fixed capacity (256). Slow subscribers lose old events; consumers that require lossless delivery can mpsc-bridge it themselves. Internal command flow (CLI → daemon → session task) is `mpsc`, single-consumer. Because the session task is the **sole owner and mutator of its FSM**, no locks are needed around the state — concurrency happens only at channel boundaries.
+The public event bus is `tokio::sync::broadcast::Sender<DaemonEvent>` with a fixed capacity (256). Slow subscribers lose old events; bridging this stream into another channel does not recover events already dropped.
+
+Router reconnection instead uses `RouterDaemon::connection_states()`, a `watch` snapshot with one entry per contacted endpoint, retained until the daemon is dropped. It tracks active session tasks and cumulative successful initializations. Consumers read the initial snapshot and subsequent changes, releasing borrow guards before awaiting. Coalescing preserves the latest state and the successful-initialization count without accumulating an event queue.
+
+Internal command flow (CLI → daemon → session task) is `mpsc`, single-consumer. Because the session task is the **sole owner and mutator of its FSM**, no locks are needed around the state — concurrency happens only at channel boundaries.
 
 ### 5.12 Extension dispatch ordering
 
@@ -534,6 +539,19 @@ The order of work was:
     drives the router event loop against repeated initialization refusals and
     frequent discovery offers, verifies 1-, 2-, and 4-second retry delays, then
     confirms successful establishment resets the next retry to 1 second.
+
+22. Reconnection independent of event lag. **Done** — the router reconciles a
+    retained connection snapshot at startup and whenever session state changes.
+    Session guards publish task registration, successful initialization, and
+    closure directly, including cancellation before a task's first poll. The
+    event broadcast remains available for logging and application notifications;
+    delayed lifecycle events no longer mutate reconnect state. An initialization
+    and disconnect that coalesce still reset backoff exactly once.
+
+    Regression tests overflow the event feed past every lifecycle notification
+    while checking reconnect delays and reset, recover a startup disconnect with
+    no lifecycle events, and verify cancellation, multiple sessions at one
+    endpoint, and independent peer retries.
 
 ---
 

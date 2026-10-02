@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+mod connections;
 pub mod discovery;
 pub mod events;
 pub mod modem;
@@ -22,6 +23,7 @@ pub use config::{
     DiscoveryMode, MetricsConfig, ModemConfig, NetworkConfig, RouterConfig, SharedConfig,
     TimersConfig, TlsConfig,
 };
+pub use connections::PeerConnectionState;
 pub use events::{
     AddressChanges, DaemonEvent, DestinationAddrs, DestinationEvent, DestinationId,
     LinkCharacteristics, LinkMetrics, MetricsEvent, PeerInfo, PeerOffer,

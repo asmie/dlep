@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use dlep_daemon::{
-    DaemonEvent, DiscoveryMode, RouterConfig, RouterDaemon, check_router_config, load_toml_config,
+    DaemonEvent, DiscoveryMode, PeerConnectionState, RouterConfig, RouterDaemon,
+    check_router_config, load_toml_config,
 };
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing_subscriber::EnvFilter;
@@ -159,7 +160,22 @@ async fn run(
 async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent>) {
     let mut connected: HashSet<SocketAddr> = HashSet::new();
     let mut reconnect = ReconnectQueue::default();
+    let mut states = daemon.connection_states();
+    let mut establishments = HashMap::new();
+    let mut refresh = true;
     loop {
+        // Read current state before acting on offers or retry deadlines. The
+        // initial snapshot also covers sessions that ended during startup.
+        if refresh || states.has_changed().unwrap_or(false) {
+            reconcile_connections(
+                &states.borrow_and_update(),
+                &mut establishments,
+                &mut connected,
+                &mut reconnect,
+                Instant::now(),
+            );
+            refresh = false;
+        }
         // Wake at the earliest pending reconnect deadline; park forever when
         // nothing is queued so an idle router doesn't spin.
         let next_due = reconnect.next_due();
@@ -172,6 +188,10 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
         tokio::pin!(retry_tick);
 
         tokio::select! {
+            changed = states.changed() => {
+                if changed.is_err() { return; }
+                refresh = true;
+            }
             _ = &mut retry_tick => {
                 for peer in reconnect.take_due(Instant::now()) {
                     if connected.contains(&peer) {
@@ -210,22 +230,42 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                 }
                 Ok(DaemonEvent::SessionUp { peer, .. }) => {
                     tracing::info!(addr = %peer.addr, tls = peer.is_tls, "session up");
-                    connected.insert(peer.addr);
-                    // Session established: the next drop is a fresh incident
-                    // and should retry at the base delay, not a grown one.
-                    reconnect.forget(&peer.addr);
                 }
                 Ok(DaemonEvent::SessionDown { peer, reason, .. }) => {
-                    tracing::info!(addr = %peer.addr, ?reason, "session down; scheduling reconnect");
-                    connected.remove(&peer.addr);
-                    reconnect.schedule(peer.addr, Instant::now());
+                    tracing::info!(addr = %peer.addr, ?reason, "session down");
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "event stream lagged");
+                    tracing::warn!(skipped, "event stream lagged; reconnect state is tracked separately");
                 }
                 Err(RecvError::Closed) => return,
             },
+        }
+    }
+}
+
+/// Reconcile retained state, never replay potentially stale broadcast events.
+/// An initialization and disconnect may coalesce into one snapshot; its
+/// establishment counter still resets backoff before scheduling the retry.
+fn reconcile_connections(
+    states: &HashMap<SocketAddr, PeerConnectionState>,
+    establishments: &mut HashMap<SocketAddr, u64>,
+    connected: &mut HashSet<SocketAddr>,
+    reconnect: &mut ReconnectQueue,
+    now: Instant,
+) {
+    for (&peer, state) in states {
+        let seen = establishments.entry(peer).or_default();
+        if *seen != state.establishment_count {
+            reconnect.forget(&peer);
+            *seen = state.establishment_count;
+        }
+        if state.active_sessions > 0 {
+            connected.insert(peer);
+            reconnect.suspend(&peer);
+        } else {
+            connected.remove(&peer);
+            reconnect.schedule(peer, now);
         }
     }
 }
@@ -366,6 +406,70 @@ mod tests {
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("dlep-router").chain(args.iter().copied()))
             .expect("CLI args parse")
+    }
+
+    #[test]
+    fn coalesced_establishment_and_disconnect_reset_backoff_once() {
+        let peer = addr(1);
+        let now = Instant::now();
+        let mut queue = ReconnectQueue::default();
+        queue.schedule(peer, now);
+        queue.take_due(now + RECONNECT_BASE);
+        queue.suspend(&peer);
+        let mut connected = HashSet::from([peer]);
+        let mut seen = HashMap::new();
+        let states = HashMap::from([(
+            peer,
+            PeerConnectionState {
+                active_sessions: 0,
+                establishment_count: 1,
+            },
+        )]);
+        let closed_at = now + Duration::from_secs(10);
+        reconcile_connections(&states, &mut seen, &mut connected, &mut queue, closed_at);
+        assert!(connected.is_empty());
+        assert_eq!(queue.next_due(), Some(closed_at + RECONNECT_BASE));
+        // An unchanged snapshot must not repeatedly reset the retry deadline.
+        reconcile_connections(
+            &states,
+            &mut seen,
+            &mut connected,
+            &mut queue,
+            closed_at + Duration::from_millis(500),
+        );
+        assert_eq!(queue.take_due(closed_at + RECONNECT_BASE), vec![peer]);
+    }
+
+    #[test]
+    fn pending_snapshot_preserves_backoff_and_keeps_other_peers_retrying() {
+        let now = Instant::now();
+        let mut queue = ReconnectQueue::default();
+        queue.schedule(addr(1), now);
+        queue.schedule(addr(2), now);
+        queue.take_due(now + RECONNECT_BASE);
+        let states = HashMap::from([
+            (
+                addr(1),
+                PeerConnectionState {
+                    active_sessions: 1,
+                    establishment_count: 0,
+                },
+            ),
+            (addr(2), PeerConnectionState::default()),
+        ]);
+        let mut connected = HashSet::new();
+        let mut seen = HashMap::new();
+        reconcile_connections(&states, &mut seen, &mut connected, &mut queue, now);
+        assert_eq!(connected, HashSet::from([addr(1)]));
+        assert!(queue.contains(&addr(1)));
+        assert_eq!(queue.take_due(now + Duration::from_secs(3)), vec![addr(2)]);
+        let closed_at = now + Duration::from_secs(4);
+        let states = HashMap::from([(addr(1), PeerConnectionState::default())]);
+        reconcile_connections(&states, &mut seen, &mut connected, &mut queue, closed_at);
+        assert_eq!(
+            queue.entries[&addr(1)].due,
+            Some(closed_at + Duration::from_secs(2))
+        );
     }
 
     #[test]
@@ -648,7 +752,68 @@ mod reconnect_runtime_tests {
     }
 
     #[tokio::test]
+    async fn startup_disconnect_is_recovered_without_lifecycle_events() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(config)
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let mut observed = daemon.subscribe();
+        daemon.connect_static(addr).await.unwrap();
+        let (mut peer, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        initialize(&mut peer, false).await;
+        lifecycle(&mut observed, true).await;
+        drop(peer);
+        lifecycle(&mut observed, false).await;
+        let mut states = daemon.connection_states();
+        timeout(WAIT, async {
+            loop {
+                if states.borrow_and_update()[&addr].active_sessions == 0 {
+                    break;
+                }
+                states.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        // The driver starts after both transitions, with an empty event feed.
+        let (_sender, mut events) = tokio::sync::broadcast::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        let driver = daemon.clone();
+        let started = Instant::now();
+        tasks.spawn(async move {
+            run_event_loop(&driver, &mut events).await;
+        });
+        let (peer, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        assert!(started.elapsed() >= RECONNECT_BASE - Duration::from_millis(100));
+        drop(peer);
+        tasks.shutdown().await;
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_sessions_back_off_despite_offers_and_success_resets_delay() {
+        backoff_with_event_overflow(false).await;
+    }
+
+    #[tokio::test]
+    async fn lost_lifecycle_events_still_reconnect_and_reset_backoff() {
+        backoff_with_event_overflow(true).await;
+    }
+
+    async fn backoff_with_event_overflow(overrun_lifecycle: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.set_ttl(255).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -671,6 +836,13 @@ mod reconnect_runtime_tests {
         tasks.spawn(async move {
             while let Ok(event) = live_events.recv().await {
                 forward.send(event).unwrap();
+                if overrun_lifecycle {
+                    // No await: on this current-thread runtime the driver
+                    // cannot consume the lifecycle event before it is evicted.
+                    for _ in 0..256 {
+                        forward.send(DaemonEvent::Extension(Arc::new(()))).unwrap();
+                    }
+                }
             }
         });
         let driver = daemon.clone();
