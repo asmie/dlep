@@ -298,7 +298,15 @@ mod platform {
                     next = *header.first()?;
                     let size = match kind {
                         0 | 43 | 60 => (usize::from(*header.get(1)?) + 1) * 8,
-                        51 => (usize::from(*header.get(1)?) + 2) * 4,
+                        51 => {
+                            let size = (usize::from(*header.get(1)?) + 2) * 4;
+                            // AH includes 12 fixed bytes and, in IPv6, must
+                            // occupy a multiple of 8 bytes (RFC 4302 §2.2).
+                            if size < 12 || size % 8 != 0 {
+                                return None;
+                            }
+                            size
+                        }
                         44 => {
                             if u16::from_be_bytes([*header.get(2)?, *header.get(3)?]) & 0xfff8 != 0
                             {
@@ -551,6 +559,155 @@ mod platform {
             packet[6] = 44;
             packet[43] = 8;
             assert!(low_ttl_connection(&packet, 7).is_none());
+        }
+
+        fn ipv6_packet(next: u8, payload: &[u8]) -> Vec<u8> {
+            let mut packet = vec![0; 40];
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+            packet[6] = next;
+            packet[7] = 254;
+            packet[8..24].copy_from_slice(&"fe80::1".parse::<Ipv6Addr>().unwrap().octets());
+            packet[24..40].copy_from_slice(&"fe80::2".parse::<Ipv6Addr>().unwrap().octets());
+            packet.extend_from_slice(payload);
+            packet
+        }
+
+        fn tcp_header() -> [u8; 20] {
+            let mut tcp = [0; 20];
+            tcp[..4].copy_from_slice(&[0x03, 0x56, 0x12, 0x34]);
+            tcp[12] = 0x50;
+            tcp
+        }
+
+        fn ipv6_header_chain() -> Vec<u8> {
+            // Independently laid out wire bytes: Hop-by-Hop (8), Destination
+            // Options (16), Routing (8), Fragment (8), AH (24), Destination
+            // Options (8), then TCP. AH measures length in 4-byte units;
+            // options/routing headers use 8-byte units.
+            let mut payload = vec![0; 72];
+            payload[0] = 60;
+            payload[8] = 43;
+            payload[9] = 1;
+            payload[24] = 44;
+            payload[26] = 253; // experimental routing type, zero segments left
+            payload[32] = 51; // atomic fragment
+            payload[40] = 60;
+            payload[41] = 4;
+            payload[47] = 1; // SPI
+            payload[51] = 1; // sequence number
+            payload[64] = 6;
+            payload.extend_from_slice(&tcp_header());
+            ipv6_packet(0, &payload)
+        }
+
+        #[test]
+        fn ipv6_mixed_extension_chain_preserves_tcp_tuple_and_scope() {
+            let mut packet = ipv6_header_chain();
+            let expected = Connection {
+                local: "[fe80::2%7]:4660".parse().unwrap(),
+                peer: "[fe80::1%7]:854".parse().unwrap(),
+            };
+            assert_eq!(low_ttl_connection(&packet, 7), Some(expected));
+            packet[7] = 255;
+            assert!(low_ttl_connection(&packet, 7).is_none());
+            packet[7] = 254;
+            packet[8..24].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+            packet[24..40].copy_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+            assert_eq!(
+                low_ttl_connection(&packet, 7),
+                Some(Connection {
+                    local: "[2001:db8::2]:4660".parse().unwrap(),
+                    peer: "[2001:db8::1]:854".parse().unwrap(),
+                })
+            );
+        }
+
+        #[test]
+        fn ipv6_extension_chain_respects_declared_and_captured_lengths() {
+            let packet = ipv6_header_chain();
+            for size in 0..packet.len() {
+                assert!(
+                    low_ttl_connection(&packet[..size], 7).is_none(),
+                    "capture length {size}"
+                );
+            }
+            // Keep the trailing bytes available in the capture: the parser
+            // must not use them beyond IPv6's declared payload boundary.
+            for payload_len in 0..packet.len() - 40 {
+                let mut short = packet.clone();
+                short[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+                assert!(
+                    low_ttl_connection(&short, 7).is_none(),
+                    "payload length {payload_len}"
+                );
+                short.truncate(40 + payload_len);
+                assert!(low_ttl_connection(&short, 7).is_none());
+            }
+            for length_offset in [41, 49, 65, 81, 105] {
+                let mut oversized = packet.clone();
+                oversized[length_offset] = 254;
+                assert!(
+                    low_ttl_connection(&oversized, 7).is_none(),
+                    "extension at {length_offset}"
+                );
+            }
+            let mut padded = packet.clone();
+            padded.extend_from_slice(&[0xaa; 32]);
+            assert_eq!(
+                low_ttl_connection(&padded, 7),
+                low_ttl_connection(&packet, 7)
+            );
+        }
+
+        #[test]
+        fn ipv6_fragments_require_zero_offset_and_a_tcp_header() {
+            let mut payload = vec![0; 8];
+            payload[0] = 6;
+            payload.extend_from_slice(&tcp_header());
+            payload.extend_from_slice(&[0; 4]); // first fragment is 8-byte aligned
+            for flags in [0u16, 1, 8, 9, 0xfff8, 0xfff9] {
+                payload[2..4].copy_from_slice(&flags.to_be_bytes());
+                let packet = ipv6_packet(44, &payload);
+                assert_eq!(
+                    low_ttl_connection(&packet, 7).is_some(),
+                    flags <= 1,
+                    "fragment {flags:#x}"
+                );
+            }
+            payload[2..4].copy_from_slice(&1u16.to_be_bytes());
+            for size in 0..28 {
+                assert!(low_ttl_connection(&ipv6_packet(44, &payload[..size]), 7).is_none());
+            }
+        }
+
+        #[test]
+        fn ipv6_non_tcp_and_opaque_headers_do_not_supply_tcp_ports() {
+            for kind in [17, 50, 59, 253] {
+                // UDP, ESP, No Next Header, unknown
+                assert!(low_ttl_connection(&ipv6_packet(kind, &tcp_header()), 7).is_none());
+                let mut packet = ipv6_header_chain();
+                packet[104] = kind; // final Destination Options Next Header
+                assert!(low_ttl_connection(&packet, 7).is_none());
+            }
+        }
+
+        #[test]
+        fn ipv6_authentication_header_requires_fixed_fields_and_alignment() {
+            // AH needs its 12-byte fixed portion and IPv6 8-byte alignment
+            // (RFC 4302 §2 and §2.2). Malformed lengths must not let following
+            // bytes masquerade as a TCP header and select a reset target.
+            for (len, valid) in [(0, false), (1, false), (2, true), (3, false), (4, true)] {
+                let mut payload = vec![0; (usize::from(len) + 2) * 4];
+                payload[0] = 6;
+                payload[1] = len;
+                payload.extend_from_slice(&tcp_header());
+                assert_eq!(
+                    low_ttl_connection(&ipv6_packet(51, &payload), 7).is_some(),
+                    valid,
+                    "AH length {len}"
+                );
+            }
         }
     }
 }

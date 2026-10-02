@@ -246,6 +246,13 @@ IPv4 and IPv6 connections. The real shutdown fallback wakes an already pending
 local reader, rejects further local writes, and gives the peer EOF. This
 fallback stops local I/O but cannot guarantee an RST when the abort syscall fails.
 
+Packet-parser regressions cover mixed IPv6 extension chains, variable header
+lengths, capture and declared-payload truncation, fragment offsets, opaque or
+non-TCP payloads, and scoped versus global endpoints. They exposed acceptance
+of structurally invalid Authentication Header lengths: AH now requires its
+12-byte fixed portion and IPv6 8-byte alignment before locating TCP. These are
+structural checks, not IPsec integrity verification.
+
 ### 5.11 Channels: broadcast for events, mpsc for commands
 
 The public event bus is `tokio::sync::broadcast::Sender<DaemonEvent>` with a fixed capacity (256). Slow subscribers lose old events; bridging this stream into another channel does not recover events already dropped.
@@ -329,8 +336,8 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
-The last validated suite contains **417 passing tests**, including the monitor
-receive-failure and reset-fallback regressions. The earlier 389-test coverage run measured
+The last validated suite contains **422 passing tests**, including the monitor
+failure and IPv6 extension-parser regressions. The earlier 389-test coverage run measured
 **94.3% lines, 93.3% regions, and 94.5% functions**; these are a snapshot,
 not a conformance score or a coverage gate. Coverage was not recollected for
 this checkpoint. Reports are produced on each CI run.
