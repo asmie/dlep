@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use dlep_fsm::events::{EmittedEvent, FsmAction, FsmEvent, SendTarget};
 use dlep_fsm::{TimerId, TimerKind};
-use dlep_net::discovery::DiscoverySocket;
+use dlep_net::discovery::{DiscoverySocket, ReceivedSignal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -112,7 +112,16 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
 
     if let Some(event) = initial_event {
         let actions = fsm.step(event);
-        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None).await?;
+        process_actions(
+            actions,
+            &socket,
+            &events_tx,
+            &mut timers,
+            &timer_tx,
+            None,
+            None,
+        )
+        .await?;
     }
 
     loop {
@@ -121,10 +130,10 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
                 // Back off only socket failures, without blocking timers or
                 // shutdown while waiting to retry the receive operation.
                 tokio::time::sleep_until(receive_after).await;
-                socket.recv_with_local().await
+                socket.recv_with_metadata().await
             } => {
                 match res {
-                    Ok((signal, from, _ttl, local)) => {
+                    Ok(ReceivedSignal { signal, from, local_addr, interface_index, .. }) => {
                         // RFC 8175 §7.1: an existing TCP connection suppresses
                         // discovery even before TLS/DLEP initialization finishes.
                         if signal.signal_type == dlep_core::SignalType::PEER_DISCOVERY
@@ -133,7 +142,7 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
                             continue;
                         }
                         let actions = fsm.step(FsmEvent::RecvSignal { signal, from });
-                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local)).await?;
+                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local_addr), Some(interface_index)).await?;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                         // A peer controls its datagram contents. Malformed
@@ -150,13 +159,13 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
             }
             Some((id, kind)) = timer_rx.recv() => {
                 let actions = fsm.step(FsmEvent::TimerExpired(id, kind));
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None).await?;
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None).await?;
             }
             Some(()) = shutdown_rx.recv() => {
                 let actions = fsm.step(FsmEvent::AppShutdown {
                     reason: dlep_core::StatusCode::SHUTTING_DOWN,
                 });
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None).await?;
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None).await?;
                 return Ok(());
             }
         }
@@ -170,6 +179,7 @@ async fn process_actions(
     timers: &mut DiscoveryTimers,
     timer_tx: &mpsc::Sender<(TimerId, TimerKind)>,
     local: Option<std::net::IpAddr>,
+    interface_index: Option<u32>,
 ) -> Result<(), DaemonError> {
     for action in actions {
         match action {
@@ -239,7 +249,7 @@ async fn process_actions(
             FsmAction::Emit(emitted) => {
                 if let Some(mut evt) = translate(emitted) {
                     if let (DaemonEvent::PeerDiscovered(offer), Some(index)) =
-                        (&mut evt, socket.interface_index())
+                        (&mut evt, interface_index)
                     {
                         for endpoint in &mut offer.endpoints {
                             if let std::net::SocketAddr::V6(addr) = &mut endpoint.addr {

@@ -56,6 +56,18 @@ pub struct DiscoveryParamsV6 {
     pub join_group: bool,
 }
 
+/// A decoded signal and the kernel metadata for this individual datagram.
+/// The ingress interface is independent of the sender's address family:
+/// IPv4 offers can advertise IPv6 link-local TCP endpoints.
+#[derive(Debug)]
+pub struct ReceivedSignal {
+    pub signal: Signal,
+    pub from: SocketAddr,
+    pub ttl: u8,
+    pub local_addr: IpAddr,
+    pub interface_index: u32,
+}
+
 #[derive(Debug)]
 pub struct DiscoverySocket {
     fd: AsyncFd<OwnedFd>,
@@ -180,7 +192,8 @@ impl DiscoverySocket {
         })
     }
 
-    /// Interface scope used by connection points advertised over this socket.
+    /// Configured interface, if any. For the actual ingress interface of a
+    /// datagram (including with no selected IPv4 interface), use `recv_with_metadata`.
     pub fn interface_index(&self) -> Option<u32> {
         self.interface
             .map(|i| i.index)
@@ -274,6 +287,19 @@ impl DiscoverySocket {
     /// limits are filtered before decoding. Malformed or truncated packets
     /// return `InvalidData`; callers may immediately receive the next packet.
     pub async fn recv_with_local(&self) -> io::Result<(Signal, SocketAddr, u8, IpAddr)> {
+        let received = self.recv_with_metadata().await?;
+        Ok((
+            received.signal,
+            received.from,
+            received.ttl,
+            received.local_addr,
+        ))
+    }
+
+    /// Receive a signal with its usable local address and ingress interface.
+    /// Interface filtering and TTL/hop-limit validation run before decoding.
+    /// Missing packet metadata is an error, never an unspecified scope.
+    pub async fn recv_with_metadata(&self) -> io::Result<ReceivedSignal> {
         use bytes::BytesMut;
         use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 
@@ -382,14 +408,17 @@ impl DiscoverySocket {
                         .codec
                         .decode_datagram(buf)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    return Ok((
+                    return Ok(ReceivedSignal {
                         signal,
                         from,
                         ttl,
-                        local.ok_or_else(|| {
+                        local_addr: local.ok_or_else(|| {
                             io::Error::other("missing packet interface information")
                         })?,
-                    ));
+                        interface_index: interface_index.filter(|index| *index != 0).ok_or_else(
+                            || io::Error::other("missing packet ingress interface index"),
+                        )?,
+                    });
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => continue,

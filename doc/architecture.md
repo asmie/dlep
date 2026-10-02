@@ -659,12 +659,18 @@ The order of work was:
 
 The [2026-10-02 completeness and coverage review](review-2026-10-02.md)
 records the final review of batches 1–29, fresh validation results, and four
-remaining fixes. Its open findings take precedence over broad completion
-statements above. Each follow-up remains a separate commit checkpoint.
+follow-up findings. R1 (mixed-family discovery scope) is now fixed: the socket
+preserves each datagram's ingress interface index, including when IPv4 discovery
+has no explicitly selected interface, and the runtime applies that scope to
+advertised IPv6 link-local endpoints. Regressions cover a complete mixed-family
+DLEP connection, per-packet scope across two interfaces, wrong-interface
+filtering, unscoped global endpoints, and source-address fallback.
+R2–R4 remain open and take precedence over broad completion statements above.
+Each follow-up remains a separate commit checkpoint.
 
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.
 - **Socket privileges.** The modem normally needs `CAP_NET_BIND_SERVICE` for port 854; the router uses ephemeral source ports. Both roles need `CAP_NET_RAW` for strict TCP GTSM. See [deployment §4](deployment.md#4-socket-privileges).
-- **IPv4 vs IPv6.** Wire encoding and discovery support both families. Each daemon uses the family of `bind_addr`; simultaneous discovery over both families is not enabled. IPv6 wildcard binds require an explicit interface to scope multicast. IPv6 discovery retains scope for link-local TCP endpoints; IPv6 link-local Connection Points received over IPv4 discovery still lose that scope (review finding R1).
+- **IPv4 vs IPv6.** Wire encoding and discovery support both families. Each daemon uses the family of `bind_addr`; simultaneous discovery over both families is not enabled. IPv6 wildcard binds require an explicit interface to scope multicast. Link-local TCP endpoints retain the packet's ingress interface scope, including IPv6 Connection Points received over default-route IPv4 discovery.
 
 - **Heartbeat failure coverage.** `silent_peer_is_detected_by_heartbeat_while_request_is_pending` uses an independent TCP peer that completes initialization, starts a destination transaction, and then goes silent. It verifies termination and `SessionDown(TIMED_OUT)`. A virtual-time transport test verifies that a response delayed for three minutes is accepted while the peer continues communicating.

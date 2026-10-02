@@ -347,3 +347,184 @@ async fn ipv6_offers_from_global_source_scope_link_local_connection_points() {
     assert_eq!(fallback.endpoints[0].addr, "[fd00::1]:854".parse().unwrap());
     router.shutdown().await.unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn default_ipv4_discovery_connects_to_ipv6_link_local_offer() {
+    use dlep_net::{
+        addr::InterfaceSpec,
+        discovery::{DiscoveryParams, DiscoverySocket},
+    };
+    let spec = InterfaceSpec::ByName("dlep-test".into());
+    let iface = spec.resolve_v6("fe80::1".parse().unwrap()).unwrap();
+    // A real modem supplies TCP/DLEP over IPv6; an independent IPv4 discovery
+    // responder advertises it so the test does not rely on matching families.
+    let mut mc = loopback_modem_config();
+    mc.shared.network.bind_addr = iface.address.into();
+    mc.shared.network.interface = Some("dlep-test".into());
+    mc.shared.network.discovery_port = 49_861;
+    let modem = ModemDaemon::builder().config(mc).spawn().await.unwrap();
+    let mut me = modem.subscribe();
+    let responder = DiscoverySocket::bind_on_interface(
+        &DiscoveryParams {
+            group_v4: dlep_core::DISCOVERY_IPV4_GROUP,
+            interface_v4: Ipv4Addr::UNSPECIFIED,
+            port: 0,
+            group_port: None,
+            multicast_loop: true,
+            join_group: true,
+        },
+        &spec,
+    )
+    .unwrap();
+    let mut rc = loopback_router_config();
+    rc.shared.network.discovery_port = responder.local_port();
+    assert!(rc.shared.network.interface.is_none());
+    let router = RouterDaemon::builder().config(rc).spawn().await.unwrap();
+    let mut re = router.subscribe();
+    router.start_discovery().await.unwrap();
+    let (_, from, _) = timeout(STEP_TIMEOUT, responder.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let signal = dlep_fsm::discovery_common::build_peer_offer(
+        "mixed-family modem",
+        modem.local_addr(),
+        false,
+    );
+    responder.send_unicast(&signal, from).await.unwrap();
+    let offer = await_peer_discovered(&mut re).await;
+    assert_eq!(
+        offer.endpoints.len(),
+        1,
+        "no alternative may hide a scope error"
+    );
+    assert_eq!(offer.endpoints[0].addr, modem.local_addr());
+    router.connect_discovered(&offer).await.unwrap();
+    await_session_up(&mut me).await;
+    await_session_up(&mut re).await;
+
+    // An offer without a Connection Point still falls back to its IPv4 sender.
+    responder
+        .send_unicast(
+            &dlep_core::Signal::new(dlep_core::SignalType::PEER_OFFER),
+            from,
+        )
+        .await
+        .unwrap();
+    let fallback = await_peer_discovered(&mut re).await;
+    let responder_addr = spec
+        .resolve_v4(Ipv4Addr::UNSPECIFIED)
+        .unwrap()
+        .unwrap()
+        .address;
+    assert_eq!(
+        fallback.endpoints[0].addr,
+        std::net::SocketAddr::new(responder_addr.into(), 854)
+    );
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+async fn ipv4_offer_ingress_scopes(select_interface: bool) {
+    use dlep_core::{DataItem, data_item::ConnectionPointFlags};
+    use dlep_net::{
+        addr::InterfaceSpec,
+        discovery::{DiscoveryParams, DiscoverySocket},
+    };
+    let params = DiscoveryParams {
+        group_v4: dlep_core::DISCOVERY_IPV4_GROUP,
+        interface_v4: Ipv4Addr::UNSPECIFIED,
+        port: 0,
+        group_port: None,
+        multicast_loop: true,
+        join_group: false,
+    };
+    let selected = InterfaceSpec::ByName("dlep-test".into());
+    let receiver = DiscoverySocket::bind_on_interface(
+        &params,
+        if select_interface {
+            &selected
+        } else {
+            &InterfaceSpec::Any
+        },
+    )
+    .unwrap();
+    let port = receiver.local_port();
+    let (events, mut received) = tokio::sync::broadcast::channel(16);
+    let (shutdown, shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(dlep_daemon::discovery::run_discovery(
+        dlep_fsm::discovery_router::RouterDiscoveryFsm::new(),
+        receiver,
+        Some(dlep_fsm::FsmEvent::AppStartDiscovery),
+        shutdown_rx,
+        events,
+    ));
+
+    // The same link-local address on successive interfaces represents different
+    // endpoints. Global IPv6 and IPv4 Connection Points must remain unscoped.
+    for name in ["lo", "dlep-test", "lo"] {
+        let spec = InterfaceSpec::ByName(name.into());
+        let iface = spec.resolve_v4(Ipv4Addr::UNSPECIFIED).unwrap().unwrap();
+        let sender = DiscoverySocket::bind_on_interface(&params, &spec).unwrap();
+        let signal = dlep_fsm::discovery_common::build_peer_offer(
+            name,
+            "[fe80::2]:12345".parse().unwrap(),
+            false,
+        )
+        .with_item(DataItem::Ipv6ConnectionPoint {
+            flags: ConnectionPointFlags::default(),
+            addr: "fd00::2".parse().unwrap(),
+            port: Some(12345),
+        })
+        .with_item(DataItem::Ipv4ConnectionPoint {
+            flags: ConnectionPointFlags::default(),
+            addr: "192.0.2.2".parse().unwrap(),
+            port: Some(12345),
+        });
+        sender
+            .send_unicast(&signal, (iface.address, port).into())
+            .await
+            .unwrap();
+        if select_interface && name == "lo" {
+            assert!(
+                timeout(Duration::from_millis(50), received.recv())
+                    .await
+                    .is_err(),
+                "an offer from the wrong interface must not escape the socket filter"
+            );
+            continue;
+        }
+        let offer = await_peer_discovered(&mut received).await;
+        assert_eq!(offer.peer_description.as_deref(), Some(name));
+        let addresses: Vec<_> = offer
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.addr)
+            .collect();
+        assert_eq!(
+            addresses,
+            vec![
+                std::net::SocketAddrV6::new("fe80::2".parse().unwrap(), 12345, 0, iface.index)
+                    .into(),
+                "[fd00::2]:12345".parse().unwrap(),
+                "192.0.2.2:12345".parse().unwrap(),
+            ]
+        );
+    }
+    shutdown.send(()).await.unwrap();
+    timeout(STEP_TIMEOUT, task).await.unwrap().unwrap().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn default_ipv4_discovery_scopes_each_offer_to_its_ingress_interface() {
+    ipv4_offer_ingress_scopes(false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn named_ipv4_discovery_filters_wrong_interface_mixed_family_offers() {
+    ipv4_offer_ingress_scopes(true).await;
+}
