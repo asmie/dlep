@@ -92,6 +92,10 @@ jobs:
       # Online mode is needed for Cargo's temporary registry checksum lookup.
       # This builds archives and verifies them without publishing anything.
       - run: cargo package --workspace --locked
+      # Package verification builds normal targets, not every test dependency.
+      # Populate the complete locked dependency set before offline test builds.
+      - name: Fetch locked dependencies for archived tests
+        run: cargo fetch --locked
       - run: python3 .github/scripts/check-release-packages.py
       - name: Exercise installed release commands with strict GTSM
         run: |

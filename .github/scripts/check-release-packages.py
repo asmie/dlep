@@ -1,8 +1,10 @@
 """Check archived sources without borrowing files from the repository.
 
-Run after `cargo package --workspace --allow-dirty --locked`. This reconstructs
-an isolated workspace from the archives and patches ONLY the unpublished DLEP
-dependencies to those extracted copies. Third-party versions use Cargo.lock.
+Run after `cargo package --workspace --allow-dirty --locked` and
+`cargo fetch --locked`. The fetch includes development dependencies that package
+verification may not download; all checks below intentionally run offline.
+This reconstructs an isolated workspace from the archives and patches ONLY the
+unpublished DLEP dependencies to those extracted copies. Third-party versions use Cargo.lock.
 Cargo's preceding package verification checks the normalized registry packages;
 this additionally compiles every packaged test and installs all three commands.
 """
