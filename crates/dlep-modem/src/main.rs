@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
         .spawn()
         .await
         .context("failed to start modem daemon")?;
+    tracing::info!("modem listening on {}", daemon.local_addr());
 
     shutdown.recv().await;
     tracing::info!("shutdown requested");

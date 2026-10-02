@@ -362,8 +362,14 @@ behavior; the coverage percentages above predate them. The local full suite now
 passes **429 tests**, with formatting, clippy, and Rust 1.85 checks passing.
 The [audit run for `3e006eb`](https://github.com/asmie/dlep/actions/runs/37048857781)
 passes, but its Linux test job reported a connection reset in the modem shutdown
-regression. That failure still needs investigation; the same test passed under
-CI coverage and in the local full run.
+regression. Local stress testing reproduced the reset during initialization:
+the helper connected before the intended modem was ready, and the modem failed
+to bind the port previously reserved and released by the test. Shutdown tests
+now let the modem allocate its own port and wait for its listening-address log.
+The stalled-TLS case also waits for a server handshake record before signalling
+shutdown, proving the connection has been accepted. Both shutdown suites passed
+200 repetitions each with four suites running concurrently (1,600 test
+executions total). Verification of this fix in pushed-commit CI is still pending.
 
 | Layer | Where | Coverage |
 |---|---|---|

@@ -27,3 +27,4 @@ dlep-fsm.workspace = true
 dlep-net = { workspace = true, features = ["test-helpers"] }
 tempfile.workspace = true
 nix = { workspace = true, features = ["signal"] }
+rustls.workspace = true

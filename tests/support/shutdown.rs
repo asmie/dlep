@@ -2,7 +2,7 @@
 //! merely a successful-looking exit after a dropped socket.
 use std::{
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -29,32 +29,59 @@ pub enum Role {
     Modem,
 }
 
-struct Process(Child);
+struct Process {
+    child: Child,
+    log: PathBuf,
+}
 impl Process {
     fn spawn(binary: &str, config: &Path) -> Self {
-        Self(
-            Command::new(binary)
-                .arg("--config")
-                .arg(config)
-                .env("TOKIO_WORKER_THREADS", "2")
-                .env("DLEP_LOG", "warn")
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        )
+        let log = config.with_extension("log");
+        let child = Command::new(binary)
+            .arg("--config")
+            .arg(config)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .env("DLEP_LOG", "info")
+            .env("NO_COLOR", "1")
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        Self { child, log }
+    }
+    async fn modem_addr(&mut self) -> SocketAddr {
+        timeout(WAIT, async {
+            loop {
+                let output = std::fs::read_to_string(&self.log).unwrap();
+                // Only use a complete line, not a partially written address.
+                for line in output.split_inclusive('\n').filter(|s| s.ends_with('\n')) {
+                    if let Some((_, addr)) = line.split_once("modem listening on ") {
+                        let addr: SocketAddr = addr.trim().parse().unwrap();
+                        assert!(addr.ip().is_loopback());
+                        assert_ne!(addr.port(), 0, "modem must report its assigned port");
+                        return addr;
+                    }
+                }
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "modem failed to start"
+                );
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("modem did not report its listening address")
     }
     fn signal(&mut self, signal: Signal) {
         assert!(
-            self.0.try_wait().unwrap().is_none(),
+            self.child.try_wait().unwrap().is_none(),
             "daemon exited before signal"
         );
-        kill(Pid::from_raw(self.0.id() as i32), signal).unwrap();
+        kill(Pid::from_raw(self.child.id() as i32), signal).unwrap();
     }
     async fn exited_cleanly(&mut self, limit: Duration) {
         let status = timeout(limit, async {
             loop {
-                if let Some(status) = self.0.try_wait().unwrap() {
+                if let Some(status) = self.child.try_wait().unwrap() {
                     break status;
                 }
                 sleep(Duration::from_millis(10)).await;
@@ -70,20 +97,30 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if std::thread::panicking() {
+            eprintln!(
+                "daemon output:\n{}",
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            );
         }
     }
 }
 
-async fn read_message(peer: &mut TcpStream) -> Message {
+async fn read_message(peer: &mut TcpStream, phase: &str) -> Message {
     timeout(WAIT, async {
         let mut header = [0; 4];
-        peer.read_exact(&mut header).await.unwrap();
+        peer.read_exact(&mut header)
+            .await
+            .unwrap_or_else(|error| panic!("{phase}: reading DLEP header: {error}"));
         let mut bytes = header.to_vec();
         bytes.resize(4 + u16::from_be_bytes([header[2], header[3]]) as usize, 0);
-        peer.read_exact(&mut bytes[4..]).await.unwrap();
+        peer.read_exact(&mut bytes[4..])
+            .await
+            .unwrap_or_else(|error| panic!("{phase}: reading DLEP payload: {error}"));
         Message::decode(bytes.into()).unwrap()
     })
     .await
@@ -95,26 +132,29 @@ async fn send(peer: &mut TcpStream, message: Message) {
         .unwrap()
         .unwrap();
 }
-async fn connect(addr: SocketAddr, child: &mut Process) -> TcpStream {
-    timeout(WAIT, async {
-        loop {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "modem failed to start"
-            );
-            let socket = TcpSocket::new_v4().unwrap();
-            dlep_net::gtsm::configure_tcp(&socket, false, true).unwrap();
-            match socket.connect(addr).await {
-                Ok(stream) => break stream,
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    sleep(Duration::from_millis(10)).await
-                }
-                Err(e) => panic!("connecting to modem: {e}"),
-            }
+async fn connect(child: &mut Process) -> TcpStream {
+    // A bind-and-drop port reservation can still accept connections during a
+    // concurrent subprocess spawn, or be reused before the modem binds. Let
+    // the modem bind port zero and wait for its own readiness announcement.
+    let addr = child.modem_addr().await;
+    let socket = TcpSocket::new_v4().unwrap();
+    dlep_net::gtsm::configure_tcp(&socket, false, true).unwrap();
+    timeout(WAIT, socket.connect(addr))
+        .await
+        .expect("connecting to ready modem timed out")
+        .expect("connecting to ready modem")
+}
+
+async fn listener(role: Role) -> (Option<TcpListener>, SocketAddr) {
+    match role {
+        Role::Router => {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.set_ttl(255).unwrap();
+            let addr = listener.local_addr().unwrap();
+            (Some(listener), addr)
         }
-    })
-    .await
-    .unwrap()
+        Role::Modem => (None, "127.0.0.1:0".parse().unwrap()),
+    }
 }
 fn config(role: Role, addr: SocketAddr, tls: bool) -> String {
     let router = if matches!(role, Role::Router) {
@@ -129,26 +169,18 @@ fn config(role: Role, addr: SocketAddr, tls: bool) -> String {
 }
 
 pub async fn established(binary: &str, role: Role, signal: Signal, acknowledge: bool) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.set_ttl(255).unwrap();
-    let addr = listener.local_addr().unwrap();
+    let (listener, addr) = listener(role).await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     std::fs::write(&path, config(role, addr, false)).unwrap();
-    let listener = if matches!(role, Role::Router) {
-        Some(listener)
-    } else {
-        drop(listener);
-        None
-    };
     let mut child = Process::spawn(binary, &path);
     let mut peer = match listener {
         Some(listener) => timeout(WAIT, listener.accept()).await.unwrap().unwrap().0,
-        None => connect(addr, &mut child).await,
+        None => connect(&mut child).await,
     };
     match role {
         Role::Router => {
-            let init = read_message(&mut peer).await;
+            let init = read_message(&mut peer, "router initialization").await;
             assert_eq!(init.message_type, MessageType::SESSION_INITIALIZATION);
             let mut fsm = ModemSessionFsm::new();
             fsm.step(FsmEvent::TcpAccepted);
@@ -172,7 +204,7 @@ pub async fn established(binary: &str, role: Role, signal: Signal, acknowledge: 
             )
             .await;
             assert_eq!(
-                read_message(&mut peer).await.message_type,
+                read_message(&mut peer, "router ready").await.message_type,
                 MessageType::SESSION_UPDATE_RESPONSE
             );
         }
@@ -187,7 +219,7 @@ pub async fn established(binary: &str, role: Role, signal: Signal, acknowledge: 
                     }),
             )
             .await;
-            let response = read_message(&mut peer).await;
+            let response = read_message(&mut peer, "modem initialization").await;
             assert_eq!(
                 response.message_type,
                 MessageType::SESSION_INITIALIZATION_RESPONSE
@@ -203,7 +235,7 @@ pub async fn established(binary: &str, role: Role, signal: Signal, acknowledge: 
     }
     let stop_started = tokio::time::Instant::now();
     child.signal(signal);
-    let termination = read_message(&mut peer).await;
+    let termination = read_message(&mut peer, "session termination").await;
     assert_eq!(termination.message_type, MessageType::SESSION_TERMINATION);
     assert!(termination.data_items.iter().any(|i| matches!(
         i,
@@ -213,7 +245,7 @@ pub async fn established(binary: &str, role: Role, signal: Signal, acknowledge: 
         }
     )));
     assert!(
-        child.0.try_wait().unwrap().is_none(),
+        child.child.try_wait().unwrap().is_none(),
         "must wait for termination acknowledgement"
     );
     if acknowledge {
@@ -221,7 +253,7 @@ pub async fn established(binary: &str, role: Role, signal: Signal, acknowledge: 
         child.signal(signal);
         sleep(Duration::from_millis(50)).await;
         assert!(
-            child.0.try_wait().unwrap().is_none(),
+            child.child.try_wait().unwrap().is_none(),
             "must keep waiting for the peer response"
         );
         send(
@@ -245,9 +277,7 @@ pub async fn established(binary: &str, role: Role, signal: Signal, acknowledge: 
 }
 
 pub async fn stalled_tls(binary: &str, role: Role) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.set_ttl(255).unwrap();
-    let addr = listener.local_addr().unwrap();
+    let (listener, addr) = listener(role).await;
     let dir = tempfile::tempdir().unwrap();
     let pki = dlep_net::tls::test_helpers::self_signed_for_ip(addr.ip());
     let cert = dir.path().join("cert.pem");
@@ -266,12 +296,6 @@ pub async fn stalled_tls(binary: &str, role: Role) {
         ),
     )
     .unwrap();
-    let listener = if matches!(role, Role::Router) {
-        Some(listener)
-    } else {
-        drop(listener);
-        None
-    };
     let mut child = Process::spawn(binary, &path);
     let mut peer = match listener {
         Some(listener) => {
@@ -286,7 +310,31 @@ pub async fn stalled_tls(binary: &str, role: Role) {
             );
             peer
         }
-        None => connect(addr, &mut child).await,
+        None => {
+            let mut peer = connect(&mut child).await;
+            let mut tls = rustls::ClientConnection::new(
+                dlep_net::tls::test_helpers::client_config_for(pki.roots),
+                addr.ip().into(),
+            )
+            .unwrap();
+            let mut hello = Vec::new();
+            tls.write_tls(&mut hello).unwrap();
+            timeout(WAIT, peer.write_all(&hello))
+                .await
+                .unwrap()
+                .unwrap();
+            // A server handshake record proves this connection was accepted
+            // and TLS is in progress. Never send the client's Finished record.
+            let mut header = [0; 5];
+            timeout(WAIT, peer.read_exact(&mut header))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(header[0], 22, "expected a TLS handshake record");
+            assert_eq!(&header[1..3], &[3, 3]);
+            assert_ne!(u16::from_be_bytes([header[3], header[4]]), 0);
+            peer
+        }
     };
     child.signal(Signal::SIGTERM);
     // Shorter than the transport's five-second handshake timeout.
