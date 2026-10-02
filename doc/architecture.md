@@ -680,8 +680,13 @@ are protected. Registry generations survive eviction/re-admission; the event loo
 prunes matching retry state and cancels stale attempts without relying on lifecycle
 broadcasts. Tests cover endpoint churn, expiry, cancellation, capacity recovery,
 static-peer deferral, rediscovery, and existing lag/backoff behavior.
-R4 remains open and takes precedence over broad completion statements above.
-Each follow-up remains a separate commit checkpoint.
+R4 (heartbeat send scheduling) was withdrawn after checking RFC 8175 §12.20
+and Appendix B.7: the existing independent send timer is correct. Receipt
+refreshes the missed-peer deadline. New virtual-time runtime regressions cover
+both roles, unequal intervals, core and negotiated extension traffic just before
+a send, eventual silence detection, and cancellation of sends during termination.
+All three confirmed follow-up defects are fixed; this review is not independent
+interoperability certification.
 
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.

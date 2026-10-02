@@ -134,6 +134,12 @@ heartbeat mechanism detects a silent peer. Remove the previously introduced
 `[timers].link_characteristics_timeout_ms` setting if present; it is no longer
 supported and configuration parsing rejects it.
 
+Each peer sends heartbeats at its own advertised interval. Valid received
+traffic refreshes a separate silence deadline of twice the remote peer's
+interval; it does not postpone local sends. The two peers may use different
+intervals. See [RFC 8175 §12.20](https://www.rfc-editor.org/rfc/rfc8175.html#section-12.20)
+and [Appendix B.7](https://www.rfc-editor.org/rfc/rfc8175.html#appendix-B.7).
+
 CLI flags override the file: `--interface`, `--no-tls`, `--cert`, `--key`,
 `--ca-bundle`, and (router) `--peer ADDR` (repeatable; implies static mode).
 

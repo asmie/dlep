@@ -100,7 +100,10 @@ pub enum FsmAction {
     /// at `missed_deadline`. The FSM owns the timer-id choice so the runtime
     /// stays decoupled from FSM-internal timer naming. The send-side
     /// periodic heartbeat timer is independent (started once at `InSession`
-    /// entry) and is *not* affected.
+    /// entry) and is *not* affected: RFC 8175 §12.20 requires periodic sends,
+    /// while Appendix B.7 resets the missed-heartbeat counter on receipt.
+    /// Resetting sends too could starve the slower peer's heartbeats when
+    /// advertised intervals differ.
     ResetHeartbeat {
         timer_id: TimerId,
         missed_deadline: Duration,
