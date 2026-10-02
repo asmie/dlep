@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+mod connect;
+
+use connect::ConnectAttempts;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -104,7 +107,7 @@ async fn main() -> Result<()> {
     let mut events = daemon.subscribe();
 
     // Race the entire connection/event driver, including startup, against
-    // shutdown. Inline TCP/TLS attempts must not delay signal handling.
+    // shutdown. Dropping the driver cancels its outstanding TCP/TLS attempts.
     let result = tokio::select! {
         biased;
         _ = shutdown.recv() => Ok(()),
@@ -131,12 +134,6 @@ async fn run(
                 !static_peers.is_empty(),
                 "mode = \"static\" requires at least one entry in static_peers"
             );
-            for peer in static_peers {
-                daemon
-                    .connect_static(*peer)
-                    .await
-                    .with_context(|| format!("connecting to static peer {peer}"))?;
-            }
         }
         DiscoveryMode::Discovery => {
             daemon
@@ -146,20 +143,31 @@ async fn run(
         }
     }
 
-    run_event_loop(daemon, events).await;
+    let peers = if matches!(mode, DiscoveryMode::Static) {
+        static_peers
+    } else {
+        &[]
+    };
+    run_event_loop(daemon, events, peers).await;
     Ok(())
 }
 
 /// Connect to modems as discovery finds them,
 /// log session lifecycle, and re-dial peers whose session dropped.
 ///
-/// `connected` tracks addresses with an active or in-flight session, so the
-/// discovery path and the reconnect path never dial the same modem twice.
+/// `connected` tracks registered sessions; `attempts` reserves endpoints while
+/// TCP/TLS is pending, so discovery and retries cannot dial a modem twice.
 /// A dropped peer is removed from it — without that, the dedup check would
 /// permanently suppress re-connection to a modem that restarted.
-async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent>) {
+async fn run_event_loop(
+    daemon: &RouterDaemon,
+    events: &mut Receiver<DaemonEvent>,
+    static_peers: &[SocketAddr],
+) {
     let mut connected: HashSet<SocketAddr> = HashSet::new();
     let mut reconnect = ReconnectQueue::default();
+    let mut attempts = ConnectAttempts::default();
+    let mut startup: VecDeque<_> = static_peers.iter().copied().collect();
     let mut states = daemon.connection_states();
     let mut establishments = HashMap::new();
     let mut refresh = true;
@@ -176,9 +184,26 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
             );
             refresh = false;
         }
-        // Wake at the earliest pending reconnect deadline; park forever when
-        // nothing is queued so an idle router doesn't spin.
-        let next_due = reconnect.next_due();
+        // Retained snapshots can still report a previous closed session while
+        // a new TCP/TLS attempt is pending. Do not rearm those retry deadlines.
+        for peer in attempts.endpoints() {
+            reconnect.suspend(peer);
+        }
+        while attempts.capacity() > 0 {
+            let Some(peer) = startup.pop_front() else {
+                break;
+            };
+            if !connected.contains(&peer) && !reconnect.contains(&peer) {
+                attempts.start_static(daemon, peer);
+            }
+        }
+        // Leave excess due peers queued without advancing their attempt count.
+        // A full pool waits for completion rather than spinning on past deadlines.
+        let next_due = if attempts.capacity() > 0 {
+            reconnect.next_due()
+        } else {
+            None
+        };
         let retry_tick = async move {
             match next_due {
                 Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -192,40 +217,42 @@ async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent
                 if changed.is_err() { return; }
                 refresh = true;
             }
-            _ = &mut retry_tick => {
-                for peer in reconnect.take_due(Instant::now()) {
-                    if connected.contains(&peer) {
-                        // An initialization is already in flight. Preserve its
-                        // failure history until SessionUp confirms success.
-                        reconnect.suspend(&peer);
-                        continue;
+            completion = attempts.next() => {
+                match completion.result {
+                    Ok(addr) => {
+                        tracing::debug!(%addr, "transport connected; awaiting DLEP initialization");
+                        // Read the snapshot again: initialization or teardown may
+                        // have completed before this future was polled as ready.
+                        refresh = true;
                     }
-                    tracing::info!(addr = %peer, "reconnecting to modem");
-                    match daemon.connect_static(peer).await {
-                        Ok(()) => {
-                            connected.insert(peer);
-                            reconnect.suspend(&peer);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                addr = %peer, error = %e,
-                                "reconnect failed; will retry with backoff"
-                            );
+                    Err(error) => {
+                        if let Some(peer) = completion.retry_peer {
+                            reconnect.schedule(peer, Instant::now());
+                            tracing::warn!(%peer, %error, "connection failed; will retry with backoff");
+                        } else {
+                            tracing::warn!(%error, "offer endpoints failed; discovery will retry");
                         }
                     }
                 }
             }
+            _ = &mut retry_tick => {
+                for peer in reconnect.take_due_limited(Instant::now(), attempts.capacity()) {
+                    reconnect.suspend(&peer);
+                    if connected.contains(&peer) || attempts.contains(&peer) { continue; }
+                    tracing::info!(addr = %peer, "reconnecting to modem");
+                    attempts.start_static(daemon, peer);
+                }
+            }
             evt = events.recv() => match evt {
                 Ok(DaemonEvent::PeerDiscovered(mut offer)) => {
-                    if offer.endpoints.iter().any(|e| connected.contains(&e.addr)) { continue; }
+                    if offer.endpoints.iter().any(|e| connected.contains(&e.addr) || attempts.contains(&e.addr)) { continue; }
                     // The retry queue owns endpoints with a failure history.
                     // Repeated offers must not bypass their backoff; new
                     // endpoints in the same offer remain eligible.
                     offer.endpoints.retain(|e| !reconnect.contains(&e.addr));
                     if offer.endpoints.is_empty() { continue; }
-                    match daemon.connect_discovered(&offer).await {
-                        Ok(addr) => { connected.insert(addr); }
-                        Err(e) => tracing::warn!(error = %e, "offer endpoints failed; discovery will retry"),
+                    if !attempts.start_offer(daemon, offer) {
+                        tracing::debug!("connection slots full; a later discovery offer can retry");
                     }
                 }
                 Ok(DaemonEvent::SessionUp { peer, .. }) => {
@@ -288,9 +315,9 @@ struct ReconnectQueue {
 
 #[derive(Debug)]
 struct ReconnectEntry {
-    /// Attempts already handed out by `take_due`.
+    /// Retries already handed out for execution.
     attempts: u32,
-    /// None while TCP is open but DLEP initialization is still pending.
+    /// None while TCP/TLS connection or DLEP initialization is pending.
     due: Option<Instant>,
 }
 
@@ -307,7 +334,7 @@ impl ReconnectQueue {
     /// Queue a dropped peer. A peer already queued keeps its accumulated
     /// backoff, so a flapping modem cannot rewind itself to the base delay by
     /// dropping repeatedly. A failed initialization resumes the retained
-    /// backoff from the time SessionDown is received.
+    /// backoff from the time connection failure or session closure is observed.
     fn schedule(&mut self, addr: SocketAddr, now: Instant) {
         self.entries
             .entry(addr)
@@ -322,22 +349,31 @@ impl ReconnectQueue {
             });
     }
 
-    /// Hand back every peer whose delay has elapsed, re-arming each at the
-    /// next backoff step. TCP success suspends retries while initialization
-    /// runs; only SessionUp clears the history. Connect failures leave the
-    /// next retry armed.
+    #[cfg(test)]
     fn take_due(&mut self, now: Instant) -> Vec<SocketAddr> {
-        let mut due: Vec<SocketAddr> = Vec::new();
-        for (addr, entry) in self.entries.iter_mut() {
-            if entry.due.is_some_and(|due| due <= now) {
+        self.take_due_limited(now, usize::MAX)
+    }
+
+    /// Hand out the oldest due peers up to available capacity. The caller
+    /// suspends their deadlines while connecting, then schedules failed
+    /// attempts from completion time. Only SessionUp clears their history.
+    fn take_due_limited(&mut self, now: Instant, limit: usize) -> Vec<SocketAddr> {
+        let mut due: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(&addr, entry)| entry.due.filter(|at| *at <= now).map(|at| (at, addr)))
+            .collect();
+        // Oldest first keeps waiting peers ahead of freshly failed retries.
+        due.sort();
+        due.truncate(limit);
+        due.into_iter()
+            .map(|(_, addr)| {
+                let entry = self.entries.get_mut(&addr).unwrap();
                 entry.attempts = entry.attempts.saturating_add(1);
                 entry.due = Some(now + Self::backoff_for(entry.attempts));
-                due.push(*addr);
-            }
-        }
-        // Deterministic order keeps logs and tests stable.
-        due.sort();
-        due
+                addr
+            })
+            .collect()
     }
 
     /// Stop retrying a peer — call on `SessionUp` so the next drop starts a
@@ -406,6 +442,24 @@ mod tests {
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("dlep-router").chain(args.iter().copied()))
             .expect("CLI args parse")
+    }
+
+    #[test]
+    fn full_connection_pool_does_not_advance_waiting_retry_counts() {
+        let now = Instant::now();
+        let mut queue = ReconnectQueue::default();
+        queue.schedule(addr(2), now);
+        queue.schedule(addr(1), now + Duration::from_millis(1));
+        let later = now + RECONNECT_BASE + Duration::from_secs(1);
+        assert!(queue.take_due_limited(later, 0).is_empty());
+        assert_eq!(queue.entries[&addr(2)].attempts, 0);
+        assert_eq!(queue.take_due_limited(later, 1), vec![addr(2)]);
+        assert_eq!(queue.entries[&addr(1)].attempts, 0);
+        assert_eq!(
+            queue.next_due(),
+            Some(now + RECONNECT_BASE + Duration::from_millis(1))
+        );
+        assert_eq!(queue.take_due_limited(later, 1), vec![addr(1)]);
     }
 
     #[test]
@@ -751,6 +805,221 @@ mod reconnect_runtime_tests {
         }
     }
 
+    async fn independent_peers_during_stalled_tls(static_mode: bool) {
+        use dlep_daemon::{ModemConfig, ModemDaemon, SessionCommand};
+        use dlep_net::tls::test_helpers::{
+            client_config_for, self_signed_for_ip, server_config_for,
+        };
+        let pki = self_signed_for_ip("127.0.0.1".parse().unwrap());
+        let mut mc = ModemConfig::default();
+        mc.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
+        mc.shared.network.tcp_port = 0;
+        mc.shared.network.discovery_port = 0;
+        let modem = ModemDaemon::builder()
+            .config(mc)
+            .with_rustls_server(server_config_for(pki.cert_der, pki.key_der))
+            .spawn()
+            .await
+            .unwrap();
+        let mut modem_events = modem.subscribe();
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(RouterConfig::default())
+                .with_rustls_client(client_config_for(pki.roots))
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let mut observed = daemon.subscribe();
+        let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        slow.set_ttl(255).unwrap();
+        let slow_addr = slow.local_addr().unwrap();
+        let healthy = modem.local_addr();
+        let (inject, mut events) = tokio::sync::broadcast::channel(128);
+        let offer = |addr| {
+            DaemonEvent::PeerDiscovered(PeerOffer {
+                endpoints: vec![OfferEndpoint {
+                    addr,
+                    use_tls: true,
+                }],
+                peer_description: None,
+            })
+        };
+        let driver = daemon.clone();
+        let task = tokio::spawn(async move {
+            if static_mode {
+                run(
+                    &driver,
+                    &mut events,
+                    DiscoveryMode::Static,
+                    &[slow_addr, healthy],
+                )
+                .await
+                .unwrap();
+            } else {
+                run_event_loop(&driver, &mut events, &[]).await;
+            }
+        });
+        if !static_mode {
+            inject.send(offer(slow_addr)).unwrap();
+        }
+        let (mut stalled, _) = timeout(WAIT, slow.accept()).await.unwrap().unwrap();
+        if !static_mode {
+            for _ in 0..16 {
+                inject.send(offer(slow_addr)).unwrap();
+                inject.send(offer(healthy)).unwrap();
+            }
+        }
+        lifecycle(&mut observed, true).await;
+        let session_id = timeout(WAIT, async {
+            loop {
+                if let DaemonEvent::SessionUp { session_id, .. } =
+                    modem_events.recv().await.unwrap()
+                {
+                    break session_id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            daemon.connection_states().borrow()[&healthy].active_sessions,
+            1
+        );
+        assert!(!daemon.connection_states().borrow().contains_key(&slow_addr));
+        // A real session close must be noticed and retried even while another
+        // endpoint still holds its TLS handshake open.
+        modem
+            .send_command_to(
+                session_id,
+                SessionCommand::Shutdown {
+                    reason: StatusCode::SHUTTING_DOWN,
+                },
+            )
+            .await
+            .unwrap();
+        lifecycle(&mut observed, false).await;
+        lifecycle(&mut observed, true).await;
+        assert!(
+            timeout(Duration::from_millis(100), slow.accept())
+                .await
+                .is_err(),
+            "duplicate slow connection"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // Cancelling the driver drops the in-flight TLS socket immediately.
+        let mut hello = Vec::new();
+        timeout(WAIT, stalled.read_to_end(&mut hello))
+            .await
+            .unwrap()
+            .unwrap();
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        modem.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn static_startup_and_retries_progress_during_stalled_tls() {
+        independent_peers_during_stalled_tls(true).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_and_retries_progress_during_stalled_tls() {
+        independent_peers_during_stalled_tls(false).await;
+    }
+
+    #[tokio::test]
+    async fn full_pool_keeps_static_peers_queued_until_a_slot_is_released() {
+        use dlep_net::tls::test_helpers::{client_config_for, self_signed_for_ip};
+        let pki = self_signed_for_ip("127.0.0.1".parse().unwrap());
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(RouterConfig::default())
+                .with_rustls_client(client_config_for(pki.roots))
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let mut listeners = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..=connect::MAX_CONNECT_ATTEMPTS {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.set_ttl(255).unwrap();
+            peers.push(listener.local_addr().unwrap());
+            listeners.push(listener);
+        }
+        let mut events = daemon.subscribe();
+        let driver = daemon.clone();
+        let task = tokio::spawn(async move {
+            run(&driver, &mut events, DiscoveryMode::Static, &peers)
+                .await
+                .unwrap();
+        });
+        let mut sockets = Vec::new();
+        for listener in &listeners[..connect::MAX_CONNECT_ATTEMPTS] {
+            sockets.push(timeout(WAIT, listener.accept()).await.unwrap().unwrap().0);
+        }
+        let last = listeners.last().unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), last.accept())
+                .await
+                .is_err(),
+            "connection limit exceeded"
+        );
+        // This handshake failure frees a slot without ending static startup.
+        drop(sockets.remove(0));
+        let (_next, _) = timeout(WAIT, last.accept()).await.unwrap().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(sockets);
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn initially_unavailable_static_peer_is_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let mut cfg = RouterConfig::default();
+        cfg.shared.network.use_tls = false;
+        let daemon = Arc::new(RouterDaemon::builder().config(cfg).spawn().await.unwrap());
+        let mut observed = daemon.subscribe();
+        let mut events = daemon.subscribe();
+        let driver = daemon.clone();
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            run(&driver, &mut events, DiscoveryMode::Static, &[addr])
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let listener = TcpListener::bind(addr).await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let (mut peer, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        assert!(started.elapsed() >= RECONNECT_BASE - Duration::from_millis(100));
+        initialize(&mut peer, false).await;
+        lifecycle(&mut observed, true).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(peer);
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn startup_disconnect_is_recovered_without_lifecycle_events() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -789,7 +1058,7 @@ mod reconnect_runtime_tests {
         let driver = daemon.clone();
         let started = Instant::now();
         tasks.spawn(async move {
-            run_event_loop(&driver, &mut events).await;
+            run_event_loop(&driver, &mut events, &[]).await;
         });
         let (peer, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
         assert!(started.elapsed() >= RECONNECT_BASE - Duration::from_millis(100));
@@ -847,7 +1116,7 @@ mod reconnect_runtime_tests {
         });
         let driver = daemon.clone();
         tasks.spawn(async move {
-            run_event_loop(&driver, &mut events).await;
+            run_event_loop(&driver, &mut events, &[]).await;
         });
 
         daemon.connect_static(addr).await.unwrap();

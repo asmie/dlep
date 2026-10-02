@@ -234,10 +234,20 @@ and reconnection. The example units use `KillSignal=SIGTERM` explicitly.
 Keep systemd's `TimeoutStopSec` longer than the configured termination timeout
 plus the transport write timeout (5 seconds), allowing scheduling overhead.
 
+The router runs up to eight TCP/TLS connection attempts concurrently across
+static startup, discovery, and reconnection. A slow endpoint does not block
+other attempts or event handling. Static peers that are unavailable at startup
+remain eligible for retry instead of stopping the process. Static peers and
+retries wait when the pool is full; extra discovery offers are skipped until a
+later offer. Endpoints within a single offer retain their preference order,
+with fallback attempted sequentially. Shutdown cancels pending attempts before
+gracefully terminating registered sessions.
+
 After a session drops, the router binary waits 1 second before retrying, then
-doubles the delay after unsuccessful retries, up to 30 seconds. Opening TCP
-suspends further attempts while DLEP initialization is pending; it does not
-clear the failure history. Rejection or failure during initialization resumes
+doubles the delay after unsuccessful retries, up to 30 seconds. Connection
+failures start the next delay when the attempt finishes. Pending TCP/TLS
+connections and DLEP initialization suspend further attempts without clearing
+the failure history. Rejection or failure during initialization resumes
 the retained delay when the session closes. Successful DLEP initialization resets
 it. Discovery offers do not bypass the delay for that endpoint; new endpoints
 remain eligible for connection. Reconnection uses retained daemon connection

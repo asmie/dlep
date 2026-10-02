@@ -238,6 +238,10 @@ The router binary retries dropped sessions with exponential backoff (1 second,
 doubling to a 30-second cap). TCP connection success preserves that retry
 history while DLEP initialization is pending; only `SessionUp` resets it.
 Repeated discovery offers for a queued endpoint do not bypass the delay.
+Static startup, discovered modems, and retries share at most eight concurrent
+TCP/TLS connection attempts. Slow peers leave other connections and event
+handling responsive. Unavailable static peers stay queued for retry; queued
+peers wait when all slots are occupied, and discovery can retry on later offers.
 Reconnect decisions use `RouterDaemon::connection_states()`, a retained state
 feed independent of the lossy public event broadcast. Missing `SessionUp` or
 `SessionDown` events therefore cannot prevent reconnection or backoff reset.

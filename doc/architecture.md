@@ -568,6 +568,21 @@ The order of work was:
     connections, stalled/failed TLS, DLEP initialization timeout, established
     sessions, clean shutdown, cancellation, and discovery resuming after close.
 
+24. Concurrent router connection scheduling. **Done** — static startup,
+    discovery, and retries share eight connection slots. The driver polls
+    owned futures alongside events and lifecycle snapshots; no detached
+    connection tasks survive cancellation. Offers reserve all their candidate
+    endpoints to prevent overlapping attempts while retaining sequential
+    preference/fallback. Registered sessions are tracked independently.
+
+    Unavailable static peers enter backoff without stopping the process.
+    Excess static peers remain queued; retries are admitted oldest-first only
+    when capacity exists, without advancing waiting peers' attempt counts.
+    Failed attempts start their next delay on completion. Extra discovery
+    offers can retry on a later broadcast. Tests cover stalled TLS alongside
+    healthy startup, discovery, and reconnection; duplicate offers; a saturated
+    pool releasing queued work; initially unavailable peers; and cancellation.
+
 ---
 
 ## 10. Open questions / risks
