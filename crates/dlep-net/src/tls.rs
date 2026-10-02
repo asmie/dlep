@@ -51,8 +51,35 @@ pub mod test_helpers {
     /// contains the IP, and the returned `RootCertStore` is seeded with
     /// the cert itself (the simplest trust setup for a single-host test).
     pub fn self_signed_for_ip(ip: IpAddr) -> TestPki {
-        let key = KeyPair::generate().expect("rcgen key generation");
+        self_signed_with_params(
+            ip,
+            CertificateParams::new(Vec::<String>::new()).expect("rcgen params"),
+        )
+    }
+
+    /// Expired in 2001, avoiding a fixture that becomes invalid only after
+    /// a future wall-clock date. Otherwise identical to the valid IP fixture.
+    pub fn expired_self_signed_for_ip(ip: IpAddr) -> TestPki {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("rcgen params");
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        self_signed_with_params(ip, params)
+    }
+
+    fn self_signed_with_params(ip: IpAddr, mut params: CertificateParams) -> TestPki {
+        let key = KeyPair::generate().expect("rcgen key generation");
+        // Independent fixtures need distinct issuer names. Reusing rcgen's
+        // default name makes an unrelated root look like the right issuer
+        // with a bad signature instead of an unknown issuer.
+        let subject: String = key
+            .public_key_raw()
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("DLEP test {subject}"));
         params.subject_alt_names = vec![SanType::IpAddress(ip)];
         let cert = params.self_signed(&key).expect("rcgen self-sign");
 

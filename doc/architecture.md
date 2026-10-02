@@ -598,6 +598,21 @@ The order of work was:
     in both roles with virtual time. Example systemd units allow 300 seconds
     for the default protocol deadline plus transport and scheduling overhead.
 
+26. TLS failure-path coverage. **Done** — real daemon sessions now verify
+    rejection of wrong-IP, untrusted, and expired server certificates over
+    both IPv4 and IPv6. These tests check the specific rustls verification
+    error, ensure failed handshakes do not register DLEP sessions, and then
+    establish a healthy session with the same router and trust configuration.
+
+    Modem tests reject plaintext DLEP against TLS and missing, untrusted, or
+    expired mutual-TLS client identities, then accept a healthy client on the
+    same listener. TLS 1.3 client-side handshake success is followed through
+    to SessionDown when the server rejects authentication; no rejected peer
+    may reach SessionUp. The earlier missing-certificate test now requires a
+    terminal result instead of passing solely on an observation timeout.
+    Test-only certificate fixtures have distinct issuer names and fixed expired
+    validity dates. No production transport changes were needed.
+
 ---
 
 ## 10. Open questions / risks
