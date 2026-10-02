@@ -241,6 +241,10 @@ A receive-error regression drives the real receive loop with a socket that
 fails on `recvfrom`. It verifies reset of registered IPv4 and IPv6 connections,
 local reader wakeup, rejection of subsequent registrations, survival of an
 unregistered connection, and release of registrations and monitor state.
+Another regression injects failure at the reset syscall boundary on healthy
+IPv4 and IPv6 connections. The real shutdown fallback wakes an already pending
+local reader, rejects further local writes, and gives the peer EOF. This
+fallback stops local I/O but cannot guarantee an RST when the abort syscall fails.
 
 ### 5.11 Channels: broadcast for events, mpsc for commands
 
@@ -325,8 +329,8 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
-The last validated suite contains **416 passing tests**, including the monitor
-receive-failure regression. The earlier 389-test coverage run measured
+The last validated suite contains **417 passing tests**, including the monitor
+receive-failure and reset-fallback regressions. The earlier 389-test coverage run measured
 **94.3% lines, 93.3% regions, and 94.5% functions**; these are a snapshot,
 not a conformance score or a coverage gate. Coverage was not recollected for
 this checkpoint. Reports are produced on each CI run.

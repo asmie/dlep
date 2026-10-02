@@ -172,6 +172,19 @@ mod platform {
     /// AF_UNSPEC disconnect aborts a Linux TCP connection and sends RST,
     /// even while another fd references it. Readers wake with EOF/error.
     fn reset(socket: &Socket) {
+        reset_with(socket, disconnect);
+    }
+
+    fn reset_with(socket: &Socket, disconnect: impl FnOnce(&Socket) -> io::Result<()>) {
+        if let Err(error) = disconnect(socket) {
+            tracing::error!(%error, "TCP GTSM reset failed");
+            // If the abort syscall fails, still stop local I/O. This fallback
+            // cannot guarantee the reset packet that AF_UNSPEC normally sends.
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn disconnect(socket: &Socket) -> io::Result<()> {
         let addr = libc::sockaddr {
             sa_family: libc::AF_UNSPEC as libc::sa_family_t,
             sa_data: [0; 14],
@@ -186,8 +199,9 @@ mod platform {
             )
         };
         if result < 0 {
-            tracing::error!(error = %io::Error::last_os_error(), "TCP GTSM reset failed");
-            let _ = socket.shutdown(std::net::Shutdown::Both);
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 
@@ -425,6 +439,67 @@ mod platform {
                 .await
                 .unwrap();
             assert!(matches!(result, Ok(0) | Err(_)));
+        }
+
+        #[tokio::test]
+        async fn failed_reset_shuts_down_both_directions_and_wakes_pending_reader() {
+            use std::future::{Future, poll_fn};
+            use tokio::sync::oneshot;
+
+            for addr in ["127.0.0.1:0", "[::1]:0"] {
+                let (mut local, mut peer) = tcp_pair(addr).await;
+                let socket = socket2::SockRef::from(&local).try_clone().unwrap();
+                let (ready, pending) = oneshot::channel();
+                let reader = tokio::spawn(async move {
+                    let mut ready = Some(ready);
+                    let mut buf = [0; 1];
+                    let result = {
+                        let read = local.read(&mut buf);
+                        tokio::pin!(read);
+                        poll_fn(|cx| {
+                            let result = read.as_mut().poll(cx);
+                            if result.is_pending() {
+                                if let Some(ready) = ready.take() {
+                                    ready.send(()).unwrap();
+                                }
+                            }
+                            result
+                        })
+                        .await
+                    };
+                    (result, local)
+                });
+                timeout(Duration::from_secs(1), pending)
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                // Inject failure at the abort syscall boundary, preserving a
+                // healthy TCP connection on which the real shutdown must act.
+                let mut attempted = false;
+                reset_with(&socket, |_| {
+                    attempted = true;
+                    Err(io::Error::from_raw_os_error(libc::EPERM))
+                });
+                assert!(attempted);
+                let (result, mut local) = timeout(Duration::from_secs(1), reader)
+                    .await
+                    .expect("fallback must wake an already pending local reader")
+                    .unwrap();
+                assert_eq!(result.unwrap(), 0);
+                assert_eq!(
+                    local.write_all(b"x").await.unwrap_err().kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+                let mut buf = [0; 1];
+                assert_eq!(
+                    timeout(Duration::from_secs(1), peer.read(&mut buf))
+                        .await
+                        .expect("fallback must also close the remote read side")
+                        .unwrap(),
+                    0
+                );
+            }
         }
 
         #[test]
