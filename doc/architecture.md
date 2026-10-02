@@ -583,6 +583,21 @@ The order of work was:
     healthy startup, discovery, and reconnection; duplicate offers; a saturated
     pool releasing queued work; initially unavailable peers; and cancellation.
 
+25. Heartbeat-derived termination deadline. **Done** — omitted termination
+    timeouts now resolve to four local heartbeat intervals (240 seconds with
+    the default heartbeat), following the recommendation in RFC 8175 §7.4.
+    Both FSMs use the same calculation for shutdown, missed heartbeats, and
+    protocol errors. Multiplication occurs on `Duration`, avoiding `u32`
+    overflow. Direct FSM configurations use the same minimum heartbeat as the
+    advertised value. Explicit positive deployment overrides remain supported.
+
+    `TimersConfig::termination_timeout_ms` and `SessionConfig::termination_timeout`
+    are optional; TOML omits automatic mode during serialization. Tests cover
+    overrides, zero rejection, custom/default/maximum heartbeat values, all
+    termination entry paths, and late acknowledgements versus timeout expiry
+    in both roles with virtual time. Example systemd units allow 300 seconds
+    for the default protocol deadline plus transport and scheduling overhead.
+
 ---
 
 ## 10. Open questions / risks

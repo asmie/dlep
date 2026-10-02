@@ -1381,3 +1381,40 @@ fn modem_rejects_destination_announce_without_mac() {
         StatusCode::INVALID_DATA
     ));
 }
+
+#[test]
+fn every_termination_path_uses_four_local_heartbeats_or_explicit_override() {
+    use dlep_fsm::SessionConfig;
+    for (heartbeat, explicit, expected_ms) in [
+        (60_000, None, 240_000_u64),
+        (2_500, None, 10_000),
+        (0, None, 4_000), // Direct FSM callers get the advertised minimum.
+        (u32::MAX, None, u64::from(u32::MAX) * 4),
+        (60_000, Some(Duration::from_millis(500)), 500),
+    ] {
+        let events: [fn() -> FsmEvent; 3] = [
+            || FsmEvent::AppShutdown {
+                reason: StatusCode::SHUTTING_DOWN,
+            },
+            || FsmEvent::TimerExpired(TIMER_HEARTBEAT_MISSED, TimerKind::HeartbeatMissed),
+            || FsmEvent::ProtocolError(StatusCode::INVALID_DATA),
+        ];
+        for event in events {
+            let config = SessionConfig {
+                heartbeat_interval_ms: heartbeat,
+                termination_timeout: explicit,
+                ..Default::default()
+            };
+            let mut router = RouterSessionFsm::with_config(config.clone());
+            router.state = RouterSessionState::InSession;
+            let mut modem = ModemSessionFsm::with_config(config);
+            modem.state = ModemSessionState::InSession;
+            for actions in [router.step(event()), modem.step(event())] {
+                assert!(actions.iter().any(|action| matches!(action,
+                    FsmAction::StartTimer { kind: TimerKind::Termination, duration, periodic: false, .. }
+                    if *duration == Duration::from_millis(expected_ms)
+                )), "missing expected termination deadline: {actions:?}");
+            }
+        }
+    }
+}

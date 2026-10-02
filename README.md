@@ -234,6 +234,13 @@ silently ignores discovery from a router address with an accepted TCP
 connection, including during TLS and DLEP initialization. Offers resume after
 the last connection from that address closes.
 
+The termination-response timeout defaults to four local heartbeat intervals
+(240 seconds with the default heartbeat). Omit `[timers].termination_timeout_ms`
+to retain this automatic behavior, or set a positive explicit override.
+For Rust callers, `TimersConfig::termination_timeout_ms` and
+`SessionConfig::termination_timeout` now use `Option`: `None` selects the
+automatic deadline, and `Some(...)` supplies an override.
+
 The router binary retries dropped sessions with exponential backoff (1 second,
 doubling to a 30-second cap). TCP connection success preserves that retry
 history while DLEP initialization is pending; only `SessionUp` resets it.

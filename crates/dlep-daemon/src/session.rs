@@ -140,7 +140,9 @@ pub fn session_config_from_timers(
         peer_description,
         heartbeat_interval_ms: timers.heartbeat_interval_ms,
         session_init_timeout: Duration::from_millis(timers.session_init_timeout_ms.into()),
-        termination_timeout: Duration::from_millis(timers.termination_timeout_ms.into()),
+        termination_timeout: timers
+            .termination_timeout_ms
+            .map(|ms| Duration::from_millis(ms.into())),
         advertised_extensions,
         initial_metrics: Default::default(),
     }

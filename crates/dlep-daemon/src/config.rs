@@ -144,9 +144,10 @@ pub struct TimersConfig {
     #[serde(default = "default_session_init_timeout_ms")]
     pub session_init_timeout_ms: u32,
     /// Deadline waiting for Session Termination Response after our Session
-    /// Termination is sent.
-    #[serde(default = "default_termination_timeout_ms")]
-    pub termination_timeout_ms: u32,
+    /// Termination is sent. Omit to use four local heartbeat intervals
+    /// (RFC 8175 §7.4). An explicit override must be positive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_timeout_ms: Option<u32>,
 }
 
 impl TimersConfig {
@@ -157,13 +158,15 @@ impl TimersConfig {
             ("heartbeat_interval_ms", self.heartbeat_interval_ms, 1_000),
             ("discovery_interval_ms", self.discovery_interval_ms, 1_000),
             ("session_init_timeout_ms", self.session_init_timeout_ms, 1),
-            ("termination_timeout_ms", self.termination_timeout_ms, 1),
         ] {
             if value < minimum {
                 return Err(format!(
                     "timers.{name} must be at least {minimum} ms (got {value})"
                 ));
             }
+        }
+        if self.termination_timeout_ms == Some(0) {
+            return Err("timers.termination_timeout_ms must be at least 1 ms (got 0)".into());
         }
         Ok(())
     }
@@ -178,9 +181,6 @@ fn default_discovery_interval_ms() -> u32 {
 fn default_session_init_timeout_ms() -> u32 {
     5_000
 }
-fn default_termination_timeout_ms() -> u32 {
-    1_000
-}
 
 impl Default for TimersConfig {
     fn default() -> Self {
@@ -188,7 +188,7 @@ impl Default for TimersConfig {
             heartbeat_interval_ms: default_heartbeat_interval_ms(),
             discovery_interval_ms: default_discovery_interval_ms(),
             session_init_timeout_ms: default_session_init_timeout_ms(),
-            termination_timeout_ms: default_termination_timeout_ms(),
+            termination_timeout_ms: None,
         }
     }
 }

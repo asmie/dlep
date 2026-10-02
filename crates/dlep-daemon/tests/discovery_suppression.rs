@@ -208,7 +208,7 @@ async fn initialization_timeout_releases_discovery_suppression() {
     config.shared.network.discovery_port = 49_906;
     config.shared.network.use_tls = false;
     config.shared.timers.session_init_timeout_ms = 500;
-    config.shared.timers.termination_timeout_ms = 100;
+    config.shared.timers.termination_timeout_ms = Some(100);
     let modem = ModemDaemon::builder().config(config).spawn().await.unwrap();
     let mut addr = modem.local_addr();
     addr.set_port(49_906);

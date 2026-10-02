@@ -10,6 +10,9 @@ Restart=on-failure
 RestartSec=2
 # SIGTERM performs the DLEP Session Termination exchange before exit.
 KillSignal=SIGTERM
+# Default termination wait is 4 * 60s; allow transport writes and scheduling.
+# Increase this if heartbeat_interval_ms or termination_timeout_ms is increased.
+TimeoutStopSec=300s
 
 # Port 854 needs bind privileges; strict TCP GTSM needs packet monitoring.
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW

@@ -584,7 +584,7 @@ impl RouterSessionFsm {
                     FsmAction::StartTimer {
                         id: TIMER_TERMINATION,
                         kind: TimerKind::Termination,
-                        duration: self.config.termination_timeout,
+                        duration: self.config.termination_timeout(),
                         periodic: false,
                     },
                 ]
@@ -610,7 +610,7 @@ impl RouterSessionFsm {
                     FsmAction::StartTimer {
                         id: TIMER_TERMINATION,
                         kind: TimerKind::Termination,
-                        duration: self.config.termination_timeout,
+                        duration: self.config.termination_timeout(),
                         periodic: false,
                     },
                 ]
@@ -793,7 +793,7 @@ impl RouterSessionFsm {
             FsmAction::StartTimer {
                 id: TIMER_TERMINATION,
                 kind: TimerKind::Termination,
-                duration: self.config.termination_timeout,
+                duration: self.config.termination_timeout(),
                 periodic: false,
             },
         ]

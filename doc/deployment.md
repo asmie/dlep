@@ -93,7 +93,7 @@ metrics, and TLS material as well.
 | `[timers]` | `heartbeat_interval_ms` | `60000` | heartbeat interval, minimum 1000 ms |
 | `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval, minimum 1000 ms |
 | `[timers]` | `session_init_timeout_ms` | `5000` | positive deadline for Session Initialization Response |
-| `[timers]` | `termination_timeout_ms` | `1000` | positive deadline for Session Termination Response |
+| `[timers]` | `termination_timeout_ms` | omitted: `4 × heartbeat_interval_ms` | positive explicit override for Session Termination Response; default resolves to `240000` ms |
 | `[metrics]` (modem) | `max_data_rate_rx_bps` / `max_data_rate_tx_bps` | `0` | maximum receive/transmit rates, bits/second |
 | `[metrics]` (modem) | `current_data_rate_rx_bps` / `current_data_rate_tx_bps` | `0` | current receive/transmit rates, bits/second |
 | `[metrics]` (modem) | `latency_us` | `0` | transmission delay, microseconds |
@@ -233,6 +233,14 @@ the router also interrupts TCP/TLS connection attempts during startup, discovery
 and reconnection. The example units use `KillSignal=SIGTERM` explicitly.
 Keep systemd's `TimeoutStopSec` longer than the configured termination timeout
 plus the transport write timeout (5 seconds), allowing scheduling overhead.
+When `termination_timeout_ms` is omitted, the deadline is four local heartbeat
+intervals, following RFC 8175 §7.4. At the default 60-second heartbeat this is
+240 seconds. A response closes the session immediately; the full deadline is
+used only if the peer does not respond. The example units use
+`TimeoutStopSec=300s`; increase it if you increase the effective protocol
+deadline. An explicit positive `termination_timeout_ms` overrides the derived
+value; shorter values are a deployment choice departing from the RFC's
+recommendation.
 
 The router runs up to eight TCP/TLS connection attempts concurrently across
 static startup, discovery, and reconnection. A slow endpoint does not block

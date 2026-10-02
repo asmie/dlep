@@ -37,7 +37,9 @@ ca_bundle = "/etc/dlep/pki/ca.pem"
 
 [timers]
 # Heartbeat/discovery intervals must be >= 1000 ms.
-# session_init_timeout_ms and termination_timeout_ms must be > 0.
+# session_init_timeout_ms and any explicit termination_timeout_ms must be > 0.
+# Omitted termination_timeout_ms uses 4 * heartbeat_interval_ms (240000 here).
+# Set termination_timeout_ms explicitly only to override that recommendation.
 heartbeat_interval_ms = 60000
 
 # Initial link metrics. Replace these illustrative values with actual link data.

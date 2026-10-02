@@ -564,7 +564,7 @@ impl ModemSessionFsm {
                     FsmAction::StartTimer {
                         id: TIMER_TERMINATION,
                         kind: TimerKind::Termination,
-                        duration: self.config.termination_timeout,
+                        duration: self.config.termination_timeout(),
                         periodic: false,
                     },
                 ]
@@ -596,7 +596,7 @@ impl ModemSessionFsm {
                     FsmAction::StartTimer {
                         id: TIMER_TERMINATION,
                         kind: TimerKind::Termination,
-                        duration: self.config.termination_timeout,
+                        duration: self.config.termination_timeout(),
                         periodic: false,
                     },
                 ]
@@ -781,7 +781,7 @@ impl ModemSessionFsm {
             FsmAction::StartTimer {
                 id: TIMER_TERMINATION,
                 kind: TimerKind::Termination,
-                duration: self.config.termination_timeout,
+                duration: self.config.termination_timeout(),
                 periodic: false,
             },
         ]

@@ -23,7 +23,9 @@ pub struct SessionConfig {
     pub initial_metrics: LinkMetrics,
     pub heartbeat_interval_ms: u32,
     pub session_init_timeout: Duration,
-    pub termination_timeout: Duration,
+    /// Explicit response deadline; None uses four local heartbeat intervals
+    /// (RFC 8175 §7.4), including the minimum enforced on advertised heartbeats.
+    pub termination_timeout: Option<Duration>,
     /// `ExtensionId`s this side announces in the Session Initialization
     /// / Session Initialization Response `ExtensionsSupported` data item.
     /// Empty by default — populated by `dlep-daemon` from the registered
@@ -45,9 +47,19 @@ impl Default for SessionConfig {
             initial_metrics: LinkMetrics::default(),
             heartbeat_interval_ms: 60_000,
             session_init_timeout: Duration::from_millis(5_000),
-            termination_timeout: Duration::from_millis(1_000),
+            termination_timeout: None,
             advertised_extensions: Vec::new(),
         }
+    }
+}
+
+impl SessionConfig {
+    /// Effective termination-response deadline. Derive it at use time so an
+    /// embedder changing the heartbeat on a default config also changes this
+    /// deadline. Explicit deployment overrides remain authoritative.
+    pub fn termination_timeout(&self) -> Duration {
+        self.termination_timeout
+            .unwrap_or_else(|| local_heartbeat_interval(self).saturating_mul(4))
     }
 }
 
