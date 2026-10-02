@@ -18,9 +18,9 @@ use crate::gtsm;
 pub struct DiscoveryParams {
     /// Multicast group to join.
     pub group_v4: Ipv4Addr,
-    /// Local IPv4 address of the interface on which to join. Use
-    /// `127.0.0.1` for loopback tests; `0.0.0.0` lets the kernel pick the
-    /// default route.
+    /// Preferred local IPv4 address for membership and sending. Use
+    /// `127.0.0.1` for loopback tests; `0.0.0.0` selects an address on the
+    /// named interface, or lets the kernel pick when no interface is named.
     pub interface_v4: Ipv4Addr,
     /// UDP port to bind. `0` lets the kernel pick an ephemeral source port,
     /// useful for router-side sockets that only send multicast and receive
@@ -55,12 +55,25 @@ pub struct DiscoverySocket {
     /// falling back to `params.port`).
     group_port: u16,
     codec: SignalCodec,
+    interface: Option<crate::addr::Ipv4Interface>,
 }
 
 impl DiscoverySocket {
     /// Bind and (optionally) join the IPv4 multicast group described by
     /// `params`.
     pub fn bind(params: &DiscoveryParams) -> io::Result<Self> {
+        Self::bind_on_interface(params, &crate::addr::InterfaceSpec::Any)
+    }
+
+    /// Select multicast membership, egress, unicast reply source, and ingress
+    /// by interface. No SO_BINDTODEVICE privilege is needed. A nonzero
+    /// `interface_v4` must be assigned to that interface.
+    pub fn bind_on_interface(
+        params: &DiscoveryParams,
+        spec: &crate::addr::InterfaceSpec,
+    ) -> io::Result<Self> {
+        let interface = spec.resolve_v4(params.interface_v4)?;
+        let address = interface.map_or(params.interface_v4, |i| i.address);
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
         // SO_REUSEPORT is needed on some Linux distros to let two sockets
@@ -75,10 +88,21 @@ impl DiscoverySocket {
         gtsm::enable_recv_ttl(&sock, false)?;
         nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)?;
         sock.set_multicast_loop_v4(params.multicast_loop)?;
+        sock.set_multicast_if_v4(&address)?;
+        // Linux otherwise also delivers multicast joined by other sockets.
+        #[cfg(target_os = "linux")]
+        sock.set_multicast_all_v4(false)?;
         let bind_addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, params.port).into();
         sock.bind(&bind_addr.into())?;
         if params.join_group {
-            sock.join_multicast_v4(&params.group_v4, &params.interface_v4)?;
+            if let Some(interface) = interface {
+                sock.join_multicast_v4_n(
+                    &params.group_v4,
+                    &socket2::InterfaceIndexOrAddress::Index(interface.index),
+                )?;
+            } else {
+                sock.join_multicast_v4(&params.group_v4, &address)?;
+            }
         }
         // If the caller asked for ephemeral (`port = 0`), resolve the
         // actual port the kernel assigned so subsequent unicast replies
@@ -98,6 +122,7 @@ impl DiscoverySocket {
             port: resolved_port,
             group_port: params.group_port.unwrap_or(resolved_port),
             codec: SignalCodec,
+            interface,
         })
     }
 
@@ -133,13 +158,26 @@ impl DiscoverySocket {
         loop {
             let mut guard = self.fd.writable().await?;
             match guard.try_io(|inner| {
-                use nix::sys::socket::{MsgFlags, SockaddrIn, sendto};
+                use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrIn, sendmsg};
                 let nix_addr = SockaddrIn::from(dest);
-                sendto(
+                let info = self.interface.map(|i| nix::libc::in_pktinfo {
+                    ipi_ifindex: i.index as _,
+                    ipi_spec_dst: nix::libc::in_addr {
+                        s_addr: u32::from_ne_bytes(i.address.octets()),
+                    },
+                    ipi_addr: nix::libc::in_addr { s_addr: 0 },
+                });
+                let controls: Vec<_> = info
+                    .as_ref()
+                    .map(ControlMessage::Ipv4PacketInfo)
+                    .into_iter()
+                    .collect();
+                sendmsg(
                     inner.get_ref().as_raw_fd(),
-                    &bytes,
-                    &nix_addr,
+                    &[std::io::IoSlice::new(&bytes)],
+                    &controls,
                     MsgFlags::empty(),
+                    Some(&nix_addr),
                 )
                 .map_err(io::Error::from)
             }) {
@@ -202,9 +240,11 @@ impl DiscoverySocket {
                     .ok_or_else(|| io::Error::other("recvmsg without v4 sender"))?;
                 let mut ttl: Option<u8> = None;
                 let mut local = None;
+                let mut interface_index = None;
                 for cmsg in res.cmsgs().map_err(io::Error::from)? {
                     if let ControlMessageOwned::Ipv4PacketInfo(info) = cmsg {
                         local = Some(Ipv4Addr::from(info.ipi_spec_dst.s_addr.to_ne_bytes()));
+                        interface_index = Some(info.ipi_ifindex as u32);
                     }
                     if let ControlMessageOwned::Ipv4Ttl(t) = cmsg {
                         // TTL is a single byte in the IP header; the kernel
@@ -213,10 +253,19 @@ impl DiscoverySocket {
                         ttl = Some(t as u8);
                     }
                 }
-                Ok::<_, io::Error>((bytes_read, from, ttl, local))
+                Ok::<_, io::Error>((bytes_read, from, ttl, local, interface_index))
             });
             match outcome {
-                Ok(Ok((bytes_read, from, ttl_opt, local))) => {
+                Ok(Ok((bytes_read, from, ttl_opt, local, interface_index))) => {
+                    if self
+                        .interface
+                        .is_some_and(|i| Some(i.index) != interface_index)
+                    {
+                        // Filter before decode; unrelated interface traffic must
+                        // not reach the discovery FSM, even when malformed.
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     let ttl = ttl_opt.ok_or_else(|| {
                         io::Error::other(
                             "recvmsg returned no IP_TTL cmsg — IP_RECVTTL not enabled?",
@@ -285,18 +334,8 @@ mod tests {
 
         // High port to minimise collisions.
         let port = 49_854_u16;
-        // INADDR_ANY (`0.0.0.0`) for the join lets the kernel pick the
-        // default multicast egress interface. On hosts where the loopback
-        // interface lacks the `MULTICAST` link flag (e.g. WSL2 — see
-        // `ip link show lo`), binding the join to `127.0.0.1` would
-        // silently succeed but never deliver datagrams, because the
-        // kernel routes `224.0.0.117` via the default route (typically
-        // `eth0`). Using `UNSPECIFIED` matches the receive interface to
-        // wherever IP_MULTICAST_IF (defaulted by the kernel) sends from,
-        // so the round-trip closes regardless of which interface carries
-        // the traffic. The TTL assertion remains the load-bearing check:
-        // it confirms `set_send_ttl` and `IP_RECVTTL`/cmsg extraction are
-        // wired correctly.
+        // Exercise default-route selection; the explicit-interface tests below
+        // cover loopback independently of the system's default multicast route.
         let params = DiscoveryParams {
             group_v4: Ipv4Addr::new(224, 0, 0, 117),
             interface_v4: Ipv4Addr::UNSPECIFIED,
@@ -316,5 +355,152 @@ mod tests {
             .expect("recv failed");
         assert_eq!(received.signal_type, SignalType::PEER_DISCOVERY);
         assert_eq!(ttl, 255, "GTSM requires outbound TTL=255");
+    }
+    #[tokio::test]
+    async fn selected_interface_controls_multicast_and_unicast_source() {
+        use crate::addr::InterfaceSpec;
+        use dlep_core::SignalType;
+        let loopback = InterfaceSpec::Any
+            .resolve_v4(Ipv4Addr::LOCALHOST)
+            .unwrap()
+            .unwrap();
+        let name = nix::net::if_::if_indextoname(loopback.index).unwrap();
+        let spec = InterfaceSpec::ByName(name.to_string_lossy().into_owned());
+        let mut params = loopback_params(0);
+        // The name alone must work with the default wildcard address.
+        params.interface_v4 = Ipv4Addr::UNSPECIFIED;
+        let modem = DiscoverySocket::bind_on_interface(&params, &spec).unwrap();
+        params.join_group = false;
+        params.group_port = Some(modem.local_port());
+        let router = DiscoverySocket::bind_on_interface(&params, &spec).unwrap();
+        router
+            .send_to_group(&Signal::new(SignalType::PEER_DISCOVERY))
+            .await
+            .unwrap();
+        let (_, from, ttl, local) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), modem.recv_with_local())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(from.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(local, Ipv4Addr::LOCALHOST);
+        assert_eq!(ttl, 255);
+        modem
+            .send_unicast(&Signal::new(SignalType::PEER_OFFER), from)
+            .await
+            .unwrap();
+        let (offer, from, ttl) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), router.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(offer.signal_type, SignalType::PEER_OFFER);
+        assert_eq!(from.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(ttl, 255);
+    }
+
+    #[tokio::test]
+    async fn multicast_membership_is_isolated_between_interfaces() {
+        use crate::addr::InterfaceSpec;
+        use dlep_core::SignalType;
+        use nix::net::if_::InterfaceFlags;
+        use std::time::Duration;
+        // The workspace network harness supplies a multicast-capable default
+        // interface as well as loopback (also needed by the default-route test).
+        let foreign = nix::ifaddrs::getifaddrs()
+            .unwrap()
+            .find(|i| {
+                i.flags
+                    .contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_MULTICAST)
+                    && !i.flags.contains(InterfaceFlags::IFF_LOOPBACK)
+                    && i.address.is_some_and(|a| a.as_sockaddr_in().is_some())
+            })
+            .expect("network test harness needs a non-loopback IPv4 multicast interface");
+        let foreign_spec = InterfaceSpec::ByName(foreign.interface_name);
+        let mut params = loopback_params(0);
+        let selected = DiscoverySocket::bind(&params).unwrap();
+        params.port = selected.local_port();
+        params.interface_v4 = Ipv4Addr::UNSPECIFIED;
+        let other = DiscoverySocket::bind_on_interface(&params, &foreign_spec).unwrap();
+        params.port = 0;
+        params.group_port = Some(selected.local_port());
+        params.join_group = false;
+        let other_sender = DiscoverySocket::bind_on_interface(&params, &foreign_spec).unwrap();
+        // Use a unique port so reuse-port hashing cannot deliver this unicast
+        // to the other socket instead of exercising the packet-info filter.
+        let filter_params = DiscoveryParams {
+            port: 0,
+            join_group: true,
+            group_port: None,
+            ..params.clone()
+        };
+        let filtered = DiscoverySocket::bind_on_interface(&filter_params, &foreign_spec).unwrap();
+        let filter_sender = DiscoverySocket::bind_on_interface(
+            &DiscoveryParams {
+                group_port: Some(filtered.local_port()),
+                join_group: false,
+                ..filter_params
+            },
+            &foreign_spec,
+        )
+        .unwrap();
+        let stray = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        stray.set_ttl(255).unwrap();
+        let destination = (Ipv4Addr::LOCALHOST, filtered.local_port());
+        stray
+            .send_to(b"not a DLEP signal", destination)
+            .await
+            .unwrap();
+        stray
+            .send_to(
+                &Signal::new(SignalType::PEER_OFFER).encode().unwrap(),
+                destination,
+            )
+            .await
+            .unwrap();
+        filter_sender
+            .send_to_group(&Signal::new(SignalType::PEER_DISCOVERY))
+            .await
+            .unwrap();
+        let (received, from, _) = tokio::time::timeout(Duration::from_secs(2), filtered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.signal_type, SignalType::PEER_DISCOVERY);
+        assert!(!from.ip().is_loopback());
+        other_sender
+            .send_to_group(&Signal::new(SignalType::PEER_DISCOVERY))
+            .await
+            .unwrap();
+        let (received, from, _) = tokio::time::timeout(Duration::from_secs(2), other.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.signal_type, SignalType::PEER_DISCOVERY);
+        assert!(!from.ip().is_loopback());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), selected.recv())
+                .await
+                .is_err()
+        );
+        params.interface_v4 = Ipv4Addr::LOCALHOST;
+        let sender = DiscoverySocket::bind(&params).unwrap();
+        sender
+            .send_to_group(&Signal::new(SignalType::PEER_DISCOVERY))
+            .await
+            .unwrap();
+        let (_, from, _, _) =
+            tokio::time::timeout(Duration::from_secs(2), selected.recv_with_local())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(from.ip(), Ipv4Addr::LOCALHOST);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), other.recv())
+                .await
+                .is_err()
+        );
     }
 }

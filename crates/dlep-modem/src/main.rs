@@ -119,3 +119,20 @@ fn apply_overrides(cfg: &mut ModemConfig, cli: &Cli) {
         cfg.shared.tls.ca_bundle = Some(path.clone());
     }
 }
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn interface_cli_overrides_config() {
+        let cli = Cli::try_parse_from(["dlep-modem", "--interface", "selected0"]).unwrap();
+        let mut config = ModemConfig::default();
+        config.shared.network.interface = Some("configured0".into());
+        apply_overrides(&mut config, &cli);
+        assert_eq!(
+            config.shared.network.interface.as_deref(),
+            Some("selected0")
+        );
+    }
+}

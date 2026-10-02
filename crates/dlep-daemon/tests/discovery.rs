@@ -6,14 +6,10 @@
 //! `connect_discovered` using the offered endpoints and assert `SessionUp` on
 //! both sides.
 //!
-//! ## WSL2 environment caveat
-//!
-//! On WSL2 the `lo` interface does not carry the `MULTICAST` link flag
-//! (`ip link show lo`), so binding the discovery socket's multicast join to
-//! `127.0.0.1` would never receive datagrams. This test uses
-//! `Ipv4Addr::UNSPECIFIED` for `bind_addr` to let the kernel pick the
-//! default-route interface for multicast. The offer must resolve the wildcard
-//! listener to the ingress interface's real unicast address via IP_PKTINFO.
+//! This test leaves interface selection to the default route and verifies that
+//! a wildcard listener advertises the ingress interface's real unicast address.
+//! A separate named-loopback test verifies explicit interface selection even
+//! when the default route points to another interface.
 //!
 //! The router-side discovery socket binds an ephemeral port (port `0`) and
 //! does not join the multicast group; only the modem joins. This avoids
@@ -155,4 +151,67 @@ async fn discovery_loopback_finds_modem_and_establishes_session() {
     // 6) Clean shutdown.
     router.shutdown().await.expect("router shutdown");
     modem.shutdown().await.expect("modem shutdown");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn named_loopback_discovery_uses_selected_address_and_connects() {
+    let mut mc = loopback_modem_config();
+    mc.shared.network.interface = Some("lo".into());
+    // Wildcard TCP bind tests that the offer uses the selected ingress address.
+    mc.shared.network.discovery_port = 49_857;
+    let modem = ModemDaemon::builder().config(mc).spawn().await.unwrap();
+    let mut me = modem.subscribe();
+    let mut rc = loopback_router_config();
+    rc.shared.network.interface = Some("lo".into());
+    rc.shared.network.discovery_port = 49_857;
+    let router = RouterDaemon::builder().config(rc).spawn().await.unwrap();
+    let mut re = router.subscribe();
+    router.start_discovery().await.unwrap();
+    let offer = await_peer_discovered(&mut re).await;
+    assert_eq!(offer.endpoints[0].addr.ip(), Ipv4Addr::LOCALHOST);
+    assert_eq!(offer.endpoints[0].addr.port(), modem.local_addr().port());
+    router.connect_discovered(&offer).await.unwrap();
+    await_session_up(&mut me).await;
+    await_session_up(&mut re).await;
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_named_interface_fails_validation_and_spawn() {
+    let mut mc = loopback_modem_config();
+    mc.shared.network.interface = Some("dlep-no-such-if".into());
+    assert!(matches!(
+        dlep_daemon::check_modem_config(&mc),
+        Err(dlep_daemon::ConfigCheckError::Interface(_))
+    ));
+    assert!(matches!(
+        ModemDaemon::builder().config(mc).spawn().await,
+        Err(dlep_daemon::DaemonError::Config(_))
+    ));
+    let mut rc = loopback_router_config();
+    rc.shared.network.interface = Some("dlep-no-such-if".into());
+    assert!(matches!(
+        dlep_daemon::check_router_config(&rc),
+        Err(dlep_daemon::ConfigCheckError::Interface(_))
+    ));
+    assert!(matches!(
+        RouterDaemon::builder().config(rc).spawn().await,
+        Err(dlep_daemon::DaemonError::Config(_))
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn named_interface_validates_address_ownership_and_toml() {
+    let mc: ModemConfig = toml::from_str("[network]\nuse_tls=false\ninterface='lo'").unwrap();
+    dlep_daemon::check_modem_config(&mc).unwrap();
+    let mut rc: RouterConfig = toml::from_str("[network]\nuse_tls=false\ninterface='lo'").unwrap();
+    dlep_daemon::check_router_config(&rc).unwrap();
+    rc.shared.network.bind_addr = "255.255.255.255".parse().unwrap();
+    assert!(matches!(
+        dlep_daemon::check_router_config(&rc),
+        Err(dlep_daemon::ConfigCheckError::Interface(_))
+    ));
 }

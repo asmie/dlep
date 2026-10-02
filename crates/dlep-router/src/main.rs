@@ -470,3 +470,20 @@ mod tests {
         assert_eq!(q.next_due(), Some(now + RECONNECT_BASE));
     }
 }
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn interface_cli_overrides_config() {
+        let cli = Cli::try_parse_from(["dlep-router", "--interface", "selected0"]).unwrap();
+        let mut config = RouterConfig::default();
+        config.shared.network.interface = Some("configured0".into());
+        apply_overrides(&mut config, &cli);
+        assert_eq!(
+            config.shared.network.interface.as_deref(),
+            Some("selected0")
+        );
+    }
+}

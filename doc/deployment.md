@@ -78,7 +78,7 @@ edit with `--check-config`.
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |
 | top level (router) | `static_peers` | `[]` | modem `addr:port` list for static mode |
 | top level | `peer_description` | binary name | Peer Type data item text |
-| `[network]` | `interface` | none | discovery interface override |
+| `[network]` | `interface` | none | IPv4 discovery interface name: membership, sending, and receive filtering |
 | `[network]` | `discovery_v4_group` | `224.0.0.117` | IPv4 discovery multicast group |
 | `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (reserved; discovery is IPv4-only today) |
 | `[network]` | `discovery_port` | `854` | UDP discovery port |
@@ -113,6 +113,24 @@ supported and configuration parsing rejects it.
 CLI flags override the file: `--interface`, `--no-tls`, `--cert`, `--key`,
 `--ca-bundle`, and (router) `--peer ADDR` (repeatable; implies static mode).
 
+For discovery on a particular link, set `interface = "eth1"` under `[network]`
+or pass `--interface eth1`. Keep the modem's `bind_addr = "0.0.0.0"` to listen on
+all TCP addresses, or supply an IPv4 address assigned to that interface. The
+address is also used as the preferred discovery source. Otherwise the lowest
+IPv4 address on the named interface is selected. Discovery traffic arriving on
+other interfaces is discarded before decoding; replies use the selected
+interface and source address. This uses ordinary IP socket options, without
+an additional capability requirement.
+
+An explicit name is checked against the current host by `--check-config` and at
+startup: the interface must exist, be up, and have usable IPv4 and multicast
+support (loopback is allowed). Socket setup errors for a named interface fail
+startup. With no name, a specific IPv4 `bind_addr` selects its interface;
+`0.0.0.0` leaves selection to the kernel routing table. `interface` controls
+discovery only, not TCP device binding. IPv6 discovery is a separate remaining
+feature.
+
+
 Validate without starting the daemon:
 
 ```bash
@@ -121,7 +139,8 @@ dlep-modem  --config /etc/dlep/modem.toml  --check-config
 ```
 
 `configuration OK` on stdout and exit code 0 mean the TOML parses, static
-mode has peers, modem metric values pass validation, and all TLS material loads.
+mode has peers, any explicit discovery interface is usable on this host, modem
+metric values pass validation, and all TLS material loads.
 
 ## 4. Port 854 privileges
 
@@ -192,5 +211,6 @@ trace|debug|info|warn|error` or the `DLEP_LOG` env var (add
 | TLS handshake fails with certificate errors | Modem cert SAN doesn't contain the IP the router dialed, or peers disagree about the CA. |
 | `M6 discovery only supports v4 bind_addr` | Discovery mode with an IPv6 `bind_addr` passes `--check-config` but fails at startup; use an IPv4 `bind_addr` or static mode. |
 | Session drops and never re-establishes | The router retries after `SessionDown`; inspect connection/TLS errors and verify the offered addresses remain reachable. |
+| `invalid discovery interface` / `has no usable IPv4 address` | Check the interface name, link state, IPv4 assignment, and that a specific `bind_addr` belongs to it. |
 | Discovery finds nothing | Peers more than one hop apart (GTSM), multicast blocked, or wrong `interface`. Try static mode (`--peer`) to isolate. |
 | `permission denied` binding port 854 | See §4. |

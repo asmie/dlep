@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Discovery interface name. Selects IPv4 membership, egress, and ingress.
     pub interface: Option<String>,
     pub discovery_v4_group: Ipv4Addr,
     pub discovery_v6_group: Ipv6Addr,
@@ -20,6 +21,31 @@ pub struct NetworkConfig {
     pub use_tls: bool,
     #[serde(default = "default_gtsm_enforce")]
     pub gtsm_enforce: bool,
+}
+
+impl NetworkConfig {
+    pub(crate) fn discovery_interface(&self) -> dlep_net::addr::InterfaceSpec {
+        self.interface
+            .as_ref()
+            .map_or(dlep_net::addr::InterfaceSpec::Any, |name| {
+                dlep_net::addr::InterfaceSpec::ByName(name.clone())
+            })
+    }
+
+    /// Validate an explicit interface without opening a privileged socket.
+    /// IPv6 discovery is not implemented yet.
+    pub fn validate_discovery_interface(&self) -> std::io::Result<()> {
+        if self.interface.is_some() {
+            let IpAddr::V4(preferred) = self.bind_addr else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "IPv4 discovery requires an IPv4 bind_addr",
+                ));
+            };
+            self.discovery_interface().resolve_v4(preferred)?;
+        }
+        Ok(())
+    }
 }
 
 fn default_bind_addr() -> IpAddr {

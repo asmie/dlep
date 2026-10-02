@@ -94,7 +94,8 @@ impl RouterDaemon {
             // unicast Peer_Offer; no need to join the discovery group.
             join_group: false,
         };
-        let socket = DiscoverySocket::bind(&params)?;
+        let socket =
+            DiscoverySocket::bind_on_interface(&params, &self.network.discovery_interface())?;
 
         let fsm = RouterDiscoveryFsm::with_config(RouterDiscoveryConfig {
             peer_description: self.peer_description.clone(),
@@ -368,6 +369,10 @@ impl RouterBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("RouterConfig required".into()))?;
+        cfg.shared
+            .network
+            .validate_discovery_interface()
+            .map_err(|e| DaemonError::Config(e.to_string()))?;
         let (events_tx, _events_rx) = new_event_channel();
         Ok(RouterDaemon {
             events_tx,

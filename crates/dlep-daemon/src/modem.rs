@@ -255,6 +255,10 @@ impl ModemBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
+        cfg.shared
+            .network
+            .validate_discovery_interface()
+            .map_err(|e| DaemonError::Config(e.to_string()))?;
         cfg.metrics.validate().map_err(DaemonError::Config)?;
         let initial_metrics = cfg.metrics.link_metrics();
         let extensions_for_accept = self.extensions.clone();
@@ -359,8 +363,12 @@ async fn spawn_modem_discovery(
         // Modem listens on the multicast group for Peer_Discovery.
         join_group: true,
     };
-    let socket = match DiscoverySocket::bind(&params) {
+    let socket = match DiscoverySocket::bind_on_interface(
+        &params,
+        &cfg.shared.network.discovery_interface(),
+    ) {
         Ok(s) => s,
+        Err(e) if cfg.shared.network.interface.is_some() => return Err(e.into()),
         Err(e) => {
             warn!(
                 "modem discovery socket bind failed ({e}); discovery disabled. \

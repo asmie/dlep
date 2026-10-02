@@ -9,6 +9,10 @@
 peer_description = "dlep-modem"
 
 [network]
+# Interface for IPv4 discovery sending, membership, and receive filtering.
+# Must be up with IPv4. Omit for bind_addr's interface or the default route.
+# A specific bind_addr must belong to this interface; 0.0.0.0 is allowed.
+# interface = "eth0"
 # Address the TCP listener binds to; 0.0.0.0 means all interfaces.
 bind_addr = "0.0.0.0"
 # DLEP well-known port is 854 (UDP for discovery, TCP for the session).

@@ -81,7 +81,7 @@ CLI flags shared by both binaries:
 | Flag           | Purpose                                                  |
 |----------------|----------------------------------------------------------|
 | `--config`     | Path to the TOML config file.                            |
-| `--interface`  | Override the network interface from config.              |
+| `--interface`  | Select the IPv4 discovery interface (overrides config).   |
 | `--log-level`  | Override `RUST_LOG`-style level (`info`, `debug`, …).    |
 | `--no-tls`     | Force plain TCP regardless of config.                    |
 
@@ -226,6 +226,22 @@ Discovery events carry a `PeerOffer` containing ordered connection points.
 Use `RouterDaemon::connect_discovered(&offer)` to try compatible endpoints;
 TLS-required configurations never fall back to plaintext. Discovery continues
 while sessions are active, allowing additional modems to be found.
+
+`[network].interface` / `--interface` selects IPv4 discovery group membership,
+multicast egress, unicast reply source, and accepted ingress interface. For
+example, `interface = "eth1"` with `bind_addr = "0.0.0.0"` discovers peers on
+eth1 while the modem's TCP listener still binds all addresses. A specific IPv4
+`bind_addr` must belong to the selected interface and serves as the preferred
+source address. With several addresses and no preference, the lowest IPv4
+address is selected. Without an interface name, a specific IPv4 `bind_addr`
+selects its interface; a wildcard lets the routing table choose.
+
+The interface must exist, be up, and have IPv4 plus multicast support (loopback
+is also supported for testing). `--check-config` and startup validate an explicit
+name against the current host. Failure to create discovery on a named interface
+fails startup instead of silently disabling discovery. The setting does not bind
+TCP connections to a device; IPv6 discovery remains unimplemented.
+
 
 `SessionUp`, `SessionDown`, `Destination`, and `Metrics` events carry a
 `session_id`; destination and metric events also carry `peer` and `event`
