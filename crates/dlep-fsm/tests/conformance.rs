@@ -319,3 +319,113 @@ fn declined_destination_can_be_announced_then_updated() {
     r.step(FsmEvent::RecvMessage(update));
     assert_eq!(r.destinations[&mac()].metrics.mtu, Some(1300));
 }
+
+#[test]
+fn destination_up_without_mac_terminates_with_invalid_data() {
+    let (mut r, _) = sessions();
+    let actions = r.step(FsmEvent::RecvMessage(Message::new(
+        MessageType::DESTINATION_UP,
+    )));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::Emit(EmittedEvent::DestinationUp { .. })))
+    );
+    let termination = sent(actions, MessageType::SESSION_TERMINATION);
+    assert!(termination.data_items.iter().any(|item| matches!(
+        item,
+        DataItem::Status {
+            code: StatusCode::INVALID_DATA,
+            ..
+        }
+    )));
+    assert_eq!(
+        r.state(),
+        dlep_fsm::session_router::RouterSessionState::Terminating
+    );
+}
+
+#[test]
+fn terminating_sessions_ignore_messages_without_restarting_the_deadline() {
+    let (mut r, mut m) = sessions();
+    r.step(FsmEvent::AppShutdown {
+        reason: StatusCode::SHUTTING_DOWN,
+    });
+    m.step(FsmEvent::AppShutdown {
+        reason: StatusCode::SHUTTING_DOWN,
+    });
+    // Includes malformed typed content, a fatal response, and simultaneous
+    // termination: section 7.4 only permits the expected response here.
+    let messages = [
+        Message::new(MessageType::HEARTBEAT),
+        Message::new(MessageType(65000)),
+        Message::new(MessageType::DESTINATION_UP),
+        Message::new(MessageType::SESSION_UPDATE_RESPONSE)
+            .with_item(status(StatusCode::INVALID_DATA)),
+        Message::new(MessageType::SESSION_TERMINATION).with_item(status(StatusCode::SHUTTING_DOWN)),
+    ];
+    for msg in messages {
+        assert!(r.step(FsmEvent::RecvMessage(msg.clone())).is_empty());
+        assert!(m.step(FsmEvent::RecvMessage(msg)).is_empty());
+    }
+    for actions in [
+        r.step(FsmEvent::RecvMessage(Message::new(
+            MessageType::SESSION_TERMINATION_RESPONSE,
+        ))),
+        m.step(FsmEvent::RecvMessage(Message::new(
+            MessageType::SESSION_TERMINATION_RESPONSE,
+        ))),
+    ] {
+        assert!(actions.iter().any(|a| matches!(a, FsmAction::CloseTcp)));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::SHUTTING_DOWN))
+                ))
+                .count(),
+            1
+        );
+    }
+    assert!(r.step(FsmEvent::TcpClosed).is_empty());
+    assert!(m.step(FsmEvent::TcpClosed).is_empty());
+}
+
+#[test]
+fn modem_termination_timeout_closes_once_and_reports_timeout() {
+    let (_, mut m) = sessions();
+    let actions = m.step(FsmEvent::AppShutdown {
+        reason: StatusCode::SHUTTING_DOWN,
+    });
+    let id = actions
+        .iter()
+        .find_map(|action| match action {
+            FsmAction::StartTimer {
+                id,
+                kind: dlep_fsm::TimerKind::Termination,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    let actions = m.step(FsmEvent::TimerExpired(id, dlep_fsm::TimerKind::Termination));
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            FsmAction::CloseTcp,
+            FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::TIMED_OUT))
+        ]
+    ));
+    assert_eq!(m.state(), ModemSessionState::Terminated);
+    assert!(
+        m.step(FsmEvent::TimerExpired(id, dlep_fsm::TimerKind::Termination))
+            .is_empty()
+    );
+    assert!(
+        m.step(FsmEvent::RecvMessage(Message::new(
+            MessageType::SESSION_TERMINATION_RESPONSE
+        )))
+        .is_empty()
+    );
+}

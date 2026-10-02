@@ -1,9 +1,7 @@
-//! M8 — Extension plug-in API loopback test.
+//! Extension plug-in integration tests over real daemon sessions.
 //!
-//! Round-trips a Private-Use `ExtensionId` through a `TestExt` on both
-//! sides: each side advertises the ID, observes the peer's advertisement,
-//! sends a Private-Use `MessageType` on `on_session_state(up=true)`, and
-//! emits a downcastable payload on the other side's `on_unknown_message`.
+//! Cover negotiation, private messages, unknown-item dispatch, destination
+//! lifecycle hooks, event ordering, and messages queued from callbacks.
 
 use std::any::Any;
 use std::net::{IpAddr, Ipv4Addr};
@@ -228,4 +226,376 @@ async fn private_use_extension_round_trips_session_init_and_unknown_message() {
 
     router.shutdown().await.expect("router shutdown");
     modem.shutdown().await.expect("modem shutdown");
+}
+
+#[derive(Clone, Debug)]
+enum HookObservation {
+    Item {
+        label: &'static str,
+        session_id: dlep_ext::SessionId,
+        router: bool,
+        message: MessageType,
+        item: dlep_core::RawDataItem,
+    },
+    Destination {
+        session_id: dlep_ext::SessionId,
+        router: bool,
+        mac: dlep_core::MacAddress,
+        state: dlep_ext::DestinationStateSnapshot,
+    },
+    Message,
+}
+
+struct HookExtension {
+    label: &'static str,
+    consume: bool,
+    probe: Option<dlep_core::RawDataItem>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl HookExtension {
+    fn new(label: &'static str, consume: bool, probe: Option<dlep_core::RawDataItem>) -> Arc<Self> {
+        Arc::new(Self {
+            label,
+            consume,
+            probe,
+            calls: Default::default(),
+        })
+    }
+}
+
+impl DlepExtension for HookExtension {
+    fn advertised_ids(&self) -> &[ExtensionId] {
+        &[TEST_EXT_ID]
+    }
+
+    fn on_session_state(&self, state: SessionStateSnapshot, ctx: &mut dyn ExtensionCtx) {
+        if state.up {
+            if let Some(item) = &self.probe {
+                ctx.send_message(
+                    Message::new(MessageType::HEARTBEAT).with_item(DataItem::Unknown(item.clone())),
+                );
+            }
+        }
+    }
+
+    fn on_unknown_data_item(
+        &self,
+        message: MessageType,
+        item: &dlep_core::RawDataItem,
+        ctx: &mut dyn ExtensionCtx,
+    ) -> ExtHandled {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ctx.emit_event(Arc::new(HookObservation::Item {
+            label: self.label,
+            session_id: ctx.session_id(),
+            router: ctx.is_router_side(),
+            message,
+            item: item.clone(),
+        }));
+        if self.consume {
+            ExtHandled::Handled
+        } else {
+            ExtHandled::Passthrough
+        }
+    }
+
+    fn on_destination_state(
+        &self,
+        mac: dlep_core::MacAddress,
+        state: dlep_ext::DestinationStateSnapshot,
+        ctx: &mut dyn ExtensionCtx,
+    ) {
+        ctx.emit_event(Arc::new(HookObservation::Destination {
+            session_id: ctx.session_id(),
+            router: ctx.is_router_side(),
+            mac,
+            state,
+        }));
+        // This also verifies that messages queued by a destination hook flush.
+        ctx.send_message(Message::new(TEST_MSG_TYPE));
+    }
+
+    fn on_unknown_message(
+        &self,
+        ty: MessageType,
+        _: &[DataItem],
+        ctx: &mut dyn ExtensionCtx,
+    ) -> ExtHandled {
+        if ty == TEST_MSG_TYPE {
+            ctx.emit_event(Arc::new(HookObservation::Message));
+            ExtHandled::Handled
+        } else {
+            ExtHandled::Passthrough
+        }
+    }
+}
+
+async fn next_hook(rx: &mut Receiver<DaemonEvent>) -> HookObservation {
+    timeout(STEP_TIMEOUT, async {
+        loop {
+            match rx.recv().await.expect("extension event channel") {
+                DaemonEvent::Extension(payload) => {
+                    return payload
+                        .downcast_ref::<HookObservation>()
+                        .expect("hook observation")
+                        .clone();
+                }
+                DaemonEvent::SessionDown { reason, .. } => {
+                    panic!("session ended before hook: {reason:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("hook deadline")
+}
+
+async fn session_identity(rx: &mut Receiver<DaemonEvent>) -> dlep_ext::SessionId {
+    timeout(STEP_TIMEOUT, async {
+        loop {
+            match rx.recv().await.unwrap() {
+                DaemonEvent::SessionUp { session_id, .. } => return session_id,
+                DaemonEvent::Extension(_) => panic!("hook event preceded SessionUp"),
+                DaemonEvent::SessionDown { .. } => panic!("session ended before SessionUp"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("session deadline")
+}
+
+#[tokio::test]
+async fn unknown_items_follow_registration_order_and_stop_at_first_consumer() {
+    use std::sync::atomic::Ordering;
+    // Exercise both receiving roles, including ExtensionCtx identity/direction.
+    for receiver_is_router in [true, false] {
+        let probe = dlep_core::RawDataItem {
+            type_id: dlep_core::DataItemType(0xf001),
+            value: b"opaque\x00\xff".as_slice().into(),
+        };
+        let sender = HookExtension::new("sender", true, Some(probe.clone()));
+        let observer = HookExtension::new("observer", false, None);
+        let consumer = HookExtension::new("consumer", true, None);
+        let later = HookExtension::new("later", true, None);
+        let mut mb = ModemDaemon::builder().config(loopback_modem_config());
+        let mut rb = RouterDaemon::builder().config(loopback_router_config());
+        if receiver_is_router {
+            mb = mb.register_extension(sender);
+            for ext in [&observer, &consumer, &later] {
+                rb = rb.register_extension(ext.clone());
+            }
+        } else {
+            rb = rb.register_extension(sender);
+            for ext in [&observer, &consumer, &later] {
+                mb = mb.register_extension(ext.clone());
+            }
+        }
+        let modem = mb.spawn().await.unwrap();
+        let router = rb.spawn().await.unwrap();
+        let mut me = modem.subscribe();
+        let mut re = router.subscribe();
+        router.connect_static(modem.local_addr()).await.unwrap();
+        let rid = session_identity(&mut re).await;
+        let mid = session_identity(&mut me).await;
+        let (events, id) = if receiver_is_router {
+            (&mut re, rid)
+        } else {
+            (&mut me, mid)
+        };
+        for expected in ["observer", "consumer"] {
+            match next_hook(events).await {
+                HookObservation::Item {
+                    label,
+                    session_id,
+                    router,
+                    message,
+                    item,
+                } => {
+                    assert_eq!(label, expected);
+                    assert_eq!(session_id, id);
+                    assert_eq!(router, receiver_is_router);
+                    assert_eq!(message, MessageType::HEARTBEAT);
+                    assert_eq!(item.type_id, probe.type_id);
+                    assert_eq!(item.value, probe.value);
+                }
+                event => panic!("unexpected hook: {event:?}"),
+            }
+        }
+        // Graceful shutdown proves the handled item did not terminate the FSM.
+        router.shutdown().await.unwrap();
+        modem.shutdown().await.unwrap();
+        assert_eq!(observer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(consumer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(later.calls.load(Ordering::SeqCst), 0);
+        for events in [&mut re, &mut me] {
+            assert_eq!(
+                session_down_reason(events).await,
+                dlep_core::StatusCode::SHUTTING_DOWN
+            );
+        }
+    }
+}
+
+async fn session_down_reason(rx: &mut Receiver<DaemonEvent>) -> dlep_core::StatusCode {
+    timeout(STEP_TIMEOUT, async {
+        loop {
+            if let DaemonEvent::SessionDown { reason, .. } = rx.recv().await.unwrap() {
+                return reason;
+            }
+        }
+    })
+    .await
+    .expect("SessionDown deadline")
+}
+
+#[tokio::test]
+async fn unhandled_items_and_reserved_flags_terminate_with_invalid_data() {
+    for reserved_flags in [false, true] {
+        let probe = if reserved_flags {
+            // Use a raw item to deliberately bypass typed encoding validation.
+            dlep_core::RawDataItem {
+                type_id: dlep_core::DataItemType::IPV4_ADDRESS,
+                value: bytes::Bytes::from_static(&[2, 192, 0, 2, 1]),
+            }
+        } else {
+            dlep_core::RawDataItem {
+                type_id: dlep_core::DataItemType(0xf001),
+                value: bytes::Bytes::from_static(b"unclaimed"),
+            }
+        };
+        let modem = ModemDaemon::builder()
+            .config(loopback_modem_config())
+            .register_extension(HookExtension::new("sender", true, Some(probe)))
+            .spawn()
+            .await
+            .unwrap();
+        let observer = HookExtension::new("observer", false, None);
+        let router = RouterDaemon::builder()
+            .config(loopback_router_config())
+            .register_extension(observer.clone())
+            .spawn()
+            .await
+            .unwrap();
+        let mut me = modem.subscribe();
+        let mut re = router.subscribe();
+        router.connect_static(modem.local_addr()).await.unwrap();
+        session_identity(&mut re).await;
+        session_identity(&mut me).await;
+        assert_eq!(
+            session_down_reason(&mut re).await,
+            dlep_core::StatusCode::INVALID_DATA
+        );
+        assert_eq!(
+            session_down_reason(&mut me).await,
+            dlep_core::StatusCode::INVALID_DATA
+        );
+        assert_eq!(
+            observer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(!reserved_flags)
+        );
+        router.shutdown().await.unwrap();
+        modem.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn destination_hooks_preserve_context_metrics_and_public_event_order() {
+    use dlep_core::{LinkMetrics, MacAddress, StatusCode};
+    use dlep_daemon::{DestinationEvent, DestinationId};
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .register_extension(HookExtension::new("modem", true, None))
+        .spawn()
+        .await
+        .unwrap();
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .register_extension(HookExtension::new("router", true, None))
+        .spawn()
+        .await
+        .unwrap();
+    let mut me = modem.subscribe();
+    let mut re = router.subscribe();
+    router.connect_static(modem.local_addr()).await.unwrap();
+    let rid = session_identity(&mut re).await;
+    session_identity(&mut me).await;
+    let mac = MacAddress::new_eui48([2, 0, 0, 0, 0, 9]);
+    let metrics = LinkMetrics {
+        current_data_rate_rx_bps: 12345,
+        latency: Duration::from_micros(678),
+        ..Default::default()
+    };
+    modem
+        .add_destination(DestinationId(mac), metrics)
+        .await
+        .unwrap();
+    for up in [true, false] {
+        let event = timeout(STEP_TIMEOUT, async {
+            loop {
+                let event = re.recv().await.unwrap();
+                // Initialization also publishes the session's default metrics.
+                if !matches!(event, DaemonEvent::Metrics { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        match event {
+            DaemonEvent::Destination {
+                session_id,
+                event:
+                    DestinationEvent::Up {
+                        id,
+                        metrics: actual,
+                        ..
+                    },
+                ..
+            } if up => {
+                assert_eq!(session_id, rid);
+                assert_eq!(id.0, mac);
+                assert_eq!(actual, metrics);
+            }
+            DaemonEvent::Destination {
+                session_id,
+                event: DestinationEvent::Down { id, reason },
+                ..
+            } if !up => {
+                assert_eq!(session_id, rid);
+                assert_eq!(id.0, mac);
+                assert_eq!(reason, StatusCode::SUCCESS);
+            }
+            other => panic!("public destination event must precede hook: {other:?}"),
+        }
+        match next_hook(&mut re).await {
+            HookObservation::Destination {
+                session_id,
+                router,
+                mac: actual,
+                state,
+            } => {
+                assert_eq!(session_id, rid);
+                assert!(router);
+                assert_eq!(actual, mac);
+                assert_eq!(state.up, up);
+                assert_eq!(state.last_status, StatusCode::SUCCESS);
+                assert_eq!(state.metrics, up.then_some(metrics));
+            }
+            other => panic!("unexpected hook: {other:?}"),
+        }
+        // The hook's queued message is received after the Up acknowledgement,
+        // providing a deterministic barrier before starting Destination Down.
+        assert!(matches!(next_hook(&mut me).await, HookObservation::Message));
+        if up {
+            modem
+                .drop_destination(DestinationId(mac), StatusCode::SUCCESS)
+                .await
+                .unwrap();
+        }
+    }
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
 }

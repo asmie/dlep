@@ -207,4 +207,49 @@ mod tests {
             2
         );
     }
+    struct SelectiveExtension {
+        ids: Vec<ExtensionId>,
+        accept: bool,
+    }
+    impl DlepExtension for SelectiveExtension {
+        fn advertised_ids(&self) -> &[ExtensionId] {
+            &self.ids
+        }
+        fn on_negotiated(&self, _: &[ExtensionId]) -> bool {
+            assert!(!self.ids.is_empty(), "unadvertised plugins must stay inert");
+            self.accept
+        }
+    }
+
+    #[test]
+    fn advertisement_is_sorted_unique_and_negotiation_preserves_plugin_order() {
+        let mut registry = ExtensionRegistry::new();
+        for ids in [vec![65002, 65000, 65002], vec![65001], vec![65000]] {
+            registry.register(Arc::new(SelectiveExtension {
+                ids: ids.into_iter().map(ExtensionId).collect(),
+                accept: true,
+            }));
+        }
+        let advertised = vec![ExtensionId(65000), ExtensionId(65001), ExtensionId(65002)];
+        assert_eq!(registry.advertised(), advertised);
+        let negotiated = registry.negotiate(&advertised);
+        assert_eq!(negotiated.len(), 3);
+        for (actual, registered) in negotiated.iter().zip(registry.iter()) {
+            assert!(Arc::ptr_eq(actual, registered));
+        }
+    }
+
+    #[test]
+    fn plugins_can_opt_out_and_plugins_without_ids_never_negotiate() {
+        let mut registry = ExtensionRegistry::new();
+        registry.register(Arc::new(SelectiveExtension {
+            ids: vec![],
+            accept: true,
+        }));
+        registry.register(Arc::new(SelectiveExtension {
+            ids: vec![ExtensionId(65000)],
+            accept: false,
+        }));
+        assert!(registry.negotiate(&[ExtensionId(65000)]).is_empty());
+    }
 }

@@ -613,6 +613,23 @@ The order of work was:
     Test-only certificate fixtures have distinct issuer names and fixed expired
     validity dates. No production transport changes were needed.
 
+27. Codec, FSM, and extension boundary coverage. **Done** — independent wire
+    fixtures cover invalid lengths for all twenty core data items, every flag
+    octet for all flagged item forms, UTF-8 octet lengths and invalid sequences,
+    numeric limits, truncated nested TLVs, and trailing signal bytes. These
+    tests exposed two decoder defects: reserved flag bits were ignored, and
+    the public signal decoder accepted extra bytes after the declared body.
+    Both now return codec errors; a daemon regression verifies reserved flags
+    produce Session Termination and SessionDown with Invalid Data.
+
+    FSM tests cover Destination Up without a MAC, ignored traffic while
+    terminating, and one-time timeout cleanup. Registry tests check sorted,
+    unique advertisements, callback order, empty declarations, and plugin
+    opt-out. Real sessions exercise unknown-item passthrough and consumption
+    in both roles, first-consumer dispatch, context identity, and destination
+    Up/Down hooks with metrics and status snapshots. They also verify public
+    events precede hook events and hook-queued messages reach the peer.
+
 ---
 
 ## 10. Open questions / risks

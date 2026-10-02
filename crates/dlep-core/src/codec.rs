@@ -34,6 +34,7 @@ pub const MESSAGE_HEADER_LEN: usize = 4;
 /// one place so a rename touches one site, not ten, and a typo at a call site
 /// becomes a compile error rather than a silent diagnostic regression.
 mod field {
+    pub const DATA_ITEM_FLAGS: &str = "data_item_flags";
     pub const HEARTBEAT_INTERVAL_MS: &str = "heartbeat_interval_ms";
     pub const LATENCY_US: &str = "latency_us";
     pub const RESOURCES: &str = "resources";
@@ -279,6 +280,7 @@ impl DataItem {
                         got: len,
                     });
                 }
+                validate_flags(v[0])?;
                 let flags = decode_cp_flags(v[0]);
                 let addr = Ipv4Addr::new(v[1], v[2], v[3], v[4]);
                 let port = (len == 7).then(|| u16::from_be_bytes([v[5], v[6]]));
@@ -292,6 +294,7 @@ impl DataItem {
                         got: len,
                     });
                 }
+                validate_flags(v[0])?;
                 let flags = decode_cp_flags(v[0]);
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&v[1..17]);
@@ -307,6 +310,7 @@ impl DataItem {
                         got: len,
                     });
                 }
+                validate_flags(v[0])?;
                 let flags = decode_peer_flags(v[0]);
                 let description = String::from_utf8(v[1..].to_vec())?;
                 Ok(DataItem::PeerType { flags, description })
@@ -368,12 +372,14 @@ impl DataItem {
             }
             DataItemType::IPV4_ADDRESS => {
                 expect_exact(kind, len, 5)?;
+                validate_flags(v[0])?;
                 let add = (v[0] & 0x01) != 0;
                 let addr = Ipv4Addr::new(v[1], v[2], v[3], v[4]);
                 Ok(DataItem::Ipv4Address { add, addr })
             }
             DataItemType::IPV6_ADDRESS => {
                 expect_exact(kind, len, 17)?;
+                validate_flags(v[0])?;
                 let add = (v[0] & 0x01) != 0;
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&v[1..17]);
@@ -384,6 +390,7 @@ impl DataItem {
             }
             DataItemType::IPV4_ATTACHED_SUBNET => {
                 expect_exact(kind, len, 6)?;
+                validate_flags(v[0])?;
                 let add = (v[0] & 0x01) != 0;
                 let addr = Ipv4Addr::new(v[1], v[2], v[3], v[4]);
                 let prefix = v[5];
@@ -401,6 +408,7 @@ impl DataItem {
             }
             DataItemType::IPV6_ATTACHED_SUBNET => {
                 expect_exact(kind, len, 18)?;
+                validate_flags(v[0])?;
                 let add = (v[0] & 0x01) != 0;
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&v[1..17]);
@@ -484,7 +492,7 @@ impl Signal {
         }
         let signal_type = SignalType(src.get_u16());
         let declared = src.get_u16() as usize;
-        if src.remaining() < declared {
+        if src.remaining() != declared {
             return Err(CodecError::LengthMismatch {
                 declared,
                 remaining: src.remaining(),
@@ -575,6 +583,16 @@ fn read_u64_be(value: &[u8]) -> u64 {
 // octet, mask `0x01`. The leftmost seven bits are Reserved (MUST be zero).
 // Encoding the named flag at any other position would set a Reserved bit and
 // place the flag where peers expect zero.
+
+fn validate_flags(byte: u8) -> Result<(), CodecError> {
+    if byte & 0xfe != 0 {
+        return Err(CodecError::OutOfRange {
+            field: field::DATA_ITEM_FLAGS,
+            value: byte.into(),
+        });
+    }
+    Ok(())
+}
 
 fn encode_cp_flags(flags: ConnectionPointFlags) -> u8 {
     u8::from(flags.use_tls)
