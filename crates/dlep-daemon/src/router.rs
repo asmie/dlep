@@ -199,6 +199,24 @@ impl RouterDaemon {
             .await
     }
 
+    /// Withdraw interest in a destination on one modem session (§12.15).
+    /// Completion emits DestinationEvent::Down with the response status as
+    /// its reason. The MAC stays known until the matching response arrives;
+    /// peer failure is detected by session heartbeats, not a request timeout.
+    /// As with other commands, busy/unknown destinations and stale session IDs
+    /// are not queued. Use a SessionUp/Destination event's session ID.
+    pub async fn drop_destination(
+        &self,
+        session_id: dlep_ext::SessionId,
+        id: DestinationId,
+    ) -> Result<(), DaemonError> {
+        self.fanout(SessionCommand::DropDestinationForSession {
+            session_id,
+            mac: id.0,
+        })
+        .await
+    }
+
     /// Request rate/latency changes from one modem (RFC 8175 §12.18).
     /// Use the session ID from SessionUp/Destination events. Completion is
     /// delivered as DestinationEvent::LinkCharacteristicsResponse; a missing

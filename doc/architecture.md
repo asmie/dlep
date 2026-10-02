@@ -370,9 +370,27 @@ The order of work was:
     missing/undeclared metrics, serialization, independent destination timers,
     timeout despite heartbeats, and targeting modems sharing a MAC.
 
+12. **Router-originated Destination Down (RFC 8175 §12.15–12.16).**
+    `RouterDaemon::drop_destination(session_id, destination)` withdraws interest
+    from a single modem. The router keeps the destination through the pending
+    exchange to accept updates already in transit, then removes it and emits
+    Down when the matching response arrives. The modem sends Success, stops
+    reporting the destination on that session, and emits its own Down event.
+    It retains physical-link knowledge so a later Announce can restore reports
+    with current metrics and addresses. No independent Down transaction timeout
+    is used; peer failure is detected through the session heartbeat. Tests cover
+    both Up- and Announce-originated destinations, resubscription, in-flight
+    updates, conflicting transactions, invalid input, and session isolation.
+
 ---
 
 ## 10. Open questions / risks
+
+- **Link Characteristics timeout correction pending.** The configurable request
+  deadline introduced in item 11 conflicts with RFC 8175 §8, which says DLEP
+  transactions do not time out independently. Remove that deadline in a separate
+  correction; use the session heartbeat mechanism for peer failure. The new
+  router-originated Down exchange follows §8 without a transaction deadline.
 
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.

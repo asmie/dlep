@@ -407,6 +407,10 @@ pub async fn run_session<F: SessionFsm>(
                     Some(SessionCommand::DropDestination { mac, reason }) => {
                         FsmEvent::AppDropDestination { mac, reason }
                     }
+                    Some(SessionCommand::DropDestinationForSession { session_id: target, mac }) => {
+                        if target != session_id { continue; }
+                        FsmEvent::AppDropDestination { mac, reason: StatusCode::SUCCESS }
+                    }
                     Some(SessionCommand::SessionUpdate { metrics }) => {
                         FsmEvent::AppSessionUpdate { metrics }
                     }

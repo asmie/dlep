@@ -347,6 +347,43 @@ impl RouterSessionFsm {
                 }
                 actions
             }
+            // Router-originated Down withdraws interest on this session.
+            // Keep the entry until the response so updates already in transit
+            // can still be processed. Section 8 permits no transaction timeout.
+            (RouterSessionState::InSession, FsmEvent::AppDropDestination { mac, .. }) => {
+                if !self.destinations.get(&mac).is_some_and(|d| d.up) {
+                    tracing::debug!(?mac, "drop_destination for unknown destination; ignoring");
+                    return Vec::new();
+                }
+                if self
+                    .tx
+                    .open_destination(mac, crate::transaction::RequestKind::DestinationDown)
+                    .is_err()
+                {
+                    tracing::debug!(?mac, "drop_destination while another tx pending; ignoring");
+                    return Vec::new();
+                }
+                vec![FsmAction::SendMessage(
+                    crate::session_common::build_destination_down(mac, StatusCode::SUCCESS),
+                )]
+            }
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_DOWN_RESPONSE =>
+            {
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let reason = extract_status(&msg).expect("validated status");
+                self.tx.close_destination(&mac);
+                self.destinations.remove(&mac);
+                let mut actions = vec![FsmAction::Emit(EmittedEvent::DestinationDown {
+                    mac,
+                    reason,
+                })];
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
+            }
             // Session_Update: RFC 8175 §12.7 — session-wide metric / L3
             // address change from the peer. §12.8 makes the response
             // MANDATORY ("MUST be sent ... when a Session Update Message is

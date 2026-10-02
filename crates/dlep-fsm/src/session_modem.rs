@@ -359,6 +359,35 @@ impl ModemSessionFsm {
                 }
                 vec![FsmAction::SendMessage(build_destination_down(mac, reason))]
             }
+            // A router withdraws interest, not physical reachability. Keep
+            // local knowledge for a later Announce, but stop reporting this
+            // destination on this session (§12.13, §12.15–12.16).
+            (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::DESTINATION_DOWN =>
+            {
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let destination = self
+                    .destinations
+                    .get_mut(&mac)
+                    .expect("validated destination");
+                destination.announced = false;
+                destination.pending_metrics = false;
+                let mut actions = vec![
+                    FsmAction::SendMessage(crate::session_common::build_destination_down_response(
+                        mac,
+                        StatusCode::SUCCESS,
+                    )),
+                    FsmAction::Emit(EmittedEvent::DestinationDown {
+                        mac,
+                        reason: StatusCode::SUCCESS,
+                    }),
+                ];
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
+            }
             // InSession: router replied to our Destination_Down. Close the
             // per-destination transaction, remove the local entry, and reset
             // the missed-heartbeat deadline (RFC §11.2).

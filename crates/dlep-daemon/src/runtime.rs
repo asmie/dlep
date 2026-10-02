@@ -31,6 +31,11 @@ pub enum SessionCommand {
     },
     /// Modem-side: drop a destination at the peer router.
     DropDestination { mac: MacAddress, reason: StatusCode },
+    /// Router-side: withdraw interest in a destination on one session only.
+    DropDestinationForSession {
+        session_id: dlep_ext::SessionId,
+        mac: MacAddress,
+    },
     /// Modem side: push session-wide metric changes via a Session Update
     /// Message (RFC 8175 §12.7).
     SessionUpdate { metrics: LinkMetrics },
