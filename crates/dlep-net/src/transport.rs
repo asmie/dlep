@@ -237,6 +237,11 @@ pub struct PendingTransport {
 }
 
 impl PendingTransport {
+    /// TCP peer identity, available before a potentially slow TLS handshake.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
+
     pub async fn handshake(self) -> io::Result<Box<dyn Transport>> {
         let inner: Box<dyn Transport> = match self.kind {
             AcceptorKind::Plain => Box::new(self.stream),

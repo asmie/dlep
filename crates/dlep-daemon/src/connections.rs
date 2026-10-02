@@ -1,4 +1,4 @@
-//! Retained router connection state, independent of the lossy event broadcast.
+//! Connection lifetime tracking, independent of the lossy event broadcast.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -48,9 +48,113 @@ impl Drop for ConnectionTracker {
     }
 }
 
+type RouterAddress = (std::net::IpAddr, u32);
+type RouterCounts = std::sync::Arc<std::sync::Mutex<HashMap<RouterAddress, usize>>>;
+
+/// Modem-side TCP peers. Unlike reconnect history, entries disappear when the
+/// last connection closes. UDP and TCP source ports differ, so match addresses
+/// only, retaining the interface scope for IPv6 link-local addresses.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectedRouters {
+    peers: RouterCounts,
+}
+
+fn router_address(peer: SocketAddr) -> RouterAddress {
+    match peer {
+        SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                (v4.into(), 0)
+            } else {
+                (
+                    (*v6.ip()).into(),
+                    if v6.ip().is_unicast_link_local() {
+                        v6.scope_id()
+                    } else {
+                        0
+                    },
+                )
+            }
+        }
+        SocketAddr::V4(v4) => ((*v4.ip()).into(), 0),
+    }
+}
+
+impl ConnectedRouters {
+    pub(crate) fn contains(&self, peer: SocketAddr) -> bool {
+        self.peers
+            .lock()
+            .unwrap()
+            .contains_key(&router_address(peer))
+    }
+
+    pub(crate) fn register(&self, peer: SocketAddr) -> RouterConnection {
+        let address = router_address(peer);
+        *self.peers.lock().unwrap().entry(address).or_default() += 1;
+        RouterConnection {
+            routers: self.clone(),
+            address,
+        }
+    }
+}
+
+/// Held from TCP accept through TLS, initialization, and session teardown.
+/// Cancellation and error exits release registration without relying on events.
+pub(crate) struct RouterConnection {
+    routers: ConnectedRouters,
+    address: RouterAddress,
+}
+
+impl Drop for RouterConnection {
+    fn drop(&mut self) {
+        let mut peers = self.routers.peers.lock().unwrap();
+        let count = peers.get_mut(&self.address).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            peers.remove(&self.address);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_identity_ignores_ports_and_ipv6_flow_but_preserves_link_scope() {
+        let peers = ConnectedRouters::default();
+        let v4 = peers.register("127.0.0.1:1234".parse().unwrap());
+        assert!(peers.contains("127.0.0.1:5678".parse().unwrap()));
+        assert!(peers.contains("[::ffff:127.0.0.1]:5678".parse().unwrap()));
+        assert!(!peers.contains("127.0.0.2:5678".parse().unwrap()));
+        let link = peers.register("[fe80::1%3]:1234".parse().unwrap());
+        assert!(
+            peers.contains(
+                std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 5678, 42, 3).into()
+            )
+        );
+        assert!(!peers.contains("[fe80::1%4]:5678".parse().unwrap()));
+        let duplicate = peers.register("[fe80::1%3]:4321".parse().unwrap());
+        drop(link);
+        assert!(peers.contains("[fe80::1%3]:5678".parse().unwrap()));
+        drop(duplicate);
+        drop(v4);
+        assert!(peers.peers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unpolled_handshake_releases_discovery_suppression() {
+        let peers = ConnectedRouters::default();
+        let peer = "127.0.0.1:1234".parse().unwrap();
+        let guard = peers.register(peer);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!peers.contains(peer));
+        assert!(peers.peers.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn closing_one_session_does_not_hide_another_at_the_same_endpoint() {

@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::{ModemConfig, TimersConfig};
+use crate::connections::ConnectedRouters;
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
@@ -297,17 +298,24 @@ impl ModemBuilder {
             Arc::new(Mutex::new(Vec::new()));
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let session_id_counter = new_session_id_counter();
+        let connected_routers = ConnectedRouters::default();
 
         // Discovery: bind the UDP multicast socket and spawn the listener.
         // The modem starts in Listening; it has no app-driven start event
         // (router-side is the active probe). The bind is best-effort — if it
         // fails (privileged port, no MULTICAST flag on the interface, etc.)
         // we log and continue so the rest of the daemon stays usable.
-        let (discovery_shutdown, discovery_task) =
-            match spawn_modem_discovery(&cfg, local_addr, events_tx.clone()).await? {
-                Some((tx, handle)) => (Some(tx), Some(handle)),
-                None => (None, None),
-            };
+        let (discovery_shutdown, discovery_task) = match spawn_modem_discovery(
+            &cfg,
+            local_addr,
+            events_tx.clone(),
+            connected_routers.clone(),
+        )
+        .await?
+        {
+            Some((tx, handle)) => (Some(tx), Some(handle)),
+            None => (None, None),
+        };
 
         let (stopping, stop_rx) = watch::channel(false);
         let listen_task = tokio::spawn(modem_accept_loop(
@@ -321,6 +329,7 @@ impl ModemBuilder {
             extensions_for_accept,
             session_id_counter.clone(),
             stop_rx,
+            connected_routers,
         ));
 
         Ok(ModemDaemon {
@@ -343,6 +352,7 @@ async fn spawn_modem_discovery(
     cfg: &ModemConfig,
     local_addr: SocketAddr,
     events_tx: EventTx,
+    connected_routers: ConnectedRouters,
 ) -> Result<Option<(mpsc::Sender<()>, JoinHandle<Result<(), DaemonError>>)>, DaemonError> {
     use dlep_fsm::discovery_modem::ModemDiscoveryFsm;
 
@@ -367,7 +377,15 @@ async fn spawn_modem_discovery(
 
     let (tx, rx) = mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {
-        crate::discovery::run_discovery(fsm, socket, None, rx, events_tx).await
+        crate::discovery::run_discovery_with_peers(
+            fsm,
+            socket,
+            None,
+            rx,
+            events_tx,
+            Some(connected_routers),
+        )
+        .await
     });
     Ok(Some((tx, handle)))
 }
@@ -384,6 +402,7 @@ async fn modem_accept_loop(
     extensions: ExtensionRegistry,
     session_id_counter: SessionIdCounter,
     stopping: watch::Receiver<bool>,
+    connected_routers: ConnectedRouters,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
@@ -398,6 +417,11 @@ async fn modem_accept_loop(
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue;
         };
+        let peer_addr = match pending.peer_addr() {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        let connection = connected_routers.register(peer_addr);
         let events_tx = events_tx.clone();
         let extensions = extensions.clone();
         let timers = timers.clone();
@@ -408,6 +432,7 @@ async fn modem_accept_loop(
         let mut running = tasks.lock().await;
         let handle = tokio::spawn(async move {
             let _permit = permit;
+            let _connection = connection;
             if *stopping.borrow() {
                 return;
             }

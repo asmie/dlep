@@ -229,7 +229,10 @@ For direct `run_session` users, command channels now carry `SessionRequest`;
 Discovery events carry a `PeerOffer` containing ordered connection points.
 Use `RouterDaemon::connect_discovered(&offer)` to try compatible endpoints;
 TLS-required configurations never fall back to plaintext. Discovery continues
-while sessions are active, allowing additional modems to be found.
+while sessions are active, allowing additional modems to be found. A modem
+silently ignores discovery from a router address with an accepted TCP
+connection, including during TLS and DLEP initialization. Offers resume after
+the last connection from that address closes.
 
 The router binary retries dropped sessions with exponential backoff (1 second,
 doubling to a 30-second cap). TCP connection success preserves that retry

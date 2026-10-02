@@ -131,7 +131,7 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 |---|---|
 | `config.rs` | `RouterConfig`, `ModemConfig`, plus shared `NetworkConfig`, `TlsConfig`, `TimersConfig`. All `serde::Deserialize` for TOML. |
 | `events.rs` | Public `DaemonEvent` enum (`PeerDiscovered`, `SessionUp`, `SessionDown`, `Destination`, `Metrics`, `Extension`), plus `DestinationId`, `LinkMetrics`, `PeerInfo`. `SessionUp`, `SessionDown`, `Destination`, and `Metrics` carry both `PeerInfo` and a `SessionId` so a multi-session embedder can attribute events across reconnects. `DaemonEvent: Clone` (required by `tokio::sync::broadcast`); `Debug` is hand-written because `Arc<dyn Any + Send + Sync>` does not derive `Debug`. |
-| `connections.rs` | Retained router endpoint state via `watch`: active task counts and cumulative successful initializations, updated directly by session guards. Reconnect decisions do not depend on the public event bus. |
+| `connections.rs` | Retained router endpoint state via `watch`: active task counts and cumulative successful initializations, updated directly by session guards. Reconnect decisions do not depend on the public event bus. Modem discovery uses a separate reference-counted TCP peer registry with entries removed on last close. |
 | `runtime.rs` | Channel plumbing: `EventTx = broadcast::Sender<DaemonEvent>` for the public event bus, `mpsc` for internal commands. `DaemonError` lives here too. |
 | `discovery.rs` | `run_discovery` background task: owns a `DiscoverySocket` + a discovery FSM (router or modem), bridges socket I/O to FSM events, applies GTSM filtering on inbound packets, drives periodic Peer_Discovery resends via `DiscoveryTimers`, and translates `EmittedEvent::PeerDiscovered` into `DaemonEvent::PeerDiscovered`. |
 | `session.rs` | The `SessionFsm` trait that the runtime drives, with blanket impls for the router and modem session FSMs. |
@@ -552,6 +552,21 @@ The order of work was:
     while checking reconnect delays and reset, recover a startup disconnect with
     no lifecycle events, and verify cancellation, multiple sessions at one
     endpoint, and independent peer retries.
+
+23. Suppress discovery from connected routers. **Done** — per RFC 8175 §7.1,
+    the modem silently ignores Peer Discovery from an address with an accepted
+    TCP connection. Registration precedes TLS and remains through initialization
+    and session teardown. A task-owned guard releases it on every exit,
+    including failed handshakes and cancellation before the first task poll.
+    Entries are reference-counted and removed on the last close, so reconnects
+    do not accumulate history in this registry. Discovery reads it directly,
+    independently of the lossy application event stream.
+
+    Identity ignores transport ports and IPv6 flow labels, normalizes mapped
+    IPv4 addresses, and preserves IPv6 link-local scope. Tests cover IPv4 and
+    scoped IPv6, other router addresses, changed UDP ports, concurrent TCP
+    connections, stalled/failed TLS, DLEP initialization timeout, established
+    sessions, clean shutdown, cancellation, and discovery resuming after close.
 
 ---
 

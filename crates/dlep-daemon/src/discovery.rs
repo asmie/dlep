@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use crate::connections::ConnectedRouters;
 use crate::events::{DaemonEvent, PeerOffer};
 use crate::runtime::{DaemonError, EventTx};
 
@@ -85,11 +86,22 @@ impl Drop for DiscoveryTimers {
 /// (`Some(FsmEvent::AppStartDiscovery)`) or leave the modem-side FSM in its
 /// default Listening state (`None`).
 pub async fn run_discovery<F: DiscoveryFsm>(
+    fsm: F,
+    socket: DiscoverySocket,
+    initial_event: Option<FsmEvent>,
+    shutdown_rx: mpsc::Receiver<()>,
+    events_tx: EventTx,
+) -> Result<(), DaemonError> {
+    run_discovery_with_peers(fsm, socket, initial_event, shutdown_rx, events_tx, None).await
+}
+
+pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
     mut fsm: F,
     socket: DiscoverySocket,
     initial_event: Option<FsmEvent>,
     mut shutdown_rx: mpsc::Receiver<()>,
     events_tx: EventTx,
+    connected_routers: Option<ConnectedRouters>,
 ) -> Result<(), DaemonError> {
     let mut timers = DiscoveryTimers::default();
     // Capacity 8 is comfortably above the expected steady-state queue
@@ -113,6 +125,13 @@ pub async fn run_discovery<F: DiscoveryFsm>(
             } => {
                 match res {
                     Ok((signal, from, _ttl, local)) => {
+                        // RFC 8175 §7.1: an existing TCP connection suppresses
+                        // discovery even before TLS/DLEP initialization finishes.
+                        if signal.signal_type == dlep_core::SignalType::PEER_DISCOVERY
+                            && connected_routers.as_ref().is_some_and(|peers| peers.contains(from)) {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
                         let actions = fsm.step(FsmEvent::RecvSignal { signal, from });
                         process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local)).await?;
                     }

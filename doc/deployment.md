@@ -245,6 +245,12 @@ state, so event-stream lag does not strand a disconnected peer or lose a
 successful initialization's backoff reset. Other application events can still
 be lost when a broadcast subscriber falls behind.
 
+A modem stops answering discovery from a router's source IP while it has an
+accepted TCP connection from that address, including during TLS handshakes and
+DLEP initialization. UDP and TCP source ports do not need to match. IPv6
+link-local addresses are matched within their interface scope. Other router
+addresses remain eligible; the last connection closing restores replies.
+
 ## 7. Troubleshooting
 
 | Symptom | Cause / fix |
