@@ -25,10 +25,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: actionlint@1.7.12
-      - run: actionlint
+      # actionlint is a Go binary, unsupported by install-action's Rust fallback.
+      - name: Install actionlint from its verified upstream release
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --location --silent --show-error --retry 3 \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+      - run: '"$RUNNER_TEMP/actionlint"'
+      # The audit is path-filtered; catch an omitted policy on every CI run.
+      - name: Verify audit policy is included in the checkout
+        run: git ls-files --error-unmatch .cargo/audit.toml
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -101,6 +113,10 @@ jobs:
           sudo env "PATH=$PATH" "RUSTUP_HOME=$HOME/.rustup" "CARGO_HOME=$HOME/.cargo" \
             bash .github/scripts/test-network.sh \
             bash .github/scripts/coverage.sh
+      # llvm-cov creates private HTML directories as root. The upload action
+      # runs as the runner user and must be able to traverse those directories.
+      - name: Return coverage reports to the runner user
+        run: sudo chown -R "$(id -u):$(id -g)" target/coverage
       - uses: actions/upload-artifact@v4
         with:
           name: linux-workspace-coverage

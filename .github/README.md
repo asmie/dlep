@@ -6,6 +6,12 @@ of the portable crates, and instrumented Linux tests. Cargo commands use the
 committed lockfile. Jobs have read-only repository permissions and deadlines;
 new pushes cancel obsolete runs for the same branch or pull request.
 
+The formatting job installs actionlint 1.7.12 from the official Linux x86-64
+release with a pinned SHA-256 checksum; `taiki-e/install-action` does not support
+this Go tool. Update the version and checksum together. The job also checks
+that `.cargo/audit.toml` is tracked, even on pushes that do not trigger the
+path-filtered dependency audit.
+
 The macOS job covers `dlep-core`, `dlep-fsm`, and `dlep-ext`. It does **not**
 validate the daemons or advertise macOS transport support. Discovery ancillary
 socket handling and strict TCP GTSM reset monitoring currently require Linux.
@@ -37,7 +43,9 @@ unshare --user --map-root-user bash .github/scripts/test-network.sh \
 
 The coverage script cleans old instrumented workspace artifacts before testing.
 Collection and reporting run with the same privileges so CI does not encounter
-root-owned profile write failures. Successful runs upload
+root-owned profile write failures. Before upload, CI returns ownership of
+`target/coverage/` to the runner user: LLVM's HTML directories can otherwise be
+unreadable to the unprivileged upload action. Successful runs upload
 `linux-workspace-coverage`, retained for 14 days, containing LCOV, HTML, and a
 JSON summary. There is no coverage-percentage gate yet; reports provide a
 baseline for the final coverage review. Reports are under `target/coverage/`,
@@ -64,6 +72,10 @@ enabled. CI checks that the resolved version stays 0.3.45, only `alloc`/`std`
 features are active, and the only consumers remain `rcgen`/`yasna`. Any change
 fails the guard and requires reviewing or removing the exception. The normal
 daemon build does not use the certificate generation helpers.
+
+The guard rejects a missing/malformed policy or an expanded advisory ignore
+list. Include `.cargo/audit.toml` in the commit; having it only in a local
+working tree does not configure a clean CI checkout.
 
 The initial audit also prompted upgrades to rustls 0.23.45 and anyhow 1.0.103,
 and replacement of the archived `rustls-pemfile` wrapper with the maintained

@@ -4,7 +4,17 @@ Input: cargo metadata --locked --all-features --format-version 1
 """
 
 import json
+from pathlib import Path
 import sys
+import tomllib
+
+policy_path = Path(__file__).resolve().parents[2] / ".cargo" / "audit.toml"
+try:
+    policy = tomllib.loads(policy_path.read_text())
+except (OSError, tomllib.TOMLDecodeError) as error:
+    sys.exit(f"Missing or invalid {policy_path}: commit the reviewed audit policy ({error})")
+if policy.get("advisories", {}).get("ignore") != ["RUSTSEC-2026-0009"]:
+    sys.exit("Review .cargo/audit.toml: only the guarded time advisory may be ignored")
 
 metadata = json.load(sys.stdin)
 packages = {package["id"]: package for package in metadata["packages"]}
