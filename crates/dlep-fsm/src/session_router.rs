@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use dlep_core::data_item::PeerFlags;
@@ -49,6 +49,9 @@ pub struct RouterSessionFsm {
     pub tx: TransactionTracker,
     pub destinations: HashMap<MacAddress, DestinationState>,
     pub session_metrics: LinkMetrics,
+    session_metric_types: HashSet<dlep_core::DataItemType>,
+    link_timers: HashMap<MacAddress, TimerId>,
+    next_link_timer: u32,
     config: SessionConfig,
     termination_reason: StatusCode,
     /// Peer's interval, populated by a validated initialization response.
@@ -85,6 +88,9 @@ impl RouterSessionFsm {
             tx: TransactionTracker::default(),
             destinations: HashMap::new(),
             session_metrics: LinkMetrics::default(),
+            session_metric_types: HashSet::new(),
+            link_timers: HashMap::new(),
+            next_link_timer: 100,
             config,
             termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
@@ -116,6 +122,17 @@ impl RouterSessionFsm {
                         .and_then(|()| {
                             if initializing {
                                 return Ok(());
+                            }
+                            if msg.message_type == MessageType::LINK_CHARACTERISTICS_RESPONSE {
+                                let received: HashSet<_> = msg
+                                    .data_items
+                                    .iter()
+                                    .map(DataItem::type_id)
+                                    .filter(|t| (12..=20).contains(&t.0))
+                                    .collect();
+                                if received != self.session_metric_types {
+                                    return Err(StatusCode::INVALID_DATA);
+                                }
                             }
                             let known = extract_destination_mac(msg)
                                 .and_then(|mac| self.destinations.get(&mac))
@@ -171,6 +188,12 @@ impl RouterSessionFsm {
                     })
                 } else {
                     merge_link_metrics(&msg, &mut self.session_metrics);
+                    self.session_metric_types = msg
+                        .data_items
+                        .iter()
+                        .map(DataItem::type_id)
+                        .filter(|t| (12..=20).contains(&t.0))
+                        .collect();
                     self.peer_heartbeat_interval = extract_heartbeat_interval(&msg);
                     self.peer_extensions = match extract_extensions_supported(&msg) {
                         Some(ids) => ids,
@@ -386,6 +409,94 @@ impl RouterSessionFsm {
                     self.peer_heartbeat_interval,
                 ));
                 actions
+            }
+            (
+                RouterSessionState::InSession,
+                FsmEvent::AppRequestLinkCharacteristics { mac, requested },
+            ) => {
+                if requested.is_empty()
+                    || !self.destinations.get(&mac).is_some_and(|d| d.up)
+                    || self.tx.destination_busy(&mac)
+                {
+                    tracing::debug!(?mac, "link request requires an idle, announced destination");
+                    return Vec::new();
+                }
+                let message =
+                    crate::session_common::build_link_characteristics_request(mac, &requested);
+                if message.encode().is_err() {
+                    return Vec::new();
+                }
+                self.tx
+                    .open_destination(mac, crate::transaction::RequestKind::LinkCharacteristics)
+                    .expect("checked idle transaction");
+                // Never reuse an active ID; runtime generations reject queued
+                // expiries from cancelled timers after wraparound.
+                let id = loop {
+                    let candidate = TimerId::new(self.next_link_timer);
+                    self.next_link_timer = self.next_link_timer.wrapping_add(1).max(100);
+                    if !self.link_timers.values().any(|id| *id == candidate) {
+                        break candidate;
+                    }
+                };
+                self.link_timers.insert(mac, id);
+                vec![
+                    FsmAction::SendMessage(message),
+                    FsmAction::StartTimer {
+                        id,
+                        kind: TimerKind::Transaction(mac),
+                        duration: self.config.link_characteristics_timeout,
+                        periodic: false,
+                    },
+                ]
+            }
+            (RouterSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::LINK_CHARACTERISTICS_RESPONSE =>
+            {
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let destination = self
+                    .destinations
+                    .get_mut(&mac)
+                    .expect("pending destination");
+                merge_link_metrics(&msg, &mut destination.metrics);
+                let metrics = destination.metrics;
+                let (status, text) = msg
+                    .data_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DataItem::Status { code, text } => Some((*code, text.clone())),
+                        _ => None,
+                    })
+                    .expect("validated status");
+                self.tx.close_destination(&mac);
+                let mut actions = Vec::new();
+                if let Some(id) = self.link_timers.remove(&mac) {
+                    actions.push(FsmAction::CancelTimer(id));
+                }
+                actions.push(FsmAction::Emit(EmittedEvent::LinkCharacteristicsResponse {
+                    mac,
+                    status,
+                    text,
+                    metrics,
+                }));
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
+            }
+            (
+                RouterSessionState::InSession,
+                FsmEvent::TimerExpired(id, TimerKind::Transaction(mac)),
+            ) => {
+                if self.link_timers.get(&mac) != Some(&id) {
+                    return Vec::new();
+                }
+                self.link_timers.remove(&mac);
+                self.tx.close_destination(&mac);
+                self.protocol_error(DataItem::Status {
+                    code: StatusCode::TIMED_OUT,
+                    text: "Link Characteristics Response timed out".into(),
+                })
             }
             // Negotiated extension traffic also keeps the session alive.
             (RouterSessionState::InSession, FsmEvent::RecvExtensionMessage) => {

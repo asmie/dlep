@@ -33,6 +33,7 @@ fn fast_timers() -> TimersConfig {
         discovery_interval_ms: 5_000,
         session_init_timeout_ms: FAST_SESSION_INIT_MS,
         termination_timeout_ms: FAST_TERMINATION_MS,
+        ..TimersConfig::default()
     }
 }
 

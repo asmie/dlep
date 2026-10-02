@@ -429,6 +429,27 @@ impl ModemSessionFsm {
                 }
                 actions
             }
+            // This modem has no backend capable of changing radio parameters.
+            // The mandatory response reports actual stored metrics and denies
+            // the requested alteration, rather than claiming it was applied.
+            (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
+                if msg.message_type == MessageType::LINK_CHARACTERISTICS_REQUEST =>
+            {
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let metrics = self.destinations[&mac].metrics;
+                let mut actions = vec![FsmAction::SendMessage(
+                    crate::session_common::build_link_characteristics_response(
+                        mac,
+                        StatusCode::REQUEST_DENIED,
+                        &metrics,
+                    ),
+                )];
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
+            }
             // Negotiated extension traffic also keeps the session alive.
             (ModemSessionState::InSession, FsmEvent::RecvExtensionMessage) => {
                 heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
@@ -462,6 +483,11 @@ impl ModemSessionFsm {
                 if self.tx.open_session(RequestKind::SessionUpdate).is_err() {
                     tracing::debug!("session_update while another session request is pending");
                     return Vec::new();
+                }
+                // Subsequent Link Characteristics Responses must report the
+                // same effective metrics we just advertised for every link.
+                for destination in self.destinations.values_mut() {
+                    destination.metrics = metrics;
                 }
                 vec![FsmAction::SendMessage(build_session_update(&metrics))]
             }

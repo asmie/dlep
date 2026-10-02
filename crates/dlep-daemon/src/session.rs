@@ -137,6 +137,9 @@ pub fn session_config_from_timers(
         heartbeat_interval_ms: timers.heartbeat_interval_ms,
         session_init_timeout: Duration::from_millis(timers.session_init_timeout_ms.into()),
         termination_timeout: Duration::from_millis(timers.termination_timeout_ms.into()),
+        link_characteristics_timeout: Duration::from_millis(
+            timers.link_characteristics_timeout_ms.into(),
+        ),
         advertised_extensions,
     }
 }
@@ -409,6 +412,10 @@ pub async fn run_session<F: SessionFsm>(
                     }
                     Some(SessionCommand::AnnounceDestination { mac }) => {
                         FsmEvent::AppAnnounceDestination { mac }
+                    }
+                    Some(SessionCommand::RequestLinkCharacteristics { session_id: target, mac, requested }) => {
+                        if target != session_id { continue; }
+                        FsmEvent::AppRequestLinkCharacteristics { mac, requested }
                     }
                     None => {
                         // Daemon dropped the channel without an explicit
@@ -710,6 +717,21 @@ fn translate_emitted(
             event: DestinationEvent::Down {
                 id: DestinationId(*mac),
                 reason: *reason,
+            },
+        }),
+        EmittedEvent::LinkCharacteristicsResponse {
+            mac,
+            status,
+            text,
+            metrics,
+        } => Some(DaemonEvent::Destination {
+            session_id,
+            peer: peer.clone(),
+            event: DestinationEvent::LinkCharacteristicsResponse {
+                id: DestinationId(*mac),
+                status: *status,
+                text: text.clone(),
+                metrics: *metrics,
             },
         }),
         EmittedEvent::DestinationAnnounced { mac } => Some(DaemonEvent::Destination {

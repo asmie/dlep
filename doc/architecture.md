@@ -354,7 +354,21 @@ The order of work was:
     - **`Destination Announce` was on the wrong role.** `ModemDaemon::announce_destination` existed, took a MAC, discarded it and returned `Ok(())` — a public method that silently did nothing, advertised in both the README and §7. But §12.13 makes Destination Announce *router*-originated ("MAY be sent by a router to announce such an interest"), and §12.14 obliges the *modem* to answer it. The no-op is gone; `RouterDaemon::announce_destination` sends the message under a per-destination transaction, and the modem answers and emits `DestinationEvent::Announced` (another previously-dead variant) so its application can decide whether to follow up with a `Destination_Up`. A malformed announce with no MAC now terminates the session with Invalid Data.
     - **The router binary could never reconnect.** `run_event_loop` inserted each peer into a `connected` dedup set and never removed it, and the `SessionDown` arm only logged, so a modem restart orphaned the router until the process was restarted — re-discovery hit the dedup `continue` and was skipped forever. The root cause was an API gap: `DaemonEvent::SessionDown` carried only a `StatusCode`, so the loop could not tell *which* peer had dropped. `SessionDown` now carries `PeerInfo`, and the loop evicts the dead peer and re-dials it via a `ReconnectQueue` (1 s base, doubling, 30 s cap; `forget` on `SessionUp` so each drop starts a fresh sequence). The queue takes its clock as a parameter, so the backoff is unit-tested without sleeping.
 
-    Follow-ups: make session-wide metrics configurable instead of the `PLACEHOLDER_*` constants in `build_session_initialization_response`; IPv6 discovery; `Link Characteristics Request`/`Response`. Note also that the new `AppSessionUpdate` / `AppAnnounceDestination` arms follow the existing convention of *silently dropping* a command when the transaction slot is busy (`tracing::debug!` + empty action vec) — the same wart tracked below for `AppDropDestination`. It should be fixed for all of them at once, by queueing or by surfacing a busy error.
+    Follow-ups: make session-wide metrics configurable instead of the `PLACEHOLDER_*` constants in `build_session_initialization_response`; IPv6 discovery; a modem backend capable of applying requested link changes. Note also that the new `AppSessionUpdate` / `AppAnnounceDestination` arms follow the existing convention of *silently dropping* a command when the transaction slot is busy (`tracing::debug!` + empty action vec) — the same wart tracked below for `AppDropDestination`. It should be fixed for all of them at once, by queueing or by surfacing a busy error.
+
+11. **Link Characteristics Request/Response (RFC 8175 §12.18–12.19).**
+    The router API targets one session and accepts optional receive rate,
+    transmit rate, and latency changes (at least one is required). Requests
+    occupy a per-destination transaction slot, with an independent configurable
+    60-second deadline. Responses cancel the deadline, update stored metrics,
+    and emit a session-attributed `DestinationEvent::LinkCharacteristicsResponse`
+    containing status, text, and metrics. The router requires the complete set
+    of core metrics declared by that peer during initialization. The modem
+    currently has no link-control backend, so it immediately replies Request
+    Denied with the current destination metrics. It does not fabricate a
+    successful physical link change. Tests cover denial and success replies,
+    missing/undeclared metrics, serialization, independent destination timers,
+    timeout despite heartbeats, and targeting modems sharing a MAC.
 
 ---
 

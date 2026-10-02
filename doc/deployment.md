@@ -93,6 +93,7 @@ edit with `--check-config`.
 | `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval |
 | `[timers]` | `session_init_timeout_ms` | `5000` | deadline for Session Initialization Response |
 | `[timers]` | `termination_timeout_ms` | `1000` | deadline for Session Termination Response |
+| `[timers]` | `link_characteristics_timeout_ms` | `60000` | router deadline for Link Characteristics Response; must be positive when requesting changes |
 
 CLI flags override the file: `--interface`, `--no-tls`, `--cert`, `--key`,
 `--ca-bundle`, and (router) `--peer ADDR` (repeatable; implies static mode).

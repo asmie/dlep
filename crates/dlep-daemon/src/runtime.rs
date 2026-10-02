@@ -37,6 +37,13 @@ pub enum SessionCommand {
     /// Router-side: declare interest in a destination the modem has not
     /// reported, via Destination Announce (RFC 8175 §12.13).
     AnnounceDestination { mac: MacAddress },
+    /// Router-side request, addressed to one session because a MAC can be
+    /// present at several modems with different link characteristics.
+    RequestLinkCharacteristics {
+        session_id: dlep_ext::SessionId,
+        mac: MacAddress,
+        requested: dlep_core::LinkCharacteristics,
+    },
 }
 
 /// Broadcast buffer size for public `DaemonEvent`s. When a subscriber lags

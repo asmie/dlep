@@ -6,7 +6,7 @@ use std::sync::Arc;
 use dlep_core::{ExtensionId, MacAddress, StatusCode};
 use ipnet::{Ipv4Net, Ipv6Net};
 
-pub use dlep_fsm::LinkMetrics;
+pub use dlep_fsm::{LinkCharacteristics, LinkMetrics};
 
 /// Opaque destination identifier. Today it is a MAC address; this wrapper
 /// lets the API evolve (e.g. for logical-destination extensions).
@@ -45,6 +45,14 @@ pub enum DestinationEvent {
     },
     Update {
         id: DestinationId,
+        metrics: LinkMetrics,
+    },
+    /// Outcome of a Link Characteristics Request. Metrics describe the link
+    /// after processing, including when the requested change was denied.
+    LinkCharacteristicsResponse {
+        id: DestinationId,
+        status: StatusCode,
+        text: String,
         metrics: LinkMetrics,
     },
     Announced {

@@ -14,15 +14,16 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 
 > **Status: core implementation with remaining conformance gaps.** Wire codec, both state machines,
 > TCP + TLS (mutual TLS supported) transport, UDP multicast discovery with
-> GTSM, destinations & metrics, `Session Update` and `Destination Announce`,
+> GTSM, destinations & metrics, `Session Update`, `Destination Announce`,
+> and `Link Characteristics Request`/`Response`,
 > the extension plug-in API, and deployable CLI binaries with
 > reconnect-on-drop. See
 > [§9 of `doc/architecture.md`](doc/architecture.md#9-implementation-status-high-level)
 > for the milestone log and remaining follow-ups, and
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
 >
-> Not yet implemented: IPv6 discovery transport, `Link Characteristics
-> Request`/`Response`, and configurable session-wide metrics (the modem
+> Not yet implemented: IPv6 discovery transport, a modem backend that applies
+> requested link changes, and configurable session-wide metrics (the modem
 > still advertises placeholders in `Session Initialization Response`).
 
 ## Goals
@@ -142,6 +143,22 @@ The modem-side API is symmetric, with
 error: routers may report Layer 3 changes but cannot originate metric items.
 `announce_destination` is router-side only. The modem denies destinations it
 does not know; successful responses create destinations at the router.
+
+`RouterDaemon::request_link_characteristics(session_id, destination, requested)`
+requests rate or latency changes from one modem. `LinkCharacteristics` has
+optional receive rate, transmit rate, and latency fields; supply at least one.
+Listen for `DestinationEvent::LinkCharacteristicsResponse` to obtain the status,
+status text, and current metrics. A response must include every core metric the
+peer declared during initialization. The request deadline defaults to 60 seconds
+and is configurable with `[timers].link_characteristics_timeout_ms`; expiry
+terminates the session even if the peer is still sending heartbeats.
+
+The bundled modem cannot change physical link parameters. It returns
+`Request Denied` with current destination metrics, keeping the session alive.
+Applying requested changes requires a modem control backend, which remains
+unimplemented. As with other destination commands, a busy transaction, an
+unknown destination, or a stale session ID prevents the request from being sent;
+command acknowledgement and queueing remain a separate gap.
 
 Discovery events carry a `PeerOffer` containing ordered connection points.
 Use `RouterDaemon::connect_discovered(&offer)` to try compatible endpoints;

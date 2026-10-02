@@ -19,3 +19,20 @@ pub struct LinkMetrics {
     pub rlq_tx: u8,
     pub mtu: u16,
 }
+
+/// Requested changes in RFC 8175 §12.18. At least one field must be present;
+/// omitted fields are not requests to change that characteristic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinkCharacteristics {
+    pub current_data_rate_rx_bps: Option<u64>,
+    pub current_data_rate_tx_bps: Option<u64>,
+    pub latency: Option<Duration>,
+}
+
+impl LinkCharacteristics {
+    pub fn is_empty(&self) -> bool {
+        self.current_data_rate_rx_bps.is_none()
+            && self.current_data_rate_tx_bps.is_none()
+            && self.latency.is_none()
+    }
+}

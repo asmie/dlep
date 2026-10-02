@@ -21,7 +21,7 @@ pub use error::{CodecError, ExpectedLen};
 pub use ids::{DataItemType, ExtensionId, MessageType, SignalType};
 pub use mac::MacAddress;
 pub use message::Message;
-pub use metrics::LinkMetrics;
+pub use metrics::{LinkCharacteristics, LinkMetrics};
 pub use signal::Signal;
 pub use status::StatusCode;
 

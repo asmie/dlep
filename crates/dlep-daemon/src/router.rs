@@ -199,6 +199,38 @@ impl RouterDaemon {
             .await
     }
 
+    /// Request rate/latency changes from one modem (RFC 8175 §12.18).
+    /// Use the session ID from SessionUp/Destination events. Completion is
+    /// delivered as DestinationEvent::LinkCharacteristicsResponse; a missing
+    /// response terminates that session after link_characteristics_timeout_ms.
+    /// Like existing destination commands, busy/unknown destinations or stale
+    /// session IDs are not queued. Await completion before requesting again.
+    pub async fn request_link_characteristics(
+        &self,
+        session_id: dlep_ext::SessionId,
+        id: DestinationId,
+        requested: dlep_core::LinkCharacteristics,
+    ) -> Result<(), DaemonError> {
+        if requested.is_empty() {
+            return Err(DaemonError::Config(
+                "at least one link characteristic must be requested".into(),
+            ));
+        }
+        if self.timers.link_characteristics_timeout_ms == 0 {
+            return Err(DaemonError::Config(
+                "link_characteristics_timeout_ms must be positive".into(),
+            ));
+        }
+        // Reject unencodable application values before they reach the session.
+        dlep_fsm::session_common::build_link_characteristics_request(id.0, &requested).encode()?;
+        self.fanout(SessionCommand::RequestLinkCharacteristics {
+            session_id,
+            mac: id.0,
+            requested,
+        })
+        .await
+    }
+
     /// Compatibility entry point: always returns a configuration error.
     /// RFC 8175 §12.7 permits only modems to originate session metric items.
     pub async fn update_session_metrics(&self, _metrics: LinkMetrics) -> Result<(), DaemonError> {

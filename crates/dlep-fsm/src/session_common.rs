@@ -22,6 +22,8 @@ pub struct SessionConfig {
     pub heartbeat_interval_ms: u32,
     pub session_init_timeout: Duration,
     pub termination_timeout: Duration,
+    /// Link changes may take longer than ordinary protocol exchanges.
+    pub link_characteristics_timeout: Duration,
     /// `ExtensionId`s this side announces in the Session Initialization
     /// / Session Initialization Response `ExtensionsSupported` data item.
     /// Empty by default — populated by `dlep-daemon` from the registered
@@ -43,6 +45,7 @@ impl Default for SessionConfig {
             heartbeat_interval_ms: 60_000,
             session_init_timeout: Duration::from_millis(5_000),
             termination_timeout: Duration::from_millis(1_000),
+            link_characteristics_timeout: Duration::from_secs(60),
             advertised_extensions: Vec::new(),
         }
     }
@@ -88,6 +91,47 @@ pub fn build_session_update_response(status: StatusCode) -> Message {
         code: status,
         text: String::new(),
     })
+}
+
+/// RFC 8175 §12.18: only the characteristics explicitly requested are sent.
+pub fn build_link_characteristics_request(
+    mac: MacAddress,
+    requested: &dlep_core::LinkCharacteristics,
+) -> Message {
+    let mut message = Message::new(MessageType::LINK_CHARACTERISTICS_REQUEST)
+        .with_item(DataItem::MacAddress(mac));
+    if let Some(value) = requested.current_data_rate_rx_bps {
+        message
+            .data_items
+            .push(DataItem::CurrentDataRateReceive(value));
+    }
+    if let Some(value) = requested.current_data_rate_tx_bps {
+        message
+            .data_items
+            .push(DataItem::CurrentDataRateTransmit(value));
+    }
+    if let Some(value) = requested.latency {
+        message.data_items.push(DataItem::Latency(value));
+    }
+    message
+}
+
+/// RFC 8175 §12.19 requires current metrics, including on Request Denied.
+/// The modem currently declares every core metric during initialization.
+pub fn build_link_characteristics_response(
+    mac: MacAddress,
+    status: StatusCode,
+    metrics: &LinkMetrics,
+) -> Message {
+    push_metric_items(
+        Message::new(MessageType::LINK_CHARACTERISTICS_RESPONSE)
+            .with_item(DataItem::MacAddress(mac))
+            .with_item(DataItem::Status {
+                code: status,
+                text: String::new(),
+            }),
+        metrics,
+    )
 }
 
 /// Build a `Destination_Announce` (RFC 8175 §12.13). Router → modem only:

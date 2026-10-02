@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-pub use dlep_core::LinkMetrics;
+pub use dlep_core::{LinkCharacteristics, LinkMetrics};
 use dlep_core::{MacAddress, Message, Signal, StatusCode};
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -77,6 +77,7 @@ pub enum FsmEvent {
     },
     AppRequestLinkCharacteristics {
         mac: MacAddress,
+        requested: LinkCharacteristics,
     },
     AppStartDiscovery,
     AppShutdown {
@@ -141,6 +142,14 @@ pub enum EmittedEvent {
     },
     DestinationUpdate {
         mac: MacAddress,
+        metrics: LinkMetrics,
+    },
+    /// Reply to the router's Link Characteristics Request, including the
+    /// current metrics even when the requested change was denied.
+    LinkCharacteristicsResponse {
+        mac: MacAddress,
+        status: StatusCode,
+        text: String,
         metrics: LinkMetrics,
     },
     /// Session-wide metric change the peer reported in a Session Update
