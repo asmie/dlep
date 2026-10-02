@@ -93,16 +93,45 @@ pub fn build_session_update_response(status: StatusCode) -> Message {
     })
 }
 
+pub(crate) fn validate_local_address_update(
+    local: &DestinationAddrs,
+    changes: &crate::AddressChanges,
+) -> Result<(), crate::CommandError> {
+    changes
+        .validate()
+        .map_err(|_| crate::CommandError::InvalidInput)?;
+    let mut desired = local.clone();
+    changes.apply_lenient(&mut desired);
+    crate::AddressChanges::between(local, &desired)
+        .append_to(Message::new(MessageType::SESSION_UPDATE))
+        .encode()
+        .map_err(|_| crate::CommandError::InvalidInput)?;
+    Ok(())
+}
+
 /// Originate an address-only Session Update on either role. Applications may
 /// repeat desired changes; only actual changes are sent, avoiding inconsistent
-/// wire updates. Busy commands follow the existing no-queue convention.
+/// wire updates. Busy or invalid commands produce an explicit rejection.
 pub fn apply_local_address_update(
     tx: &mut crate::transaction::TransactionTracker,
     local: &mut DestinationAddrs,
     changes: crate::AddressChanges,
 ) -> Vec<FsmAction> {
-    if tx.session_busy() || changes.validate().is_err() {
-        return Vec::new();
+    let validation = if tx.session_busy() {
+        Err(crate::CommandError::Busy)
+    } else {
+        validate_local_address_update(local, &changes)
+    };
+    if let Err(reason) = validation {
+        return vec![FsmAction::Emit(
+            crate::events::EmittedEvent::CommandRejected(crate::CommandRejection {
+                command: crate::CommandInfo {
+                    kind: crate::CommandKind::SessionAddresses,
+                    destination: None,
+                },
+                reason,
+            }),
+        )];
     }
     let mut desired = local.clone();
     changes.apply_lenient(&mut desired);
@@ -111,9 +140,6 @@ pub fn apply_local_address_update(
         return Vec::new();
     }
     let message = effective.append_to(Message::new(MessageType::SESSION_UPDATE));
-    if message.encode().is_err() {
-        return Vec::new();
-    }
     tx.open_session(crate::transaction::RequestKind::SessionUpdate)
         .expect("checked transaction");
     *local = desired;

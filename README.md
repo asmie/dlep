@@ -23,7 +23,7 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
 >
 > Not yet implemented: IPv6 discovery transport, a modem backend that applies
-> requested link changes, and command queuing when a transaction is busy.
+> requested link changes. Busy commands return explicit acceptance errors.
 
 ## Goals
 
@@ -175,8 +175,8 @@ Response addresses are retained. `DestinationEvent::Announced` now also carries
 `requested_addresses`; existing exhaustive patterns need that field or `..`.
 Address-only updates preserve metrics. Destination changes made before Up is
 acknowledged are coalesced; changes made while a router has withdrawn interest
-are retained for a later Announce. Session address commands still follow the
-existing no-queue rule when another session transaction is in progress.
+are retained for a later Announce. Session address commands return an explicit
+Busy error when another session transaction is in progress.
 
 `RouterDaemon::drop_destination(session_id, destination)` withdraws interest
 from one modem. The modem acknowledges with Destination Down Response, stops
@@ -184,7 +184,7 @@ reporting that destination on this session, and emits a `DestinationEvent::Down`
 The router emits its own Down event when the response arrives. The session stays
 active; a later Destination Announce can restore reports using the modem's
 latest local metrics and addresses. Busy/unknown destinations and stale session
-IDs follow the existing command-delivery limitation described below.
+IDs return explicit errors as described below.
 
 `RouterDaemon::request_link_characteristics(session_id, destination, requested)`
 requests rate or latency changes from one modem. `LinkCharacteristics` has
@@ -200,9 +200,27 @@ been removed and is rejected if present in a configuration file.
 The bundled modem cannot change physical link parameters. It returns
 `Request Denied` with current destination metrics, keeping the session alive.
 Applying requested changes requires a modem control backend, which remains
-unimplemented. As with other destination commands, a busy transaction, an
-unknown destination, or a stale session ID prevents the request from being sent;
-command acknowledgement and queueing remain a separate gap.
+unimplemented.
+
+Command methods now await local acceptance by the session task. `Ok(())` means
+the command was applied, sent, or retained as a pending Up update; peer responses
+still arrive as protocol events. `DaemonError::CommandRejected(report)` contains
+accepted session IDs and per-session rejections (`Busy`, `NotReady`,
+`UnknownDestination`, `AlreadyExists`, `Unsupported`, or `InvalidInput`).
+`NoMatchingSession` covers stale IDs and an empty session list. FSM rejections
+also produce `DaemonEvent::CommandRejected` with the command kind, destination,
+and peer/session context.
+
+Busy commands are not queued or replayed. Retry after the outstanding response,
+using application-controlled backoff when no completion event is available.
+Broadcasts can partially succeed: inspect the report and use
+`send_command_to(session_id, SessionCommand::...)` on either daemon to retry
+only the rejected sessions. `undelivered` counts channels closed before enqueue;
+`unknown` counts sessions that ended without an acceptance receipt, where the
+command may already have taken effect. Canceling an API future after enqueue
+also does not cancel the protocol operation. Shutdown bypasses busy checks.
+For direct `run_session` users, command channels now carry `SessionRequest`;
+`SessionCommand::... .into()` constructs a request without a receipt.
 
 Discovery events carry a `PeerOffer` containing ordered connection points.
 Use `RouterDaemon::connect_discovered(&offer)` to try compatible endpoints;

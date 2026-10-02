@@ -13,7 +13,8 @@ use tracing::{info, warn};
 use crate::config::{ModemConfig, TimersConfig};
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
-    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, new_event_channel,
+    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
+    new_event_channel,
 };
 use crate::session::{
     SessionIdCounter, new_session_id_counter, run_session, session_config_from_timers,
@@ -24,7 +25,7 @@ pub struct ModemDaemon {
     events_tx: EventTx,
     /// Address the listen socket actually bound to (resolves `tcp_port = 0`).
     local_addr: SocketAddr,
-    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>>,
+    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
     /// First entry is the listen task; subsequent entries are per-session.
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     listen_task: JoinHandle<()>,
@@ -129,8 +130,8 @@ impl ModemDaemon {
 
     /// Advertise local peer-address/subnet changes on one session. This sends
     /// an address-only Session Update; it does not alter destination metrics.
-    /// Repeated adds/absent removes are local no-ops. Busy session transactions
-    /// follow the current no-queue command convention.
+    /// Repeated adds/absent removes are successful local no-ops. Busy sessions
+    /// return CommandRejected with CommandError::Busy; retry after completion.
     pub async fn update_session_addresses(
         &self,
         session_id: dlep_ext::SessionId,
@@ -154,21 +155,33 @@ impl ModemDaemon {
         Ok(())
     }
 
-    /// Fan a command to every active session. Snapshot the sender list under
-    /// the lock so we don't hold the mutex across `await`. If a session
-    /// already exited and dropped its receiver, the `send` fails — we drop
-    /// the error rather than surface it, since a dead session is not the
-    /// caller's problem.
+    /// Submit a command to one session, including a retry after a partial
+    /// broadcast rejection. Returns local acceptance, not the peer's response.
+    /// The session validates role, state, transaction scope, and payload.
+    pub async fn send_command_to(
+        &self,
+        session_id: dlep_ext::SessionId,
+        command: SessionCommand,
+    ) -> Result<(), DaemonError> {
+        self.dispatch(command, Some(session_id)).await
+    }
+
     async fn fanout(&self, cmd: SessionCommand) -> Result<(), DaemonError> {
+        self.dispatch(cmd, None).await
+    }
+
+    // Snapshot channels without holding the lock across acceptance waits.
+    async fn dispatch(
+        &self,
+        cmd: SessionCommand,
+        target: Option<dlep_ext::SessionId>,
+    ) -> Result<(), DaemonError> {
         let senders: Vec<_> = {
             let mut guard = self.session_cmds.lock().await;
             guard.retain(|tx| !tx.is_closed());
             guard.clone()
         };
-        for tx in senders {
-            let _ = tx.send(cmd.clone()).await;
-        }
-        Ok(())
+        crate::runtime::dispatch_command(senders, cmd, target).await
     }
 
     pub async fn shutdown(self) -> Result<(), DaemonError> {
@@ -195,9 +208,12 @@ impl ModemDaemon {
         let cmds: Vec<_> = std::mem::take(&mut *self.session_cmds.lock().await);
         for cmd_tx in cmds {
             let _ = cmd_tx
-                .send(SessionCommand::Shutdown {
-                    reason: StatusCode::SHUTTING_DOWN,
-                })
+                .send(
+                    SessionCommand::Shutdown {
+                        reason: StatusCode::SHUTTING_DOWN,
+                    }
+                    .into(),
+                )
                 .await;
         }
         let tasks: Vec<_> = std::mem::take(&mut *self.tasks.lock().await);
@@ -270,7 +286,7 @@ impl ModemBuilder {
         };
 
         let (events_tx, _events_rx) = new_event_channel();
-        let session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>> =
+        let session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let session_id_counter = new_session_id_counter();
@@ -375,7 +391,7 @@ async fn modem_accept_loop(
     timers: TimersConfig,
     peer_description: String,
     initial_metrics: LinkMetrics,
-    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>>,
+    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     extensions: ExtensionRegistry,
     session_id_counter: SessionIdCounter,

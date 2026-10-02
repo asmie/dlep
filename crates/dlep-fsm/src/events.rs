@@ -114,6 +114,7 @@ pub enum FsmAction {
 /// these into the richer `DaemonEvent` type with full metric payloads.
 #[derive(Debug)]
 pub enum EmittedEvent {
+    CommandRejected(crate::CommandRejection),
     SessionUp {
         /// Extension IDs the peer advertised in `ExtensionsSupported`.
         /// The daemon intersects with its own advertised set to compute

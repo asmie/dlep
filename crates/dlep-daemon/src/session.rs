@@ -27,7 +27,9 @@ use tracing::debug;
 
 use crate::config::TimersConfig;
 use crate::events::{DaemonEvent, PeerInfo};
-use crate::runtime::{COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionCommand};
+use crate::runtime::{
+    COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionCommand, SessionRequest,
+};
 
 /// Per-daemon monotonic counter for `SessionId`. Each daemon constructs
 /// its own `Arc<AtomicU64>` and passes it into every `run_session` call;
@@ -283,7 +285,7 @@ pub async fn run_session<F: SessionFsm>(
     mut fsm: F,
     transport: Box<dyn Transport>,
     initial_event: FsmEvent,
-    mut commands: mpsc::Receiver<SessionCommand>,
+    mut commands: mpsc::Receiver<SessionRequest>,
     events_tx: EventTx,
     mut peer: PeerInfo,
     extensions: ExtensionRegistry,
@@ -392,6 +394,16 @@ pub async fn run_session<F: SessionFsm>(
             }
 
             cmd = commands.recv(), if commands_open => {
+                let (cmd, receipt) = match cmd {
+                    Some(request) => {
+                        if request.target.is_some_and(|target| target != session_id) {
+                            if let Some(receipt) = request.receipt { let _ = receipt.send(None); }
+                            continue;
+                        }
+                        (Some(request.command), request.receipt)
+                    }
+                    None => (None, None),
+                };
                 let event = match cmd {
                     Some(SessionCommand::Shutdown { reason }) => {
                         FsmEvent::AppShutdown { reason }
@@ -405,15 +417,13 @@ pub async fn run_session<F: SessionFsm>(
                     Some(SessionCommand::UpdateDestinationAddresses { mac, changes }) => {
                         FsmEvent::AppUpdateAddresses { mac, changes }
                     }
-                    Some(SessionCommand::UpdateSessionAddresses { session_id: target, changes }) => {
-                        if target != session_id { continue; }
+                    Some(SessionCommand::UpdateSessionAddresses { session_id: _, changes }) => {
                         FsmEvent::AppSessionAddresses { changes }
                     }
                     Some(SessionCommand::DropDestination { mac, reason }) => {
                         FsmEvent::AppDropDestination { mac, reason }
                     }
-                    Some(SessionCommand::DropDestinationForSession { session_id: target, mac }) => {
-                        if target != session_id { continue; }
+                    Some(SessionCommand::DropDestinationForSession { session_id: _, mac }) => {
                         FsmEvent::AppDropDestination { mac, reason: StatusCode::SUCCESS }
                     }
                     Some(SessionCommand::SessionUpdate { metrics }) => {
@@ -422,8 +432,7 @@ pub async fn run_session<F: SessionFsm>(
                     Some(SessionCommand::AnnounceDestination { mac }) => {
                         FsmEvent::AppAnnounceDestination { mac }
                     }
-                    Some(SessionCommand::RequestLinkCharacteristics { session_id: target, mac, requested }) => {
-                        if target != session_id { continue; }
+                    Some(SessionCommand::RequestLinkCharacteristics { session_id: _, mac, requested }) => {
                         FsmEvent::AppRequestLinkCharacteristics { mac, requested }
                     }
                     None => {
@@ -436,14 +445,18 @@ pub async fn run_session<F: SessionFsm>(
                     }
                 };
                 let actions = fsm.step(event);
-                if process_actions(
+                let outcome = actions.iter().find_map(|action| match action {
+                    FsmAction::Emit(dlep_fsm::events::EmittedEvent::CommandRejected(rejection)) => Some(*rejection),
+                    _ => None,
+                }).map_or(Ok(()), Err);
+                let closed = process_actions(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
                     &mut lifecycle.active_exts, &mut lifecycle.down_emitted, &mut pending_sends,
-                ).await? {
-                    break;
-                }
+                ).await?;
+                if let Some(receipt) = receipt { let _ = receipt.send(Some((session_id, outcome))); }
+                if closed { break; }
             }
 
             Some((id, kind, generation)) = timer_expiry_rx.recv() => {
@@ -711,6 +724,11 @@ fn translate_emitted(
                 v4_subnets: addrs.v4_subnets.clone(),
                 v6_subnets: addrs.v6_subnets.clone(),
             },
+        }),
+        EmittedEvent::CommandRejected(rejection) => Some(DaemonEvent::CommandRejected {
+            session_id,
+            peer: peer.clone(),
+            rejection: *rejection,
         }),
         EmittedEvent::DestinationUpdate { mac, metrics } => Some(DaemonEvent::Destination {
             session_id,

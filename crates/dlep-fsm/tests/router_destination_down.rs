@@ -1,3 +1,4 @@
+mod common;
 use std::time::Duration;
 
 use dlep_core::{
@@ -116,14 +117,13 @@ fn withdraw_stop_updates_and_reannounce_for_both_original_up_and_announce() {
                 })
                 .is_empty()
         );
-        assert!(
-            modem
-                .step(E::AppAddDestination {
-                    mac: mac(),
-                    metrics: changed,
-                    addrs: Default::default()
-                })
-                .is_empty()
+        common::assert_rejected(
+            modem.step(E::AppAddDestination {
+                mac: mac(),
+                metrics: changed,
+                addrs: Default::default(),
+            }),
+            dlep_fsm::CommandError::AlreadyExists,
         );
         let announce = sent(
             &router.step(E::AppAnnounceDestination { mac: mac() }),
@@ -193,13 +193,12 @@ fn modem_can_forget_a_withdrawn_destination_without_sending_another_down() {
 fn local_unknown_or_busy_destination_does_not_send_down() {
     let (mut router, _) = sessions();
     let other = MacAddress::new_eui48([2, 0, 0, 0, 0, 2]);
-    assert!(
-        router
-            .step(E::AppDropDestination {
-                mac: other,
-                reason: S::SUCCESS
-            })
-            .is_empty()
+    common::assert_rejected(
+        router.step(E::AppDropDestination {
+            mac: other,
+            reason: S::SUCCESS,
+        }),
+        dlep_fsm::CommandError::UnknownDestination,
     );
     router.step(E::AppRequestLinkCharacteristics {
         mac: mac(),
@@ -208,13 +207,12 @@ fn local_unknown_or_busy_destination_does_not_send_down() {
             ..Default::default()
         },
     });
-    assert!(
-        router
-            .step(E::AppDropDestination {
-                mac: mac(),
-                reason: S::SUCCESS
-            })
-            .is_empty()
+    common::assert_rejected(
+        router.step(E::AppDropDestination {
+            mac: mac(),
+            reason: S::SUCCESS,
+        }),
+        dlep_fsm::CommandError::Busy,
     );
 }
 

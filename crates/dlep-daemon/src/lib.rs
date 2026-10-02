@@ -28,3 +28,6 @@ pub use events::{
 pub use modem::{ModemBuilder, ModemDaemon};
 pub use router::{RouterBuilder, RouterDaemon};
 pub use tls::TlsSetupError;
+
+pub use dlep_fsm::{CommandError, CommandInfo, CommandKind, CommandRejection};
+pub use runtime::{CommandReport, DaemonError, SessionCommand};

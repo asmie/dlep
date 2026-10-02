@@ -1,3 +1,4 @@
+mod common;
 use std::time::Duration;
 
 use dlep_core::{DataItem, LinkMetrics, MacAddress, Message, MessageType as M, StatusCode};
@@ -253,22 +254,25 @@ fn invalid_app_metrics_do_not_mutate_state_or_open_transactions() {
             ..Default::default()
         },
     ] {
-        assert!(
+        common::assert_rejected(
             m.step(E::AppAddDestination {
                 mac: mac(2),
                 metrics: invalid,
-                addrs: Default::default()
-            })
-            .is_empty()
+                addrs: Default::default(),
+            }),
+            dlep_fsm::CommandError::InvalidInput,
         );
-        assert!(
+        common::assert_rejected(
             m.step(E::AppUpdateMetrics {
                 mac: mac(1),
-                metrics: invalid
-            })
-            .is_empty()
+                metrics: invalid,
+            }),
+            dlep_fsm::CommandError::InvalidInput,
         );
-        assert!(m.step(E::AppSessionUpdate { metrics: invalid }).is_empty());
+        common::assert_rejected(
+            m.step(E::AppSessionUpdate { metrics: invalid }),
+            dlep_fsm::CommandError::InvalidInput,
+        );
         assert!(!m.tx.session_busy());
         assert!(!m.tx.destination_busy(&mac(2)));
         assert!(!m.destinations.contains_key(&mac(2)));

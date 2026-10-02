@@ -80,6 +80,11 @@ pub struct MetricsEvent {
 /// broadcast channel needs to fan out to multiple subscribers.
 #[derive(Clone)]
 pub enum DaemonEvent {
+    CommandRejected {
+        session_id: dlep_ext::SessionId,
+        peer: PeerInfo,
+        rejection: dlep_fsm::CommandRejection,
+    },
     PeerDiscovered(PeerOffer),
     SessionUp {
         session_id: dlep_ext::SessionId,
@@ -162,6 +167,16 @@ impl fmt::Debug for DaemonEvent {
                 .field("peer", peer)
                 .field("changes", changes)
                 .field("addresses", addresses)
+                .finish(),
+            Self::CommandRejected {
+                session_id,
+                peer,
+                rejection,
+            } => f
+                .debug_struct("CommandRejected")
+                .field("session_id", session_id)
+                .field("peer", peer)
+                .field("rejection", rejection)
                 .finish(),
             Self::Extension(_) => f.debug_tuple("Extension").field(&"<opaque>").finish(),
         }

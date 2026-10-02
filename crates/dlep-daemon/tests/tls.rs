@@ -151,21 +151,7 @@ async fn tls_session_establishes_and_carries_destination_lifecycle() {
     )
     .await;
 
-    // The router emits DestinationEvent::Up _before_ its Destination_Up_Response
-    // round-trips back to the modem; the modem keeps the per-destination
-    // transaction open until that response arrives. If we fire
-    // `drop_destination` while the prior Up transaction is still pending the
-    // modem-side FSM silently swallows the request (see
-    // `ModemSessionFsm`'s `AppDropDestination` arm). Plain-TCP localhost
-    // delivery is fast enough that the response is almost always in by the
-    // time the test gets here; the extra record-framing overhead of TLS makes
-    // the race observable. Yield the runtime briefly to let the response drain.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    modem
-        .drop_destination(id, StatusCode::SHUTTING_DOWN)
-        .await
-        .expect("drop_destination over TLS");
+    drop_after_ack(&modem, id).await;
     let _ = await_destination_event(
         &mut router_events,
         |d| matches!(d, DestinationEvent::Down { id: got, .. } if *got == id),
@@ -243,13 +229,7 @@ async fn mtls_session_requires_and_accepts_client_certificate() {
     )
     .await;
 
-    // Same AppDropDestination race mitigation as the M7 test above.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    modem
-        .drop_destination(id, StatusCode::SHUTTING_DOWN)
-        .await
-        .expect("drop_destination over mTLS");
+    drop_after_ack(&modem, id).await;
     let _ = await_destination_event(
         &mut router_events,
         |d| matches!(d, DestinationEvent::Down { id: got, .. } if *got == id),
@@ -315,4 +295,30 @@ async fn mtls_modem_rejects_client_without_certificate() {
 
     router.shutdown().await.expect("router shutdown");
     modem.shutdown().await.expect("modem shutdown");
+}
+
+// Explicit Busy permits a safe retry; no guessed delay for the Up response.
+async fn drop_after_ack(modem: &ModemDaemon, id: DestinationId) {
+    timeout(STEP_TIMEOUT, async {
+        loop {
+            match modem.drop_destination(id, StatusCode::SHUTTING_DOWN).await {
+                Ok(()) => break,
+                Err(dlep_daemon::DaemonError::CommandRejected(report))
+                    if report.accepted.is_empty()
+                        && report.undelivered == 0
+                        && report.unknown == 0
+                        && !report.rejected.is_empty()
+                        && report
+                            .rejected
+                            .iter()
+                            .all(|(_, r)| r.reason == dlep_daemon::CommandError::Busy) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => panic!("drop over TLS failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("Up acknowledgement before drop");
 }

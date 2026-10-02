@@ -97,6 +97,13 @@ impl ModemSessionFsm {
     }
 
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
+        if let Some(command) = event.command() {
+            if let Err(reason) = self.check_command(&event) {
+                return vec![FsmAction::Emit(EmittedEvent::CommandRejected(
+                    crate::CommandRejection { command, reason },
+                ))];
+            }
+        }
         if let FsmEvent::RecvMessage(msg) = &event {
             if matches!(
                 self.state,
@@ -270,9 +277,6 @@ impl ModemSessionFsm {
                 },
             ) => {
                 use crate::transaction::RequestKind;
-                if !self.valid_metrics(&metrics) {
-                    return Vec::new();
-                }
                 let mut effective = self.session_metrics;
                 crate::session_common::merge_link_metrics(
                     &build_session_update(&metrics),
@@ -280,29 +284,9 @@ impl ModemSessionFsm {
                 );
                 let metrics = effective;
                 let addrs = addrs.canonical();
-                if (AddressChanges {
-                    added: addrs.clone(),
-                    removed: Default::default(),
-                })
-                .validate()
-                .is_err()
-                    || build_destination_up(mac, &metrics, &addrs)
-                        .encode()
-                        .is_err()
-                {
-                    return Vec::new();
-                }
-                if self.destinations.contains_key(&mac) {
-                    return Vec::new();
-                }
-                if self
-                    .tx
+                self.tx
                     .open_destination(mac, RequestKind::DestinationUp)
-                    .is_err()
-                {
-                    tracing::debug!(?mac, "duplicate add_destination while Up pending");
-                    return Vec::new();
-                }
+                    .expect("checked idle destination");
                 self.destinations.insert(
                     mac,
                     DestinationState {
@@ -360,16 +344,12 @@ impl ModemSessionFsm {
             }
             // InSession: app asks us to advertise an updated metric set for
             // an existing destination. RFC 8175 §11.7 — Destination_Update is
-            // one-way; there is no Response. If the MAC is unknown locally,
-            // log+drop (symmetric to the Up dedup-guard) so we never advertise
-            // an Update for a destination the router never saw an Up for.
+            // one-way; there is no Response. Preflight rejects unknown MACs.
             (ModemSessionState::InSession, FsmEvent::AppUpdateMetrics { mac, metrics }) => {
-                if !self.valid_metrics(&metrics) {
-                    return Vec::new();
-                }
-                let Some(destination) = self.destinations.get_mut(&mac) else {
-                    return Vec::new();
-                };
+                let destination = self
+                    .destinations
+                    .get_mut(&mac)
+                    .expect("checked destination");
                 crate::session_common::merge_link_metrics(
                     &build_session_update(&metrics),
                     &mut destination.metrics,
@@ -383,21 +363,12 @@ impl ModemSessionFsm {
                 ))]
             }
             (ModemSessionState::InSession, FsmEvent::AppUpdateAddresses { mac, changes }) => {
-                if changes.validate().is_err() {
-                    return Vec::new();
-                }
-                let Some(destination) = self.destinations.get_mut(&mac) else {
-                    return Vec::new();
-                };
+                let destination = self
+                    .destinations
+                    .get_mut(&mac)
+                    .expect("checked destination");
                 let mut desired = destination.addrs.clone();
                 changes.apply_lenient(&mut desired);
-                // Retained snapshots must also fit a later Up/Announce response.
-                if build_destination_up(mac, &destination.metrics, &desired)
-                    .encode()
-                    .is_err()
-                {
-                    return Vec::new();
-                }
                 destination.addrs = desired;
                 if !destination.announced || self.tx.destination_busy(&mac) {
                     return Vec::new();
@@ -422,22 +393,13 @@ impl ModemSessionFsm {
             // `announced` flips only on response).
             (ModemSessionState::InSession, FsmEvent::AppDropDestination { mac, reason }) => {
                 use crate::transaction::RequestKind;
-                if !self.destinations.contains_key(&mac) {
-                    tracing::debug!(?mac, "drop_destination for unknown destination; ignoring");
-                    return Vec::new();
-                }
                 if !self.destinations[&mac].announced && !self.tx.destination_busy(&mac) {
                     self.destinations.remove(&mac);
                     return Vec::new();
                 }
-                if self
-                    .tx
+                self.tx
                     .open_destination(mac, RequestKind::DestinationDown)
-                    .is_err()
-                {
-                    tracing::debug!(?mac, "drop_destination while another tx pending; ignoring");
-                    return Vec::new();
-                }
+                    .expect("checked idle destination");
                 vec![FsmAction::SendMessage(build_destination_down(mac, reason))]
             }
             // A router withdraws interest, not physical reachability. Keep
@@ -612,13 +574,9 @@ impl ModemSessionFsm {
             // transaction slot until the Response arrives.
             (ModemSessionState::InSession, FsmEvent::AppSessionUpdate { metrics }) => {
                 use crate::transaction::RequestKind;
-                if !self.valid_metrics(&metrics) {
-                    return Vec::new();
-                }
-                if self.tx.open_session(RequestKind::SessionUpdate).is_err() {
-                    tracing::debug!("session_update while another session request is pending");
-                    return Vec::new();
-                }
+                self.tx
+                    .open_session(RequestKind::SessionUpdate)
+                    .expect("checked idle session");
                 // Subsequent Link Characteristics Responses must report the
                 // same effective metrics we just advertised for every link.
                 let message = build_session_update(&metrics);
@@ -698,6 +656,98 @@ impl ModemSessionFsm {
     fn valid_metrics(&self, metrics: &LinkMetrics) -> bool {
         metrics.supported_by(&self.config.initial_metrics)
             && build_session_update(metrics).encode().is_ok()
+    }
+
+    fn check_command(&self, event: &FsmEvent) -> Result<(), crate::CommandError> {
+        use crate::CommandError as E;
+        use crate::transaction::RequestKind;
+        if self.state != ModemSessionState::InSession {
+            return Err(E::NotReady);
+        }
+        let info = event.command().expect("application command");
+        match event {
+            FsmEvent::AppAnnounceDestination { .. }
+            | FsmEvent::AppRequestLinkCharacteristics { .. } => return Err(E::Unsupported),
+            _ => {}
+        }
+        if let Some(mac) = info.destination {
+            if let Some(pending) = self.tx.per_destination.get(&mac) {
+                // Updates during Up are retained/coalesced. During Down, the
+                // destination will be removed, so accepting updates loses them.
+                let retained = matches!(
+                    event,
+                    FsmEvent::AppUpdateMetrics { .. } | FsmEvent::AppUpdateAddresses { .. }
+                ) && pending.kind == RequestKind::DestinationUp;
+                if !retained {
+                    return Err(E::Busy);
+                }
+            }
+        } else if self.tx.session_busy() {
+            return Err(E::Busy);
+        }
+        match event {
+            FsmEvent::AppAddDestination {
+                mac,
+                metrics,
+                addrs,
+            } => {
+                if self.destinations.contains_key(mac) {
+                    return Err(E::AlreadyExists);
+                }
+                if !self.valid_metrics(metrics) {
+                    return Err(E::InvalidInput);
+                }
+                AddressChanges {
+                    added: addrs.clone(),
+                    removed: Default::default(),
+                }
+                .validate()
+                .map_err(|_| E::InvalidInput)?;
+                let mut effective = self.session_metrics;
+                crate::session_common::merge_link_metrics(
+                    &build_session_update(metrics),
+                    &mut effective,
+                );
+                build_destination_up(*mac, &effective, addrs)
+                    .encode()
+                    .map_err(|_| E::InvalidInput)?;
+            }
+            FsmEvent::AppDropDestination { mac, .. } => {
+                if !self.destinations.contains_key(mac) {
+                    return Err(E::UnknownDestination);
+                }
+            }
+            FsmEvent::AppUpdateMetrics { mac, metrics } => {
+                if !self.destinations.contains_key(mac) {
+                    return Err(E::UnknownDestination);
+                }
+                if !self.valid_metrics(metrics) {
+                    return Err(E::InvalidInput);
+                }
+            }
+            FsmEvent::AppUpdateAddresses { mac, changes } => {
+                let destination = self.destinations.get(mac).ok_or(E::UnknownDestination)?;
+                changes.validate().map_err(|_| E::InvalidInput)?;
+                let mut desired = destination.addrs.clone();
+                changes.apply_lenient(&mut desired);
+                build_destination_up(*mac, &destination.metrics, &desired)
+                    .encode()
+                    .map_err(|_| E::InvalidInput)?;
+            }
+            FsmEvent::AppSessionUpdate { metrics } => {
+                if !self.valid_metrics(metrics) {
+                    return Err(E::InvalidInput);
+                }
+            }
+            FsmEvent::AppSessionAddresses { changes } => {
+                crate::session_common::validate_local_address_update(
+                    &self.local_addresses,
+                    changes,
+                )?;
+            }
+            _ => return Err(E::Unsupported),
+        }
+        Ok(())
     }
 
     fn protocol_error(&mut self, status: DataItem) -> Vec<FsmAction> {

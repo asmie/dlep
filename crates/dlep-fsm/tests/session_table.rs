@@ -1286,7 +1286,7 @@ fn modem_in_session_session_update_opens_then_closes_session_transaction() {
 }
 
 #[test]
-fn modem_in_session_second_app_session_update_is_dropped_while_pending() {
+fn modem_in_session_second_app_session_update_is_rejected_while_pending() {
     let mut fsm = modem_at(ModemSessionState::InSession);
     let first = fsm.step(FsmEvent::AppSessionUpdate {
         metrics: sample_metrics_dest(),
@@ -1295,6 +1295,10 @@ fn modem_in_session_second_app_session_update_is_dropped_while_pending() {
     let second = fsm.step(FsmEvent::AppSessionUpdate {
         metrics: sample_metrics_dest(),
     });
+    assert!(
+        matches!(second.as_slice(), [FsmAction::Emit(EmittedEvent::CommandRejected(rejection))]
+        if rejection.reason == dlep_fsm::CommandError::Busy)
+    );
     assert_eq!(
         action_count_send_message(&second),
         0,

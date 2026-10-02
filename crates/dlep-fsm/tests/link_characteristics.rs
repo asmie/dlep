@@ -1,3 +1,4 @@
+mod common;
 use std::time::Duration;
 
 use dlep_core::{
@@ -247,12 +248,12 @@ fn concurrent_transactions_remain_pending_while_heartbeats_continue() {
     add(&mut r, &mut m, mac(2));
     request(&mut r, mac(1));
     request(&mut r, mac(2));
-    assert!(
+    common::assert_rejected(
         r.step(E::AppRequestLinkCharacteristics {
             mac: mac(1),
-            requested: requested()
-        })
-        .is_empty()
+            requested: requested(),
+        }),
+        dlep_fsm::CommandError::Busy,
     );
     for _ in 0..100 {
         r.step(E::RecvMessage(Message::new(M::HEARTBEAT)));

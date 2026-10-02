@@ -1,3 +1,4 @@
+mod common;
 use dlep_core::{DataItem, LinkMetrics, MacAddress, Message, MessageType as M, StatusCode as S};
 use dlep_fsm::events::EmittedEvent;
 use dlep_fsm::session_common::build_destination_update;
@@ -197,11 +198,11 @@ fn session_sender_emits_only_effective_changes_and_shares_transaction_slot() {
     );
     assert_eq!(message.data_items.len(), 4); // no router-originated metric items
     let ack = sent(&m.step(E::RecvMessage(message)), M::SESSION_UPDATE_RESPONSE);
-    assert!(
+    common::assert_rejected(
         r.step(E::AppSessionAddresses {
-            changes: replace(1, 2)
-        })
-        .is_empty()
+            changes: replace(1, 2),
+        }),
+        dlep_fsm::CommandError::Busy,
     );
     r.step(E::RecvMessage(ack));
     assert!(

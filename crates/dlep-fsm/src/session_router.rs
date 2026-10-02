@@ -105,6 +105,13 @@ impl RouterSessionFsm {
     }
 
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
+        if let Some(command) = event.command() {
+            if let Err(reason) = self.check_command(&event) {
+                return vec![FsmAction::Emit(EmittedEvent::CommandRejected(
+                    crate::CommandRejection { command, reason },
+                ))];
+            }
+        }
         if let FsmEvent::RecvMessage(msg) = &event {
             if matches!(
                 self.state,
@@ -392,18 +399,9 @@ impl RouterSessionFsm {
             // Keep the entry until the response so updates already in transit
             // can still be processed. Section 8 permits no transaction timeout.
             (RouterSessionState::InSession, FsmEvent::AppDropDestination { mac, .. }) => {
-                if !self.destinations.get(&mac).is_some_and(|d| d.up) {
-                    tracing::debug!(?mac, "drop_destination for unknown destination; ignoring");
-                    return Vec::new();
-                }
-                if self
-                    .tx
+                self.tx
                     .open_destination(mac, crate::transaction::RequestKind::DestinationDown)
-                    .is_err()
-                {
-                    tracing::debug!(?mac, "drop_destination while another tx pending; ignoring");
-                    return Vec::new();
-                }
+                    .expect("checked idle destination");
                 vec![FsmAction::SendMessage(
                     crate::session_common::build_destination_down(mac, StatusCode::SUCCESS),
                 )]
@@ -511,18 +509,8 @@ impl RouterSessionFsm {
                 RouterSessionState::InSession,
                 FsmEvent::AppRequestLinkCharacteristics { mac, requested },
             ) => {
-                if requested.is_empty()
-                    || !self.destinations.get(&mac).is_some_and(|d| d.up)
-                    || self.tx.destination_busy(&mac)
-                {
-                    tracing::debug!(?mac, "link request requires an idle, announced destination");
-                    return Vec::new();
-                }
                 let message =
                     crate::session_common::build_link_characteristics_request(mac, &requested);
-                if message.encode().is_err() {
-                    return Vec::new();
-                }
                 self.tx
                     .open_destination(mac, crate::transaction::RequestKind::LinkCharacteristics)
                     .expect("checked idle transaction");
@@ -607,14 +595,9 @@ impl RouterSessionFsm {
             // has not reported (RFC 8175 §12.13). Router-originated only.
             (RouterSessionState::InSession, FsmEvent::AppAnnounceDestination { mac }) => {
                 use crate::transaction::RequestKind;
-                if self
-                    .tx
+                self.tx
                     .open_destination(mac, RequestKind::DestinationAnnounce)
-                    .is_err()
-                {
-                    tracing::debug!(?mac, "announce_destination while another tx pending");
-                    return Vec::new();
-                }
+                    .expect("checked idle destination");
                 vec![FsmAction::SendMessage(build_destination_announce(mac))]
             }
             (RouterSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
@@ -731,6 +714,59 @@ impl RouterSessionFsm {
                         .any(|(m, d)| *m != mac && d.addrs.v6_subnets.contains(a)))
         });
         changes
+    }
+
+    fn check_command(&self, event: &FsmEvent) -> Result<(), crate::CommandError> {
+        use crate::CommandError as E;
+        if self.state != RouterSessionState::InSession {
+            return Err(E::NotReady);
+        }
+        if !matches!(
+            event,
+            FsmEvent::AppDropDestination { .. }
+                | FsmEvent::AppAnnounceDestination { .. }
+                | FsmEvent::AppRequestLinkCharacteristics { .. }
+                | FsmEvent::AppSessionAddresses { .. }
+        ) {
+            return Err(E::Unsupported);
+        }
+        let info = event.command().expect("application command");
+        if let Some(mac) = info.destination {
+            if self.tx.destination_busy(&mac) {
+                return Err(E::Busy);
+            }
+        } else if self.tx.session_busy() {
+            return Err(E::Busy);
+        }
+        match event {
+            FsmEvent::AppDropDestination { mac, .. }
+            | FsmEvent::AppRequestLinkCharacteristics { mac, .. } => {
+                if !self.destinations.get(mac).is_some_and(|d| d.up) {
+                    return Err(E::UnknownDestination);
+                }
+                if let FsmEvent::AppRequestLinkCharacteristics { requested, .. } = event {
+                    if requested.is_empty() {
+                        return Err(E::InvalidInput);
+                    }
+                    crate::session_common::build_link_characteristics_request(*mac, requested)
+                        .encode()
+                        .map_err(|_| E::InvalidInput)?;
+                }
+            }
+            FsmEvent::AppAnnounceDestination { mac } => {
+                if self.destinations.get(mac).is_some_and(|d| d.up) {
+                    return Err(E::AlreadyExists);
+                }
+            }
+            FsmEvent::AppSessionAddresses { changes } => {
+                crate::session_common::validate_local_address_update(
+                    &self.local_addresses,
+                    changes,
+                )?;
+            }
+            _ => return Err(E::Unsupported),
+        }
+        Ok(())
     }
 
     fn protocol_error(&mut self, status: DataItem) -> Vec<FsmAction> {

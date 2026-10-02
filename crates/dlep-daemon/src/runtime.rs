@@ -8,7 +8,7 @@
 use dlep_core::{MacAddress, StatusCode};
 use dlep_fsm::{DestinationAddrs, LinkMetrics};
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::events::DaemonEvent;
 
@@ -59,6 +59,105 @@ pub enum SessionCommand {
     },
 }
 
+/// Result for a selected session, or None if the request targets another session.
+pub type CommandReceipt = Option<(dlep_ext::SessionId, Result<(), dlep_fsm::CommandRejection>)>;
+
+/// A command with an optional acceptance receipt. The runtime resolves it only
+/// after checking FSM state and executing the resulting local actions. This is
+/// not the peer's protocol response. Dropped receipts indicate an unknown
+/// outcome (e.g. transport failure after a partial write), not safe retry.
+#[derive(Debug)]
+pub struct SessionRequest {
+    pub target: Option<dlep_ext::SessionId>,
+    pub command: SessionCommand,
+    pub receipt: Option<oneshot::Sender<CommandReceipt>>,
+}
+
+impl From<SessionCommand> for SessionRequest {
+    fn from(command: SessionCommand) -> Self {
+        Self {
+            target: command.target(),
+            command,
+            receipt: None,
+        }
+    }
+}
+
+impl SessionCommand {
+    pub fn target(&self) -> Option<dlep_ext::SessionId> {
+        match self {
+            Self::DropDestinationForSession { session_id, .. }
+            | Self::UpdateSessionAddresses { session_id, .. }
+            | Self::RequestLinkCharacteristics { session_id, .. } => Some(*session_id),
+            _ => None,
+        }
+    }
+}
+
+/// Broadcasts are not atomic: a healthy session may accept a command while
+/// another rejects it. Inspect this report before deciding which peers to retry.
+#[derive(Clone, Debug, Default)]
+pub struct CommandReport {
+    pub accepted: Vec<dlep_ext::SessionId>,
+    pub rejected: Vec<(dlep_ext::SessionId, dlep_fsm::CommandRejection)>,
+    /// Channels closed before enqueue; these commands were not delivered.
+    pub undelivered: usize,
+    /// Session ended without a receipt. The command may have taken effect.
+    pub unknown: usize,
+}
+
+pub(crate) async fn dispatch_command(
+    senders: Vec<mpsc::Sender<SessionRequest>>,
+    command: SessionCommand,
+    target: Option<dlep_ext::SessionId>,
+) -> Result<(), DaemonError> {
+    if target.is_some() && command.target().is_some() && target != command.target() {
+        return Err(DaemonError::Config(
+            "conflicting command session IDs".into(),
+        ));
+    }
+    let target = target.or(command.target());
+    let mut report = CommandReport::default();
+    let mut receipts = Vec::new();
+    for sender in senders {
+        let (receipt, receiver) = oneshot::channel();
+        if sender
+            .send(SessionRequest {
+                target,
+                command: command.clone(),
+                receipt: Some(receipt),
+            })
+            .await
+            .is_err()
+        {
+            report.undelivered += 1;
+        } else {
+            receipts.push(receiver);
+        }
+    }
+    for receipt in receipts {
+        match receipt.await {
+            Ok(Some((id, Ok(())))) => report.accepted.push(id),
+            Ok(Some((id, Err(reason)))) => report.rejected.push((id, reason)),
+            Ok(None) => {} // A targeted command belongs to a different session.
+            Err(_) => report.unknown += 1,
+        }
+    }
+    // Session IDs are unique. Once the selected session replied, failures of
+    // unrelated sessions cannot change the outcome of a targeted command.
+    if target.is_some() && (!report.accepted.is_empty() || !report.rejected.is_empty()) {
+        report.undelivered = 0;
+        report.unknown = 0;
+    }
+    if !report.rejected.is_empty() || report.undelivered != 0 || report.unknown != 0 {
+        Err(DaemonError::CommandRejected(report))
+    } else if report.accepted.is_empty() {
+        Err(DaemonError::NoMatchingSession)
+    } else {
+        Ok(())
+    }
+}
+
 /// Broadcast buffer size for public `DaemonEvent`s. When a subscriber lags
 /// past this many events, the oldest events are dropped for that subscriber
 /// (standard `tokio::sync::broadcast` semantics) — consumers that need
@@ -71,6 +170,10 @@ pub const COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// Errors returned from the public daemon API.
 #[derive(Debug, Error)]
 pub enum DaemonError {
+    #[error("no matching live session")]
+    NoMatchingSession,
+    #[error("command was not accepted by every session: {0:?}")]
+    CommandRejected(CommandReport),
     #[error("daemon is shutting down")]
     ShuttingDown,
     #[error("configuration error: {0}")]
@@ -107,4 +210,72 @@ pub(crate) fn validate_address_changes(
         ))
         .encode()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use dlep_ext::SessionId;
+
+    #[tokio::test]
+    async fn closed_channels_and_lost_receipts_never_report_success() {
+        let (closed, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (accepted, mut receiver) = mpsc::channel::<SessionRequest>(1);
+        let task = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            request
+                .receipt
+                .unwrap()
+                .send(Some((SessionId(1), Ok(()))))
+                .unwrap();
+        });
+        let (lost, mut receiver) = mpsc::channel::<SessionRequest>(1);
+        let lost_task = tokio::spawn(async move {
+            drop(receiver.recv().await.unwrap());
+        });
+        let error = dispatch_command(
+            vec![closed, accepted, lost],
+            SessionCommand::SessionUpdate {
+                metrics: Default::default(),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        let DaemonError::CommandRejected(report) = error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(report.accepted, [SessionId(1)]);
+        assert_eq!(report.undelivered, 1);
+        assert_eq!(report.unknown, 1);
+        task.await.unwrap();
+        lost_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn targeted_receipt_is_not_overridden_by_unrelated_closed_channel() {
+        let (closed, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (accepted, mut receiver) = mpsc::channel::<SessionRequest>(1);
+        let task = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            assert_eq!(request.target, Some(SessionId(1)));
+            request
+                .receipt
+                .unwrap()
+                .send(Some((SessionId(1), Ok(()))))
+                .unwrap();
+        });
+        dispatch_command(
+            vec![closed, accepted],
+            SessionCommand::SessionUpdate {
+                metrics: Default::default(),
+            },
+            Some(SessionId(1)),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+    }
 }

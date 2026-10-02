@@ -12,7 +12,8 @@ use tracing::warn;
 use crate::config::{NetworkConfig, RouterConfig, TimersConfig};
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
-    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, new_event_channel,
+    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
+    new_event_channel,
 };
 use crate::session::{
     SessionIdCounter, new_session_id_counter, run_session, session_config_from_timers,
@@ -27,7 +28,7 @@ pub struct RouterDaemon {
     timers: TimersConfig,
     network: NetworkConfig,
     /// Per-active-session command channels, used to fan out shutdown.
-    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionCommand>>>>,
+    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
     /// Background tasks: one per active session.
     tasks: Arc<Mutex<Vec<SessionTaskHandle>>>,
     /// Set by `start_discovery`; cleared by `shutdown`. Sends `()` to ask the
@@ -203,8 +204,8 @@ impl RouterDaemon {
     /// Completion emits DestinationEvent::Down with the response status as
     /// its reason. The MAC stays known until the matching response arrives;
     /// peer failure is detected by session heartbeats, not a request timeout.
-    /// As with other commands, busy/unknown destinations and stale session IDs
-    /// are not queued. Use a SessionUp/Destination event's session ID.
+    /// Busy/unknown destinations return CommandRejected; stale session IDs
+    /// return NoMatchingSession. Use a SessionUp/Destination event's session ID.
     pub async fn drop_destination(
         &self,
         session_id: dlep_ext::SessionId,
@@ -222,8 +223,8 @@ impl RouterDaemon {
     /// delivered as DestinationEvent::LinkCharacteristicsResponse. Per RFC §8,
     /// the transaction has no deadline: a slow peer remains valid while its
     /// heartbeats continue. Session reset discards outstanding transactions.
-    /// Like existing destination commands, busy/unknown destinations or stale
-    /// session IDs are not queued. Await completion before requesting again.
+    /// Busy/unknown destinations return CommandRejected; stale session IDs
+    /// return NoMatchingSession. Await completion before requesting again.
     pub async fn request_link_characteristics(
         &self,
         session_id: dlep_ext::SessionId,
@@ -255,8 +256,8 @@ impl RouterDaemon {
 
     /// Advertise local peer-address/subnet changes on one session. This sends
     /// an address-only Session Update; it does not alter destination metrics.
-    /// Repeated adds/absent removes are local no-ops. Busy session transactions
-    /// follow the current no-queue command convention.
+    /// Repeated adds/absent removes are successful local no-ops. Busy sessions
+    /// return CommandRejected with CommandError::Busy; retry after completion.
     pub async fn update_session_addresses(
         &self,
         session_id: dlep_ext::SessionId,
@@ -270,19 +271,33 @@ impl RouterDaemon {
         .await
     }
 
-    /// Fan a command to every active session. Snapshot the sender list under
-    /// the lock so we don't hold the mutex across `await`; a session that
-    /// already exited and dropped its receiver is not the caller's problem.
+    /// Submit a command to one session, including a retry after a partial
+    /// broadcast rejection. Returns local acceptance, not the peer's response.
+    /// The session validates role, state, transaction scope, and payload.
+    pub async fn send_command_to(
+        &self,
+        session_id: dlep_ext::SessionId,
+        command: SessionCommand,
+    ) -> Result<(), DaemonError> {
+        self.dispatch(command, Some(session_id)).await
+    }
+
     async fn fanout(&self, cmd: SessionCommand) -> Result<(), DaemonError> {
+        self.dispatch(cmd, None).await
+    }
+
+    // Snapshot channels without holding the lock across acceptance waits.
+    async fn dispatch(
+        &self,
+        cmd: SessionCommand,
+        target: Option<dlep_ext::SessionId>,
+    ) -> Result<(), DaemonError> {
         let senders: Vec<_> = {
             let mut guard = self.session_cmds.lock().await;
             guard.retain(|tx| !tx.is_closed());
             guard.clone()
         };
-        for tx in senders {
-            let _ = tx.send(cmd.clone()).await;
-        }
-        Ok(())
+        crate::runtime::dispatch_command(senders, cmd, target).await
     }
 
     /// Initiate a graceful shutdown: every active session is asked to send
@@ -305,9 +320,12 @@ impl RouterDaemon {
         let cmds: Vec<_> = std::mem::take(&mut *self.session_cmds.lock().await);
         for cmd_tx in cmds {
             let _ = cmd_tx
-                .send(SessionCommand::Shutdown {
-                    reason: StatusCode::SHUTTING_DOWN,
-                })
+                .send(
+                    SessionCommand::Shutdown {
+                        reason: StatusCode::SHUTTING_DOWN,
+                    }
+                    .into(),
+                )
                 .await;
         }
         let tasks: Vec<_> = std::mem::take(&mut *self.tasks.lock().await);

@@ -400,11 +400,14 @@ async fn slow_response_remains_valid_after_three_minutes_of_peer_activity() {
         M::DESTINATION_UP_RESPONSE
     );
     commands
-        .send(SessionCommand::RequestLinkCharacteristics {
-            session_id,
-            mac: destination().0,
-            requested: requested(),
-        })
+        .send(
+            SessionCommand::RequestLinkCharacteristics {
+                session_id,
+                mac: destination().0,
+                requested: requested(),
+            }
+            .into(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -452,9 +455,12 @@ async fn slow_response_remains_valid_after_three_minutes_of_peer_activity() {
         matches!(reply, DaemonEvent::Destination { event: DestinationEvent::LinkCharacteristicsResponse { status: S::SUCCESS, metrics, .. }, .. } if metrics.current_data_rate_tx_bps == 123_000)
     );
     commands
-        .send(SessionCommand::Shutdown {
-            reason: S::SHUTTING_DOWN,
-        })
+        .send(
+            SessionCommand::Shutdown {
+                reason: S::SHUTTING_DOWN,
+            }
+            .into(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -463,4 +469,63 @@ async fn slow_response_remains_valid_after_three_minutes_of_peer_activity() {
     );
     send(&mut peer, Message::new(M::SESSION_TERMINATION_RESPONSE)).await;
     timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn busy_router_request_returns_error_and_retry_after_response_succeeds() {
+    let (router, mut events, mut peer, session_id) = raw_modem().await;
+    router
+        .request_link_characteristics(session_id, destination(), requested())
+        .await
+        .unwrap();
+    assert_eq!(
+        read(&mut peer).await.message_type,
+        M::LINK_CHARACTERISTICS_REQUEST
+    );
+    let error = router
+        .request_link_characteristics(session_id, destination(), requested())
+        .await
+        .unwrap_err();
+    let dlep_daemon::DaemonError::CommandRejected(report) = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].0, session_id);
+    assert_eq!(report.rejected[0].1.reason, dlep_daemon::CommandError::Busy);
+    assert!(report.accepted.is_empty());
+    send(
+        &mut peer,
+        build_link_characteristics_response(
+            destination().0,
+            S::REQUEST_DENIED,
+            &LinkMetrics::default(),
+        ),
+    )
+    .await;
+    event(&mut events, |e| {
+        matches!(
+            e,
+            DaemonEvent::Destination {
+                event: DestinationEvent::LinkCharacteristicsResponse { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    router
+        .request_link_characteristics(session_id, destination(), requested())
+        .await
+        .unwrap();
+    // An extra frame here would reveal an incorrectly queued/replayed command.
+    assert_eq!(
+        read(&mut peer).await.message_type,
+        M::LINK_CHARACTERISTICS_REQUEST
+    );
+    assert!(
+        timeout(Duration::from_millis(50), read(&mut peer))
+            .await
+            .is_err()
+    );
+    drop(peer);
+    router.shutdown().await.unwrap();
 }
