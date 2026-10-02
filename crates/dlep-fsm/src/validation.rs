@@ -8,6 +8,22 @@ use dlep_core::{DataItem, DataItemType as D, Message, MessageType as M, StatusCo
 use crate::session_common::extract_destination_mac;
 use crate::transaction::{RequestKind, TransactionTracker};
 
+/// Check every core MAC item, including ones carried by extension messages.
+pub fn validate_mac_format(
+    msg: &Message,
+    format: dlep_core::MacAddressFormat,
+) -> Result<(), StatusCode> {
+    if msg
+        .data_items
+        .iter()
+        .any(|item| matches!(item, DataItem::MacAddress(mac) if !format.accepts(*mac)))
+    {
+        Err(StatusCode::INVALID_DATA)
+    } else {
+        Ok(())
+    }
+}
+
 pub fn validate_message(
     msg: &Message,
     router: bool,

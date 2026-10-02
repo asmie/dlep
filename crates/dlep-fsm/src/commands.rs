@@ -37,6 +37,8 @@ pub enum CommandError {
     Unsupported,
     #[error("invalid or unencodable command values")]
     InvalidInput,
+    #[error("destination MAC does not match the configured session address format")]
+    MacAddressFormatMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

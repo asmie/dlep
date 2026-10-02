@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Fixed destination MAC format; must match the modem's router-facing link.
+    #[serde(with = "MacAddressFormatDef")]
+    pub mac_address_format: dlep_core::MacAddressFormat,
     /// Discovery interface name. Selects discovery membership, egress, and ingress.
     pub interface: Option<String>,
     pub discovery_v4_group: Ipv4Addr,
@@ -25,6 +28,14 @@ pub struct NetworkConfig {
     pub use_tls: bool,
     #[serde(default = "default_gtsm_enforce")]
     pub gtsm_enforce: bool,
+}
+
+// Keep serde out of the protocol's core types/dependencies.
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "dlep_core::MacAddressFormat", rename_all = "lowercase")]
+enum MacAddressFormatDef {
+    Eui48,
+    Eui64,
 }
 
 impl NetworkConfig {
@@ -105,6 +116,7 @@ fn default_gtsm_enforce() -> bool {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
+            mac_address_format: Default::default(),
             interface: None,
             discovery_v4_group: DISCOVERY_IPV4_GROUP,
             discovery_v6_group: DISCOVERY_IPV6_GROUP,
@@ -380,6 +392,35 @@ fn default_modem_peer_description() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_format_defaults_roundtrips_and_rejects_unknown_values() {
+        use dlep_core::MacAddressFormat as F;
+        assert_eq!(
+            RouterConfig::default().shared.network.mac_address_format,
+            F::Eui48
+        );
+        assert_eq!(
+            ModemConfig::default().shared.network.mac_address_format,
+            F::Eui48
+        );
+        for (name, format) in [("eui48", F::Eui48), ("eui64", F::Eui64)] {
+            let input = format!("[network]\nmac_address_format = '{name}'");
+            let r: RouterConfig = toml::from_str(&input).unwrap();
+            let m: ModemConfig = toml::from_str(&input).unwrap();
+            assert_eq!(r.shared.network.mac_address_format, format);
+            assert_eq!(m.shared.network.mac_address_format, format);
+            let r: RouterConfig = toml::from_str(&toml::to_string(&r).unwrap()).unwrap();
+            let m: ModemConfig = toml::from_str(&toml::to_string(&m).unwrap()).unwrap();
+            assert_eq!(r.shared.network.mac_address_format, format);
+            assert_eq!(m.shared.network.mac_address_format, format);
+        }
+        for input in ["'auto'", "'eui46'", "48"] {
+            let input = format!("[network]\nmac_address_format = {input}");
+            assert!(toml::from_str::<RouterConfig>(&input).is_err());
+            assert!(toml::from_str::<ModemConfig>(&input).is_err());
+        }
+    }
 
     #[test]
     fn unknown_top_level_keys_and_sections_are_rejected() {

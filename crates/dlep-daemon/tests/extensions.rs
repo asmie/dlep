@@ -27,6 +27,105 @@ const TEST_EXT_ID: ExtensionId = ExtensionId(0xF000);
 /// reserves 1..=16; anything above is fair game for extensions.
 const TEST_MSG_TYPE: MessageType = MessageType(0xF000);
 
+struct MacExt {
+    send: bool,
+    received: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DlepExtension for MacExt {
+    fn advertised_ids(&self) -> &[ExtensionId] {
+        &[TEST_EXT_ID]
+    }
+    fn on_session_state(&self, state: SessionStateSnapshot, ctx: &mut dyn ExtensionCtx) {
+        if state.up && self.send {
+            ctx.send_message(
+                Message::new(TEST_MSG_TYPE)
+                    .with_item(DataItem::MacAddress(dlep_core::MacAddress::BROADCAST_EUI64)),
+            );
+        }
+    }
+    fn on_unknown_message(
+        &self,
+        _: MessageType,
+        _: &[DataItem],
+        _: &mut dyn ExtensionCtx,
+    ) -> ExtHandled {
+        self.received
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ExtHandled::Handled
+    }
+}
+
+async fn extension_mac_policy(outgoing_invalid: bool) {
+    for router_sends in [false, true] {
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mc = loopback_modem_config();
+        let mut rc = loopback_router_config();
+        // With EUI-64 at the sender the message reaches the EUI-48 receiver.
+        // With EUI-48 at both ends, reject the plugin's message before writing.
+        if !outgoing_invalid {
+            if router_sends {
+                rc.shared.network.mac_address_format = dlep_core::MacAddressFormat::Eui64;
+            } else {
+                mc.shared.network.mac_address_format = dlep_core::MacAddressFormat::Eui64;
+            }
+        }
+        let modem = ModemDaemon::builder()
+            .config(mc)
+            .register_extension(Arc::new(MacExt {
+                send: !router_sends,
+                received: received.clone(),
+            }))
+            .spawn()
+            .await
+            .unwrap();
+        let mut me = modem.subscribe();
+        let router = RouterDaemon::builder()
+            .config(rc)
+            .register_extension(Arc::new(MacExt {
+                send: router_sends,
+                received: received.clone(),
+            }))
+            .spawn()
+            .await
+            .unwrap();
+        let mut re = router.subscribe();
+        router.connect_static(modem.local_addr()).await.unwrap();
+        let receiving_events = if router_sends { &mut me } else { &mut re };
+        timeout(STEP_TIMEOUT, async {
+            loop {
+                if let DaemonEvent::SessionDown { reason, .. } =
+                    receiving_events.recv().await.unwrap()
+                {
+                    if !outgoing_invalid {
+                        assert_eq!(reason, dlep_core::StatusCode::INVALID_DATA);
+                    }
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            received.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid core MAC must never reach a consuming extension"
+        );
+        router.shutdown().await.unwrap();
+        modem.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn negotiated_extensions_cannot_consume_incompatible_core_mac_items() {
+    extension_mac_policy(false).await;
+}
+
+#[tokio::test]
+async fn extension_queued_messages_cannot_send_incompatible_core_mac_items() {
+    extension_mac_policy(true).await;
+}
+
 /// Payload that `TestExt::on_unknown_message` emits on the broadcast
 /// channel. Downcastable from `DaemonEvent::Extension`.
 #[derive(Clone, Debug, PartialEq, Eq)]

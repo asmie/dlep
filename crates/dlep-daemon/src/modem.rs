@@ -324,6 +324,7 @@ impl ModemBuilder {
             cfg.shared.timers.clone(),
             cfg.peer_description.clone(),
             initial_metrics,
+            cfg.shared.network.mac_address_format,
             session_cmds.clone(),
             tasks.clone(),
             extensions_for_accept,
@@ -397,6 +398,7 @@ async fn modem_accept_loop(
     timers: TimersConfig,
     peer_description: String,
     initial_metrics: LinkMetrics,
+    mac_address_format: dlep_core::MacAddressFormat,
     session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     extensions: ExtensionRegistry,
@@ -463,6 +465,7 @@ async fn modem_accept_loop(
             let mut cfg =
                 session_config_from_timers(&timers, peer_description, extensions.advertised());
             cfg.initial_metrics = initial_metrics;
+            cfg.mac_address_format = mac_address_format;
             let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
             {
                 let mut senders = commands.lock().await;

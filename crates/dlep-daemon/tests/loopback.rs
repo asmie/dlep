@@ -134,6 +134,93 @@ async fn router_modem_loopback_session() {
     modem.shutdown().await.expect("modem shutdown");
 }
 
+#[tokio::test]
+async fn configured_eui64_sessions_reject_local_eui48_and_reconnect() {
+    use dlep_core::MacAddressFormat as F;
+    let mut mc = loopback_modem_config();
+    mc.shared.network.mac_address_format = F::Eui64;
+    let modem = ModemDaemon::builder().config(mc).spawn().await.unwrap();
+    let mut me = modem.subscribe();
+    let mut rc = loopback_router_config();
+    rc.shared.network.mac_address_format = F::Eui64;
+    for _ in 0..2 {
+        let router = RouterDaemon::builder()
+            .config(rc.clone())
+            .spawn()
+            .await
+            .unwrap();
+        let mut re = router.subscribe();
+        router.connect_static(modem.local_addr()).await.unwrap();
+        await_session_up(&mut re).await;
+        await_session_up(&mut me).await;
+        let wrong = DestinationId(MacAddress::BROADCAST_EUI48);
+        for result in [
+            modem.add_destination(wrong, sample_metrics()).await,
+            router.announce_destination(wrong).await,
+        ] {
+            let dlep_daemon::DaemonError::CommandRejected(report) = result.unwrap_err() else {
+                panic!("expected rejection")
+            };
+            assert_eq!(report.rejected.len(), 1);
+            assert_eq!(
+                report.rejected[0].1.reason,
+                dlep_daemon::CommandError::MacAddressFormatMismatch
+            );
+        }
+        let id = DestinationId(MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]));
+        modem.add_destination(id, sample_metrics()).await.unwrap();
+        await_destination_event(
+            &mut re,
+            |d| matches!(d, DestinationEvent::Up { id: got, .. } if *got == id),
+        )
+        .await;
+        router.shutdown().await.unwrap();
+        await_session_down(&mut me).await;
+    }
+    modem.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn incompatible_mac_policies_terminate_with_invalid_data() {
+    let mut mc = loopback_modem_config();
+    mc.shared.network.mac_address_format = dlep_core::MacAddressFormat::Eui64;
+    let modem = ModemDaemon::builder().config(mc).spawn().await.unwrap();
+    let mut me = modem.subscribe();
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .spawn()
+        .await
+        .unwrap();
+    let mut re = router.subscribe();
+    router.connect_static(modem.local_addr()).await.unwrap();
+    await_session_up(&mut re).await;
+    await_session_up(&mut me).await;
+    modem
+        .add_destination(MacAddress::BROADCAST_EUI64.into(), sample_metrics())
+        .await
+        .unwrap();
+    for rx in [&mut re, &mut me] {
+        timeout(STEP_TIMEOUT, async {
+            loop {
+                match rx.recv().await.unwrap() {
+                    DaemonEvent::SessionDown { reason, .. } => {
+                        assert_eq!(reason, StatusCode::INVALID_DATA);
+                        break;
+                    }
+                    DaemonEvent::Destination { .. } => {
+                        panic!("incompatible destination escaped validation")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
+}
+
 /// Regression: dropping the router handle without calling `shutdown()` must
 /// terminate the session in bounded time. Before P2 #1 fix, the session
 /// task would hot-loop on `commands.recv() == None` after the FSM entered

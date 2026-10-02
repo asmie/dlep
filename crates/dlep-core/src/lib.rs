@@ -19,7 +19,7 @@ pub mod status;
 pub use data_item::{DataItem, RawDataItem};
 pub use error::{CodecError, ExpectedLen};
 pub use ids::{DataItemType, ExtensionId, MessageType, SignalType};
-pub use mac::MacAddress;
+pub use mac::{MacAddress, MacAddressFormat};
 pub use message::Message;
 pub use metrics::{LinkCharacteristics, LinkMetrics};
 pub use signal::Signal;

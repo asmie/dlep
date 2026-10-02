@@ -85,6 +85,7 @@ metrics, and TLS material as well.
 | top level (router) | `static_peers` | `[]` | modem `addr:port` list for static mode |
 | top level | `peer_description` | binary name | Peer Type data item text |
 | `[network]` | `interface` | none | Discovery interface name: membership, sending, and receive filtering |
+| `[network]` | `mac_address_format` | `"eui48"` | Destination MAC format: `"eui48"` or `"eui64"`; must match the modem's router-facing link |
 | `[network]` | `discovery_v4_group` | `224.0.0.117` | IPv4 discovery multicast group |
 | `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (used with an IPv6 `bind_addr`) |
 | `[network]` | `discovery_port` | `854` | modem UDP listen port / router multicast destination port; router source port is ephemeral |
@@ -110,6 +111,20 @@ metrics that the modem can supply: omitted optional fields declare them
 unsupported and keep them off the wire. Explicit zero remains a reported value.
 Support is fixed for each session; enabling another optional metric requires a
 new session. Configured current rates cannot exceed their maximum rates.
+
+Set `mac_address_format` on both peers to match the modem's router-facing
+link-layer format ([RFC 8175 §13.7](https://www.rfc-editor.org/rfc/rfc8175.html#section-13.7)).
+It is an explicit local policy, not negotiated or inferred from the first
+destination or the discovery interface. The default is EUI-48; EUI-64 links
+must set `mac_address_format = "eui64"`. A daemon applies this policy to all its
+sessions; deployments with different link formats need separately configured
+daemon instances (direct FSM embedders configure each `SessionConfig`).
+The format cannot change during a session, even after every destination is
+removed. Incorrect local destination commands return
+`CommandError::MacAddressFormatMismatch`; incorrect received MAC items cause
+Session Termination with Invalid Data (130). Negotiated extensions must also
+respect this policy: an incompatible queued core MAC item is rejected before
+writing and ends the session through runtime error cleanup.
 
 DLEP transactions do not have individual deadlines (RFC 8175 §8). The session
 heartbeat mechanism detects a silent peer. Remove the previously introduced

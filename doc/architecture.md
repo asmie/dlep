@@ -665,7 +665,14 @@ has no explicitly selected interface, and the runtime applies that scope to
 advertised IPv6 link-local endpoints. Regressions cover a complete mixed-family
 DLEP connection, per-packet scope across two interfaces, wrong-interface
 filtering, unscoped global endpoints, and source-address fallback.
-R2–R4 remain open and take precedence over broad completion statements above.
+R2 (mixed MAC formats) is now fixed with a session-wide `MacAddressFormat`
+policy. Daemon `[network].mac_address_format` defaults to `eui48` and permits
+explicit `eui64`; it must match the modem's router-facing link. Both FSMs reject
+incompatible local commands and terminate on incompatible received MAC items.
+Extension dispatch and queued writes enforce the same policy. Tests cover both
+formats, every core destination message, removal of the last destination,
+reconnection, configuration parsing, and extension bypass paths.
+R3–R4 remain open and take precedence over broad completion statements above.
 Each follow-up remains a separate commit checkpoint.
 
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.

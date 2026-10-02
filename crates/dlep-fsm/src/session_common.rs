@@ -18,6 +18,8 @@ use crate::timers::TimerId;
 /// state handlers themselves never reach into config files or environment.
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
+    /// Fixed for the session lifetime; must match the modem's link-layer format.
+    pub mac_address_format: dlep_core::MacAddressFormat,
     pub peer_description: String,
     /// Initial modem metrics and fixed optional metric support for this session.
     pub initial_metrics: LinkMetrics,
@@ -43,6 +45,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            mac_address_format: Default::default(),
             peer_description: "dlep-router".into(),
             initial_metrics: LinkMetrics::default(),
             heartbeat_interval_ms: 60_000,

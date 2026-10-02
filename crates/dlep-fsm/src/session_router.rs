@@ -104,6 +104,10 @@ impl RouterSessionFsm {
         self.state
     }
 
+    pub fn mac_address_format(&self) -> dlep_core::MacAddressFormat {
+        self.config.mac_address_format
+    }
+
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
         if let Some(command) = event.command() {
             if let Err(reason) = self.check_command(&event) {
@@ -129,6 +133,10 @@ impl RouterSessionFsm {
                 let checked =
                     validate_message(msg, true, initializing, &self.config.advertised_extensions)
                         .and_then(|()| {
+                            crate::validation::validate_mac_format(
+                                msg,
+                                self.config.mac_address_format,
+                            )?;
                             if initializing || msg.message_type == MessageType::SESSION_UPDATE {
                                 let mut addresses = self.peer_addresses.clone();
                                 AddressChanges::from_message(msg).apply_strict(&mut addresses)?;
@@ -730,6 +738,9 @@ impl RouterSessionFsm {
         }
         let info = event.command().expect("application command");
         if let Some(mac) = info.destination {
+            if !self.config.mac_address_format.accepts(mac) {
+                return Err(E::MacAddressFormatMismatch);
+            }
             if self.tx.destination_busy(&mac) {
                 return Err(E::Busy);
             }

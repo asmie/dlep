@@ -96,6 +96,10 @@ impl ModemSessionFsm {
         self.state
     }
 
+    pub fn mac_address_format(&self) -> dlep_core::MacAddressFormat {
+        self.config.mac_address_format
+    }
+
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
         if let Some(command) = event.command() {
             if let Err(reason) = self.check_command(&event) {
@@ -121,6 +125,10 @@ impl ModemSessionFsm {
                 let checked =
                     validate_message(msg, false, initializing, &self.config.advertised_extensions)
                         .and_then(|()| {
+                            crate::validation::validate_mac_format(
+                                msg,
+                                self.config.mac_address_format,
+                            )?;
                             if initializing || msg.message_type == MessageType::SESSION_UPDATE {
                                 let mut addresses = self.peer_addresses.clone();
                                 AddressChanges::from_message(msg).apply_strict(&mut addresses)?;
@@ -671,6 +679,9 @@ impl ModemSessionFsm {
             _ => {}
         }
         if let Some(mac) = info.destination {
+            if !self.config.mac_address_format.accepts(mac) {
+                return Err(E::MacAddressFormatMismatch);
+            }
             if let Some(pending) = self.tx.per_destination.get(&mac) {
                 // Updates during Up are retained/coalesced. During Down, the
                 // destination will be removed, so accepting updates loses them.

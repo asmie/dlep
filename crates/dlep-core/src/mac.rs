@@ -1,5 +1,23 @@
 use std::fmt;
 
+/// Destination address format of the modem's router-facing link (§13.7).
+/// This is a local session policy, not a negotiated wire parameter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MacAddressFormat {
+    #[default]
+    Eui48,
+    Eui64,
+}
+
+impl MacAddressFormat {
+    pub fn accepts(self, mac: MacAddress) -> bool {
+        matches!(
+            (self, mac),
+            (Self::Eui48, MacAddress::Eui48(_)) | (Self::Eui64, MacAddress::Eui64(_))
+        )
+    }
+}
+
 /// MAC address used to identify a DLEP destination. RFC 8175 §13.7 permits
 /// either EUI-48 (6 octets) or EUI-64 (8 octets) on the wire and requires
 /// all destination MACs in a single session to share one format

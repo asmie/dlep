@@ -91,6 +91,7 @@ struct SessionLifecycle {
     is_router: bool,
     active_exts: Vec<Arc<dyn DlepExtension>>,
     down_emitted: bool,
+    mac_address_format: dlep_core::MacAddressFormat,
 }
 
 impl Drop for SessionLifecycle {
@@ -145,15 +146,20 @@ pub fn session_config_from_timers(
             .map(|ms| Duration::from_millis(ms.into())),
         advertised_extensions,
         initial_metrics: Default::default(),
+        mac_address_format: Default::default(),
     }
 }
 
 pub trait SessionFsm {
+    fn mac_address_format(&self) -> dlep_core::MacAddressFormat;
     fn step(&mut self, event: FsmEvent) -> Vec<FsmAction>;
     fn in_session(&self) -> bool;
 }
 
 impl SessionFsm for dlep_fsm::session_router::RouterSessionFsm {
+    fn mac_address_format(&self) -> dlep_core::MacAddressFormat {
+        dlep_fsm::session_router::RouterSessionFsm::mac_address_format(self)
+    }
     fn in_session(&self) -> bool {
         self.state() == dlep_fsm::session_router::RouterSessionState::InSession
     }
@@ -163,6 +169,9 @@ impl SessionFsm for dlep_fsm::session_router::RouterSessionFsm {
 }
 
 impl SessionFsm for dlep_fsm::session_modem::ModemSessionFsm {
+    fn mac_address_format(&self) -> dlep_core::MacAddressFormat {
+        dlep_fsm::session_modem::ModemSessionFsm::mac_address_format(self)
+    }
     fn in_session(&self) -> bool {
         self.state() == dlep_fsm::session_modem::ModemSessionState::InSession
     }
@@ -338,6 +347,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
         is_router: is_router_side,
         active_exts: Vec::new(),
         down_emitted: false,
+        mac_address_format: fsm.mac_address_format(),
     };
     let mut pending_sends: Vec<Message> = Vec::new();
 
@@ -395,6 +405,16 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                             });
                             lifecycle.peer = peer.clone();
                         }
+                        // Extensions cannot consume a core MAC that violates the
+                        // link format, even inside a negotiated private message.
+                        if fsm.in_session() && !is_known_message_type(msg.message_type) && dlep_fsm::validation::validate_mac_format(
+                            &msg, lifecycle.mac_address_format).is_err() {
+                            let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
+                            if process_actions(actions, &mut writer, &mut timers, &timer_expiry_tx,
+                                &events_tx, &peer, &extensions, session_id, is_router_side,
+                                &mut lifecycle, &mut pending_sends).await? { break; }
+                            continue;
+                        }
                         // Only mutually negotiated extensions can consume unknown
                         // messages/items. Unclaimed input reaches strict validation.
                         let handled = fsm.in_session() && !is_known_message_type(msg.message_type) && dispatch_unknown_message(
@@ -410,7 +430,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                             &timer_expiry_tx, &events_tx, &peer, &extensions, session_id, is_router_side,
                             &mut lifecycle, &mut pending_sends).await?;
                         if close { break; }
-                        flush_pending_sends(&mut pending_sends, &mut writer).await?;
+                        flush_pending_sends(&mut pending_sends, &mut writer, lifecycle.mac_address_format).await?;
                     }
                     FrameRead::Eof => {
                         let actions = fsm.step(FsmEvent::TcpClosed);
@@ -713,7 +733,7 @@ async fn process_actions(
                 }
 
                 // Propagate extension write failures through lifecycle cleanup.
-                flush_pending_sends(pending_sends, writer).await?;
+                flush_pending_sends(pending_sends, writer, lifecycle.mac_address_format).await?;
             }
         }
     }
@@ -996,8 +1016,14 @@ fn dispatch_destination_state(
 async fn flush_pending_sends(
     pending_sends: &mut Vec<Message>,
     writer: &mut WriteHalf<Box<dyn Transport>>,
+    format: dlep_core::MacAddressFormat,
 ) -> Result<(), DaemonError> {
     for msg in pending_sends.drain(..) {
+        dlep_fsm::validation::validate_mac_format(&msg, format).map_err(|_| {
+            DaemonError::Config(
+                "extension message MAC does not match session address format".into(),
+            )
+        })?;
         write_message(writer, &msg).await?;
     }
     Ok(())

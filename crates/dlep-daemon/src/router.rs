@@ -152,8 +152,9 @@ impl RouterDaemon {
         };
 
         let advertised = self.extensions.advertised();
-        let session_cfg =
+        let mut session_cfg =
             session_config_from_timers(&self.timers, self.peer_description.clone(), advertised);
+        session_cfg.mac_address_format = self.network.mac_address_format;
         let fsm = RouterSessionFsm::with_config(session_cfg);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
