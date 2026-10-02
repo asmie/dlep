@@ -1,0 +1,43 @@
+name: Dependency audit
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '**/Cargo.toml'
+      - Cargo.lock
+      - .cargo/audit.toml
+      - .github/scripts/check-audit-exception.py
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - Cargo.lock
+      - .cargo/audit.toml
+      - .github/scripts/check-audit-exception.py
+      - .github/workflows/audit.yml
+  # Detect new RustSec advisories even when the lockfile has not changed.
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Verify the narrowly scoped time advisory exception
+        run: cargo metadata --locked --all-features --format-version 1 | python3 .github/scripts/check-audit-exception.py
+      - run: cargo audit --deny warnings

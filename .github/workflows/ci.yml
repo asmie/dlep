@@ -5,6 +5,13 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,16 +19,22 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: actionlint@1.7.12
+      - run: actionlint
       - run: cargo fmt --all -- --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,6 +46,7 @@ jobs:
   test:
     name: build & test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,14 +57,53 @@ jobs:
       - name: Test with strict GTSM in an isolated network namespace
         run: |
           sudo env "PATH=$PATH" "RUSTUP_HOME=$HOME/.rustup" "CARGO_HOME=$HOME/.cargo" \
-            unshare --net sh -c '
-              set -e
-              ip link set lo up
-              ip link add dlep-test type dummy
-              ip addr add 192.0.2.1/24 dev dlep-test
-              ip link set dlep-test up multicast on
-              ip -6 addr add fe80::1/64 dev dlep-test nodad
-              ip -6 addr add fd00::1/64 dev dlep-test nodad
-              ip route add default dev dlep-test
-              cargo test --workspace --locked --offline
-            '
+            bash .github/scripts/test-network.sh cargo test --workspace --locked --offline
+
+  msrv:
+    name: Rust 1.85 minimum supported version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --all-features --locked
+
+  macos:
+    name: macOS portable protocol crates
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Strict TCP reset monitoring and the transport implementation require
+      # Linux. This job checks portability of the codec, FSM, and plug-in API;
+      # it does not claim macOS daemon support.
+      - run: cargo test -p dlep-core -p dlep-fsm -p dlep-ext --all-features --locked
+
+  coverage:
+    name: Linux workspace coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      # Fetch while networking is available; the test namespace is isolated.
+      - run: cargo fetch --locked
+      - name: Instrument, test with strict GTSM, and generate reports
+        run: |
+          sudo env "PATH=$PATH" "RUSTUP_HOME=$HOME/.rustup" "CARGO_HOME=$HOME/.cargo" \
+            bash .github/scripts/test-network.sh \
+            bash .github/scripts/coverage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-workspace-coverage
+          path: target/coverage/
+          if-no-files-found: error
+          retention-days: 14

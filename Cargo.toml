@@ -30,9 +30,8 @@ tokio-util = { version = "0.7", features = ["codec"] }
 
 # TLS
 tokio-rustls = "0.26"
-rustls = "0.23"
-rustls-pemfile = "2"
-rustls-pki-types = "1"
+rustls = "0.23.45"
+rustls-pki-types = { version = "1.9", features = ["std"] }
 tempfile = "3"
 
 # sockets / os
@@ -48,7 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-anyhow = "1"
+anyhow = "1.0.103"
 
 # internal crates
 dlep-core = { path = "crates/dlep-core", version = "0.1.0" }

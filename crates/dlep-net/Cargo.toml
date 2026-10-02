@@ -14,7 +14,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 socket2.workspace = true
 nix.workspace = true

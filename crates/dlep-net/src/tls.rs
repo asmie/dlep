@@ -5,22 +5,32 @@
 //! without pulling rustls at the CLI layer.
 
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io;
 use std::path::Path;
 
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 pub fn load_certs(path: impl AsRef<Path>) -> io::Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path.as_ref())?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+    CertificateDer::pem_reader_iter(file)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(pem_error)
 }
 
 pub fn load_private_key(path: impl AsRef<Path>) -> io::Result<PrivateKeyDer<'static>> {
     let file = File::open(path.as_ref())?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key found"))
+    PrivateKeyDer::from_pem_reader(file).map_err(pem_error)
+}
+
+fn pem_error(error: PemError) -> io::Error {
+    match error {
+        PemError::Io(error) => error,
+        PemError::NoItemsFound => {
+            io::Error::new(io::ErrorKind::InvalidData, "no private key found")
+        }
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
 }
 
 /// Cert/key generation helpers for integration tests. Gated behind the
@@ -163,6 +173,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::test_helpers::*;
+    use super::{CertificateDer, PemObject, PrivateKeyDer};
 
     #[test]
     fn self_signed_for_ip_round_trips_through_client_and_server_configs() {
@@ -175,14 +186,12 @@ mod tests {
     #[test]
     fn test_pki_exposes_loadable_pem() {
         let pki = self_signed_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let mut reader = std::io::BufReader::new(pki.cert_pem.as_bytes());
-        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(pki.cert_pem.as_bytes())
             .collect::<Result<_, _>>()
             .expect("cert_pem parses");
         assert_eq!(certs.len(), 1);
-        let mut reader = std::io::BufReader::new(pki.key_pem.as_bytes());
-        let key = rustls_pemfile::private_key(&mut reader).expect("key_pem parses");
-        assert!(key.is_some());
+        let key = PrivateKeyDer::from_pem_slice(pki.key_pem.as_bytes()).expect("key_pem parses");
+        assert_eq!(key.secret_der(), pki.key_der.secret_der());
     }
 
     #[test]

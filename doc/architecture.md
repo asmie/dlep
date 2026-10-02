@@ -630,6 +630,20 @@ The order of work was:
     Up/Down hooks with metrics and status snapshots. They also verify public
     events precede hook events and hook-queued messages reach the peer.
 
+28. CI and dependency checks. **Done** — workflows now check Rust 1.85.0
+    across all workspace targets/features, test the portable protocol crates
+    on macOS, validate workflow syntax, collect full Linux workspace coverage,
+    and upload LCOV/HTML/JSON reports. A shared namespace script supplies the
+    IPv4/IPv6 interfaces and privileges needed by strict GTSM tests. The macOS
+    job does not imply support for the Linux-specific daemon transport.
+
+    A scheduled RustSec audit also runs on dependency/policy changes. Its
+    initial findings prompted patched rustls/anyhow versions and replacement
+    of the unmaintained PEM wrapper. The parser-disabled `time` dependency used
+    by certificate helpers has a documented, CI-guarded exception to retain
+    Rust 1.85 compatibility. See `.github/README.md` for job scope, local
+    reproduction, coverage artifacts, and the exception's exact conditions.
+
 ---
 
 ## 10. Open questions / risks
