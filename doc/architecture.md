@@ -387,10 +387,17 @@ to check missing-metadata errors and recovery on the same socket. They exposed
 an error-classification bug: with a selected interface, absent packet info was
 silently treated as traffic from another interface. The receive path now reports
 the missing ingress index before applying the interface filter. Valid traffic
-from other interfaces remains filtered before decoding. The full local suite
-passes **434 tests**; formatting, clippy with warnings denied, and Rust 1.85
-checks for all targets/features also pass. Coverage was not recollected for
-this checkpoint.
+from other interfaces remains filtered before decoding. That checkpoint passed
+434 tests.
+
+Six further regressions cover datagram send backpressure, cancellation,
+short-write/error propagation, and subsequent recovery. The production send
+loop is shared through a private helper with no change to its retry policy.
+Unix datagram sockets supply deterministic kernel backpressure; separate
+IPv4/IPv6 tests exercise real UDP send failures followed by successful discovery
+signals with correct TTL/interface metadata. The full local suite now passes
+**440 tests**; formatting, clippy with warnings denied, and Rust 1.85 checks for
+all targets/features also pass. Coverage was not recollected for these checkpoints.
 
 | Layer | Where | Coverage |
 |---|---|---|

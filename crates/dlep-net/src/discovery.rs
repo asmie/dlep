@@ -227,50 +227,38 @@ impl DiscoverySocket {
         let bytes = signal
             .encode()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        loop {
-            let mut guard = self.fd.writable().await?;
-            match guard.try_io(|inner| {
-                use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg};
-                let nix_addr = SockaddrStorage::from(dest);
-                let info = self.interface.map(|i| nix::libc::in_pktinfo {
-                    ipi_ifindex: i.index as _,
-                    ipi_spec_dst: nix::libc::in_addr {
-                        s_addr: u32::from_ne_bytes(i.address.octets()),
-                    },
-                    ipi_addr: nix::libc::in_addr { s_addr: 0 },
-                });
-                let info_v6 = self.interface_v6.map(|i| nix::libc::in6_pktinfo {
-                    ipi6_ifindex: i.index,
-                    ipi6_addr: nix::libc::in6_addr {
-                        s6_addr: i.address.octets(),
-                    },
-                });
-                let controls: Vec<_> = info
-                    .as_ref()
-                    .map(ControlMessage::Ipv4PacketInfo)
-                    .into_iter()
-                    .chain(info_v6.as_ref().map(ControlMessage::Ipv6PacketInfo))
-                    .collect();
-                sendmsg(
-                    inner.get_ref().as_raw_fd(),
-                    &[std::io::IoSlice::new(&bytes)],
-                    &controls,
-                    MsgFlags::empty(),
-                    Some(&nix_addr),
-                )
-                .map_err(io::Error::from)
-            }) {
-                Ok(Ok(n)) if n == bytes.len() => return Ok(()),
-                Ok(Ok(n)) => {
-                    return Err(io::Error::other(format!(
-                        "short sendto: {n}/{}",
-                        bytes.len()
-                    )));
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(_would_block) => continue,
-            }
-        }
+        send_datagram(&self.fd, &bytes, |fd, bytes| {
+            use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg};
+            let nix_addr = SockaddrStorage::from(dest);
+            let info = self.interface.map(|i| nix::libc::in_pktinfo {
+                ipi_ifindex: i.index as _,
+                ipi_spec_dst: nix::libc::in_addr {
+                    s_addr: u32::from_ne_bytes(i.address.octets()),
+                },
+                ipi_addr: nix::libc::in_addr { s_addr: 0 },
+            });
+            let info_v6 = self.interface_v6.map(|i| nix::libc::in6_pktinfo {
+                ipi6_ifindex: i.index,
+                ipi6_addr: nix::libc::in6_addr {
+                    s6_addr: i.address.octets(),
+                },
+            });
+            let controls: Vec<_> = info
+                .as_ref()
+                .map(ControlMessage::Ipv4PacketInfo)
+                .into_iter()
+                .chain(info_v6.as_ref().map(ControlMessage::Ipv6PacketInfo))
+                .collect();
+            sendmsg(
+                fd.as_raw_fd(),
+                &[std::io::IoSlice::new(bytes)],
+                &controls,
+                MsgFlags::empty(),
+                Some(&nix_addr),
+            )
+            .map_err(io::Error::from)
+        })
+        .await
     }
 
     /// Receive a single signal with its source address and the
@@ -432,9 +420,209 @@ impl DiscoverySocket {
     }
 }
 
+// Keep the readiness/retry policy separate from sendmsg so tests can exercise
+// real backpressure and inject the short-write/error results UDP rarely emits.
+async fn send_datagram(
+    fd: &AsyncFd<OwnedFd>,
+    bytes: &[u8],
+    mut send: impl FnMut(&OwnedFd, &[u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    loop {
+        let mut guard = fd.writable().await?;
+        match guard.try_io(|inner| send(inner.get_ref(), bytes)) {
+            Ok(Ok(n)) if n == bytes.len() => return Ok(()),
+            Ok(Ok(n)) => {
+                return Err(io::Error::other(format!(
+                    "short sendto: {n}/{}",
+                    bytes.len()
+                )));
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => continue,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn datagram_pair() -> (AsyncFd<OwnedFd>, std::os::unix::net::UnixDatagram) {
+        // Unix datagrams provide deterministic kernel backpressure on loopback;
+        // UDP may drop packets instead of filling the sender's queue.
+        let (sender, receiver) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        socket2::SockRef::from(&sender)
+            .set_send_buffer_size(4096)
+            .unwrap();
+        (AsyncFd::new(sender.into()).unwrap(), receiver)
+    }
+
+    async fn fill_datagram_queue(fd: &AsyncFd<OwnedFd>) -> usize {
+        // Prime cached readiness, then fill the kernel queue without clearing
+        // it. The next real send must hit EAGAIN inside AsyncFd::try_io.
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(2), fd.writable())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        for queued in 0..1024 {
+            match socket2::SockRef::from(fd.get_ref()).send(b"queued") {
+                Ok(n) => assert_eq!(n, 6),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(queued > 0);
+                    return queued;
+                }
+                Err(e) => panic!("filling datagram queue: {e}"),
+            }
+        }
+        panic!("datagram queue did not fill within the test bound");
+    }
+
+    fn drain_datagram_queue(receiver: &std::os::unix::net::UnixDatagram, queued: usize) {
+        let mut buf = [0; 128];
+        for _ in 0..queued {
+            let n = receiver.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"queued");
+        }
+        assert_eq!(
+            receiver.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    async fn blocked_datagram_send(cancel: bool) {
+        use std::cell::Cell;
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let (fd, receiver) = datagram_pair();
+        let queued = fill_datagram_queue(&fd).await;
+        let bytes = Signal::new(dlep_core::SignalType::PEER_DISCOVERY)
+            .encode()
+            .unwrap();
+        let attempts = Cell::new(0);
+        let mut send = Box::pin(send_datagram(&fd, &bytes, |fd, bytes| {
+            attempts.set(attempts.get() + 1);
+            socket2::SockRef::from(fd).send(bytes)
+        }));
+        // A full queue must suspend the future, not spin or report success.
+        poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(attempts.get(), 1, "expected one failed kernel send");
+        if cancel {
+            drop(send);
+            drain_datagram_queue(&receiver, queued);
+            // Deliver readiness after cancellation; there is no detached retry.
+            tokio::task::yield_now().await;
+            assert_eq!(attempts.get(), 1);
+            let mut buf = [0; 128];
+            assert_eq!(
+                receiver.recv(&mut buf).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                send_datagram(&fd, &bytes, |fd, bytes| {
+                    socket2::SockRef::from(fd).send(bytes)
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        } else {
+            drain_datagram_queue(&receiver, queued);
+            tokio::time::timeout(Duration::from_secs(2), send)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(attempts.get(), 2, "retry only after the queue is drained");
+        }
+        let mut buf = [0; 128];
+        let n = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &bytes[..], "one complete datagram");
+        assert_eq!(
+            receiver.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "must not send duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn datagram_send_waits_for_writable_after_would_block() {
+        blocked_datagram_send(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_blocked_datagram_send_does_not_transmit() {
+        blocked_datagram_send(true).await;
+    }
+
+    async fn rejected_datagram_send_recovers(result: io::Result<usize>) -> io::Error {
+        use std::time::Duration;
+        let (fd, receiver) = datagram_pair();
+        let bytes = Signal::new(dlep_core::SignalType::PEER_DISCOVERY)
+            .encode()
+            .unwrap();
+        let mut result = Some(result);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_datagram(&fd, &bytes, |_, _| {
+                result
+                    .take()
+                    .expect("must not retry short sends or I/O errors")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(result.is_none(), "must attempt the send");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            send_datagram(&fd, &bytes, |fd, bytes| {
+                socket2::SockRef::from(fd).send(bytes)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut buf = [0; 128];
+        let n = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &bytes[..]);
+        assert_eq!(
+            receiver.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        error
+    }
+
+    #[tokio::test]
+    async fn datagram_short_send_errors_do_not_retry() {
+        let len = Signal::new(dlep_core::SignalType::PEER_DISCOVERY)
+            .encode()
+            .unwrap()
+            .len();
+        for sent in [0, len - 1] {
+            let error = rejected_datagram_send_recovers(Ok(sent)).await;
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(error.to_string().contains("short sendto"));
+        }
+    }
+
+    #[tokio::test]
+    async fn datagram_send_syscall_errors_propagate_without_retry() {
+        for errno in [nix::libc::EACCES, nix::libc::ENETUNREACH, nix::libc::EINTR] {
+            let error =
+                rejected_datagram_send_recovers(Err(io::Error::from_raw_os_error(errno))).await;
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+    }
 
     fn loopback_params(port: u16) -> DiscoveryParams {
         DiscoveryParams {
@@ -445,6 +633,63 @@ mod tests {
             multicast_loop: true,
             join_group: true,
         }
+    }
+
+    async fn udp_send_error_preserves_socket(ip: IpAddr) {
+        use crate::addr::InterfaceSpec;
+        use dlep_core::SignalType;
+        use std::time::Duration;
+
+        let socket = match ip {
+            IpAddr::V4(_) => DiscoverySocket::bind(&loopback_params(0)).unwrap(),
+            IpAddr::V6(local_address) => DiscoverySocket::bind_v6(
+                &DiscoveryParamsV6 {
+                    group: "ff02::1:7".parse().unwrap(),
+                    local_address,
+                    port: 0,
+                    group_port: None,
+                    multicast_loop: true,
+                    join_group: false,
+                },
+                &InterfaceSpec::Any,
+            )
+            .unwrap(),
+        };
+        let signal = Signal::new(SignalType::PEER_DISCOVERY);
+        // Linux rejects destination port zero in the real sendmsg syscall.
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            socket.send_unicast(&signal, SocketAddr::new(ip, 0)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EINVAL));
+        let dest = SocketAddr::new(ip, socket.local_port());
+        tokio::time::timeout(Duration::from_secs(2), socket.send_unicast(&signal, dest))
+            .await
+            .unwrap()
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), socket.recv_with_metadata())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.signal.signal_type, signal.signal_type);
+        assert!(received.signal.data_items.is_empty());
+        assert_eq!(received.from, dest);
+        assert_eq!(received.local_addr, ip);
+        assert_eq!(received.ttl, 255);
+        assert_eq!(Some(received.interface_index), socket.interface_index());
+    }
+
+    #[tokio::test]
+    async fn ipv4_send_error_preserves_socket_for_next_datagram() {
+        udp_send_error_preserves_socket(Ipv4Addr::LOCALHOST.into()).await;
+    }
+
+    #[tokio::test]
+    async fn ipv6_send_error_preserves_socket_for_next_datagram() {
+        udp_send_error_preserves_socket(Ipv6Addr::LOCALHOST.into()).await;
     }
 
     #[derive(Clone, Copy)]
