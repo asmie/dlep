@@ -147,7 +147,7 @@ preferred, then the lowest usable address. The modem replaces a wildcard
 Connection Point with that unicast address, and the router supplies the local
 interface scope when connecting to link-local endpoints. A link-local TCP
 listener also obtains its scope from the interface. Both multicast and unicast
-signals use hop limit 255, with received hop limits checked before FSM input.
+signals use hop limit 255, with received hop limits checked before decoding.
 Use a multicast-capable interface for IPv6 discovery; Linux loopback alone does
 not provide the link multicast route.
 
@@ -193,7 +193,10 @@ Do **not** run the daemons as root.
 | router → modem | TCP | 854 | DLEP session (TLS) |
 
 Discovery sends with TTL 255 and drops discovery packets whose TTL is not 255 (GTSM, RFC 5082) —
-discovery only works between directly-connected (one-hop) peers.
+discovery only works between directly-connected (one-hop) peers. The receive
+socket filters TTL/hop limit before decoding. Malformed or truncated signals
+are discarded without delaying other peers or producing a warning per packet.
+Socket errors use a receive retry delay while timers and shutdown remain active.
 
 Strict TCP GTSM also requires `CAP_NET_RAW` on Linux to monitor rejected packets
 and reset the affected connection immediately (RFC 8175 §14). The sample

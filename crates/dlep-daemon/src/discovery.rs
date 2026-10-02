@@ -18,7 +18,6 @@ use std::time::Duration;
 use dlep_fsm::events::{EmittedEvent, FsmAction, FsmEvent, SendTarget};
 use dlep_fsm::{TimerId, TimerKind};
 use dlep_net::discovery::DiscoverySocket;
-use dlep_net::gtsm;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -97,6 +96,7 @@ pub async fn run_discovery<F: DiscoveryFsm>(
     // depth: discovery fires at most one timer per period, and the select
     // loop drains expiries promptly.
     let (timer_tx, mut timer_rx) = mpsc::channel::<(TimerId, TimerKind)>(8);
+    let mut receive_after = tokio::time::Instant::now();
 
     if let Some(event) = initial_event {
         let actions = fsm.step(event);
@@ -105,20 +105,27 @@ pub async fn run_discovery<F: DiscoveryFsm>(
 
     loop {
         tokio::select! {
-            res = socket.recv_with_local() => {
+            res = async {
+                // Back off only socket failures, without blocking timers or
+                // shutdown while waiting to retry the receive operation.
+                tokio::time::sleep_until(receive_after).await;
+                socket.recv_with_local().await
+            } => {
                 match res {
-                    Ok((signal, from, ttl, local)) => {
-                        if !gtsm::is_gtsm_valid(ttl) {
-                            debug!(?from, ttl, "dropping non-GTSM discovery datagram");
-                            continue;
-                        }
+                    Ok((signal, from, _ttl, local)) => {
                         let actions = fsm.step(FsmEvent::RecvSignal { signal, from });
                         process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local)).await?;
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        // A peer controls its datagram contents. Malformed
+                        // packets must not impose a retry delay or warning log
+                        // on other peers sharing discovery.
+                        debug!("dropping malformed discovery datagram: {e}");
+                        tokio::task::yield_now().await;
+                    }
                     Err(e) => {
                         warn!("discovery recv error: {e}");
-                        // Brief backoff so a persistent failure doesn't hot-loop.
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        receive_after = tokio::time::Instant::now() + Duration::from_millis(100);
                     }
                 }
             }

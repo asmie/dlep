@@ -104,7 +104,7 @@ Everything that touches the operating system. Built on Tokio.
 | `transport.rs` | `Transport` trait (`AsyncRead + AsyncWrite + Unpin + Send + 'static` plus `peer_addr`/`local_addr`/`is_tls`). `Connector` and `Acceptor` produce `Box<dyn Transport>` for either plain TCP or TLS. |
 | `tls.rs` | rustls helpers: `load_certs`, `load_private_key`, placeholder `client_config_placeholder`. |
 | `framed.rs` | `MessageCodec` and `SignalCodec` — `tokio_util::codec::{Decoder, Encoder}` adapters over the byte-level codec from `dlep-core`. |
-| `discovery.rs` | `DiscoverySocket`: builds a UDP/v4 socket via `socket2` with SO_REUSEADDR/REUSEPORT, optional multicast group join, sets IP_TTL=255 and IP_RECVTTL (GTSM), wraps the fd in `AsyncFd`. Sends via `nix::sendto` (both group and unicast); receives via `nix::recvmsg` extracting the inbound TTL from `IP_TTL` cmsg ancillary data so the daemon can drop non-GTSM packets. |
+| `discovery.rs` | `DiscoverySocket`: builds UDP IPv4/IPv6 sockets via `socket2`, selects multicast membership and interface, and sends with TTL/hop limit 255 using `nix::sendmsg`. `recvmsg` extracts ancillary interface and TTL/hop-limit data; the socket filters disallowed interfaces and non-255 TTLs before decoding. Malformed/truncated datagrams return `InvalidData`, separately from socket failures. |
 | `gtsm.rs` | RFC 5082 helpers: `REQUIRED_TTL = 255`, `set_send_ttl` (configures IP_TTL/IP_MULTICAST_TTL on `socket2::Socket`), `enable_recv_ttl` (enables IP_RECVTTL via `nix::setsockopt`), `is_gtsm_valid` for inbound checks. |
 | `addr.rs` | `InterfaceSpec` (by name / index / any) and `PeerAddr` convenience wrappers. |
 | `lib.rs` | Re-exports `MessageCodec`, `SignalCodec`, `Transport`, `Connector`, `Acceptor`, `TransportKind`, plus `rustls::{ClientConfig, ServerConfig}` so consumers have a single import site for TLS configuration. |
@@ -217,8 +217,8 @@ The public event channel is a `tokio::sync::broadcast` — fan-out, lossy on slo
 
 ### 5.10 GTSM (RFC 5082)
 
-IPv4 UDP discovery sends with TTL 255 and checks received TTL through ancillary
-data. TCP sockets set TTL/hop limit 255 before connecting or listening. On Linux,
+IPv4/IPv6 UDP discovery sends with TTL/hop limit 255 and checks the received
+value through ancillary data before decoding signals. TCP sockets set TTL/hop limit 255 before connecting or listening. On Linux,
 `gtsm_enforce` additionally configures `IP_MINTTL` / `IPV6_MINHOPCOUNT` so the
 kernel rejects lower-TTL TCP segments, including handshake traffic. Other
 platforms fail explicitly when TCP enforcement is requested.
@@ -507,6 +507,19 @@ The order of work was:
     cover invalid values, accepted boundaries, file-path diagnostics, preserved
     values through serialization, examples, and both actual `--check-config`
     executables. Existing timer defaults are unchanged.
+
+20. Discovery junk-packet handling. **Done** — TTL/hop-limit filtering now runs
+    in the socket before signal decoding. Malformed and truncated datagrams
+    return `InvalidData`; the runtime discards them without per-packet sleeps
+    or warning logs. Only socket failures trigger receive backoff, with the
+    delay inside the receive branch so timers and shutdown stay selectable.
+    Rejected traffic yields cooperatively instead of monopolizing the task.
+
+    Socket regressions cover malformed and valid low-TTL packets, valid traffic
+    behind them, and truncated datagrams for both IPv4 and IPv6. Runtime tests
+    queue junk before valid modem probes/router offers, then verify periodic
+    discovery resends and shutdown under ongoing low-TTL and malformed on-link
+    traffic.
 
 ---
 

@@ -261,21 +261,24 @@ impl DiscoverySocket {
     }
 
     /// Receive a single signal with its source address and the
-    /// kernel-reported IPv4 TTL or IPv6 hop limit. Missing ancillary data
-    /// is an error; callers must validate the value before processing it.
+    /// kernel-reported IPv4 TTL or IPv6 hop limit. Packets with a value other
+    /// than 255 are discarded before decoding. Missing ancillary data is an
+    /// error; a missing TTL is never assumed valid.
     pub async fn recv(&self) -> io::Result<(Signal, SocketAddr, u8)> {
         let (signal, from, ttl, _) = self.recv_with_local().await?;
         Ok((signal, from, ttl))
     }
 
     /// Receive with a usable local unicast address for wildcard Peer Offers.
-    /// IPv6 senders retain their link-local interface scope.
+    /// IPv6 senders retain their link-local interface scope. Invalid TTL/hop
+    /// limits are filtered before decoding. Malformed or truncated packets
+    /// return `InvalidData`; callers may immediately receive the next packet.
     pub async fn recv_with_local(&self) -> io::Result<(Signal, SocketAddr, u8, IpAddr)> {
         use bytes::BytesMut;
         use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 
-        // 1500 ≈ standard Ethernet MTU; DLEP signals fit easily. The
-        // datagram boundary is authoritative, so a fixed buffer is fine.
+        // Bound discovery packet storage to one standard Ethernet MTU.
+        // Reject MSG_TRUNC rather than decoding an incomplete datagram.
         // Hoisted above the retry loop so an EAGAIN spin doesn't re-allocate.
         // IP_TTL cmsg payload is `int` on Linux (`ControlMessageOwned::Ipv4Ttl(i32)`);
         // `i32` matches `libc::c_int` on every supported target, keeping
@@ -295,6 +298,15 @@ impl DiscoverySocket {
                     MsgFlags::empty(),
                 )
                 .map_err(io::Error::from)?;
+                if res
+                    .flags
+                    .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated discovery datagram or ancillary data",
+                    ));
+                }
                 let bytes_read = res.bytes;
                 let mut from: SocketAddr = res
                     .address
@@ -359,6 +371,12 @@ impl DiscoverySocket {
                     let ttl = ttl_opt.ok_or_else(|| {
                         io::Error::other("recvmsg returned no TTL/hop-limit control message")
                     })?;
+                    if !gtsm::is_gtsm_valid(ttl) {
+                        // Do not decode off-link traffic or let a perpetually
+                        // readable socket monopolize the discovery task.
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     let buf = BytesMut::from(&payload[..bytes_read]);
                     let signal = self
                         .codec
@@ -393,6 +411,99 @@ mod tests {
             multicast_loop: true,
             join_group: true,
         }
+    }
+
+    async fn rejects_bad_packets_before_accepting_valid_signal(ip: IpAddr) {
+        use crate::addr::InterfaceSpec;
+        use dlep_core::{DataItem, SignalType};
+        use std::time::Duration;
+        let receiver = match ip {
+            IpAddr::V4(_) => DiscoverySocket::bind(&loopback_params(0)).unwrap(),
+            IpAddr::V6(local_address) => DiscoverySocket::bind_v6(
+                &DiscoveryParamsV6 {
+                    group: "ff02::1:7".parse().unwrap(),
+                    local_address,
+                    port: 0,
+                    group_port: None,
+                    multicast_loop: true,
+                    join_group: false,
+                },
+                &InterfaceSpec::Any,
+            )
+            .unwrap(),
+        };
+        let sender = std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let dest = SocketAddr::new(ip, receiver.local_port());
+        let set_hops = |hops| {
+            let socket = socket2::SockRef::from(&sender);
+            if ip.is_ipv6() {
+                socket.set_unicast_hops_v6(hops).unwrap();
+            } else {
+                socket.set_ttl(hops).unwrap();
+            }
+        };
+        let valid = Signal::new(SignalType::PEER_DISCOVERY).encode().unwrap();
+        set_hops(254);
+        // If decoding happens before GTSM, the first packet returns an error.
+        sender.send_to(b"invalid signal", dest).unwrap();
+        sender
+            .send_to(&Signal::new(SignalType::PEER_OFFER).encode().unwrap(), dest)
+            .unwrap();
+        set_hops(255);
+        sender.send_to(&valid, dest).unwrap();
+        let (signal, _, hops) = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal.signal_type, SignalType::PEER_DISCOVERY);
+        assert_eq!(hops, 255);
+
+        // On-link malformed packets remain distinguishable from socket errors.
+        sender.send_to(b"invalid signal", dest).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // A complete-looking prefix must not hide bytes truncated by recvmsg.
+        let mut truncated = Signal::new(SignalType::PEER_DISCOVERY)
+            .with_item(DataItem::PeerType {
+                flags: Default::default(),
+                description: "x".repeat(1487),
+            })
+            .encode()
+            .unwrap()
+            .to_vec();
+        assert_eq!(truncated.len(), 1500);
+        truncated.push(0);
+        sender.send_to(&truncated, dest).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated"));
+        sender.send_to(&valid, dest).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .signal_type,
+            SignalType::PEER_DISCOVERY
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv4_filters_ttl_before_decode_and_rejects_truncation() {
+        rejects_bad_packets_before_accepting_valid_signal(Ipv4Addr::LOCALHOST.into()).await;
+    }
+
+    #[tokio::test]
+    async fn ipv6_filters_hop_limit_before_decode_and_rejects_truncation() {
+        rejects_bad_packets_before_accepting_valid_signal(Ipv6Addr::LOCALHOST.into()).await;
     }
 
     #[cfg(target_os = "linux")]
@@ -452,18 +563,21 @@ mod tests {
             from,
             SocketAddrV6::new(iface.address, modem.local_port(), 0, iface.index).into()
         );
-        // Receive the actual hop limit, including invalid GTSM values; the
-        // daemon uses this metadata to discard non-255 discovery signals.
+        // A low-hop-limit signal is discarded before the valid one behind it.
         socket2::SockRef::from(router.fd.get_ref())
             .set_multicast_hops_v6(254)
             .unwrap();
+        router.send_to_group(&offer).await.unwrap();
+        socket2::SockRef::from(router.fd.get_ref())
+            .set_multicast_hops_v6(255)
+            .unwrap();
         router.send_to_group(&discovery).await.unwrap();
-        let (_, _, hops) = tokio::time::timeout(Duration::from_secs(2), modem.recv())
+        let (signal, _, hops) = tokio::time::timeout(Duration::from_secs(2), modem.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(hops, 254);
-        assert!(!gtsm::is_gtsm_valid(hops));
+        assert_eq!(signal.signal_type, discovery.signal_type);
+        assert_eq!(hops, 255);
         assert!(
             router
                 .send_unicast(&discovery, "127.0.0.1:854".parse().unwrap())

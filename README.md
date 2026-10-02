@@ -269,7 +269,8 @@ With `gtsm_enforce = true`, the kernel filters lower-TTL traffic and a packet
 monitor immediately resets the affected connection. This requires `CAP_NET_RAW`;
 missing privileges fail explicitly. The supplied systemd units grant it.
 Setting `gtsm_enforce = false` disables TCP receive enforcement for development;
-outbound TTL remains 255 and discovery still checks inbound TTL.
+outbound TTL remains 255 and discovery still checks inbound TTL before decoding.
+Malformed discovery packets are discarded without a per-packet retry delay.
 
 The network tests exercise strict enforcement. On Linux, run them in an isolated
 network namespace (requires unprivileged user namespaces and `iproute2`):
