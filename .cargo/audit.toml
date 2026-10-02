@@ -1,0 +1,13 @@
+# Commit this file with the CI configuration; an untracked local policy does
+# not reach GitHub Actions. CI verifies its presence and exact ignore list.
+[advisories]
+ignore = [
+    # time 0.3.45 is pulled in only by rcgen/yasna for certificate test helpers.
+    # RUSTSEC-2026-0009 affects RFC 2822 parsing; time's `parsing` feature is
+    # disabled in this workspace, including --all-features. The fixed release
+    # (0.3.47) requires Rust 1.88, above our Rust 1.85 MSRV.
+    # .github/scripts/check-audit-exception.py enforces this scope in CI.
+    # Remove this exception when the MSRV or certificate helper changes.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0009
+    "RUSTSEC-2026-0009",
+]

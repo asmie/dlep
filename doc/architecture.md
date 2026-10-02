@@ -345,11 +345,14 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
-The last validated suite contains **427 passing tests**, including monitor,
-IPv6 extension-parser, and discovery failure regressions. The earlier 389-test coverage run measured
-**94.3% lines, 93.3% regions, and 94.5% functions**; these are a snapshot,
-not a conformance score or a coverage gate. Coverage was not recollected for
-this checkpoint. Reports are produced on each CI run.
+The [CI coverage run for `5ce40a7`](https://github.com/asmie/dlep/actions/runs/37047900385)
+passed **427 tests** and successfully uploaded its reports. It measured
+**95.05% lines, 94.08% regions, and 94.89% functions**. Excluding inline test
+code and certificate helpers gives an estimated **94.04% production-line
+coverage**. Branch coverage was not collected. These are a snapshot, not a
+conformance score or a coverage gate. The review report records the calculation
+and remaining blind spots. This CI run still failed its audit-policy presence
+check because `.cargo/audit.toml` was not included in the commit.
 
 | Layer | Where | Coverage |
 |---|---|---|
