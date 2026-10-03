@@ -138,6 +138,28 @@ unshare --user --map-root-user bash .github/scripts/test-network.sh \
   cargo test --workspace --locked --offline
 ```
 
+The normal workspace and coverage runs include `dlep-daemon/tests/churn.rs`.
+It keeps the same daemons alive for 100 successive sessions per address family
+(200 total), alternates termination initiators, and reuses destination MACs
+within and across sessions. It checks exact metrics and event attribution,
+stale session-ID rejection, retained connection state, capacity recovery, and
+file descriptors returning to baseline after every session and daemon shutdown.
+Strict TCP GTSM remains enabled. Its transaction barriers wait for protocol
+responses rather than assuming a delay is sufficient. Each cycle has a deadline.
+
+For a longer local run, increase the positive per-family cycle count:
+
+```sh
+unshare --user --map-root-user bash .github/scripts/test-network.sh \
+  env DLEP_CHURN_CYCLES=1000 \
+  cargo test -p dlep-daemon --test churn --locked --offline -- --nocapture
+```
+
+This is bounded sequential plaintext churn, not a multi-day soak, simultaneous
+client load test, TLS churn check, or heap-leak measurement. Descriptor accounting
+uses Linux `/proc/self/fd`; keep this as the only test in its integration-test
+binary so concurrent cases cannot invalidate its baseline.
+
 Coverage uses cargo-llvm-cov 0.9.1 and the matching toolchain's
 `llvm-tools-preview` component. To reproduce the CI run:
 

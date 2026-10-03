@@ -411,7 +411,7 @@ initialization decode errors, fatal response status echoing, and repeated decode
 errors during and after teardown. They check heartbeat negotiation, preservation
 of the original failure reason, and a single SessionDown notification through
 real initialization transitions. Production behavior is unchanged.
-The full local suite now passes **448 tests**; formatting, clippy with warnings
+That checkpoint's full local suite passed **448 tests**; formatting, clippy with warnings
 denied, and Rust 1.85 checks for all targets/features also pass. Coverage was not
 recollected for these checkpoints.
 
@@ -439,8 +439,20 @@ complete link replies are supplied through the peer's documented CLI. TCP
 capture checks require actual termination responses and bidirectional
 heartbeats. See [setup and qualifications](../.github/README.md#independent-modem-interoperability).
 Neither peer check establishes discovery, IPv6, TLS, extension negotiation, or
-stock-configuration compatibility. Sustained churn and dedicated `cargo-fuzz`
-targets remain separate validation gaps.
+stock-configuration compatibility.
+
+A bounded churn regression now keeps each pair of daemons alive through 100
+IPv4 and 100 IPv6 sessions, alternating termination initiators with strict GTSM
+enabled. It reuses MACs within and across sessions, checks exact destination
+metrics and peer/session attribution, rejects stale session commands, and verifies
+connection capacity and descriptor cleanup after every session. The default run
+checks 6,600 Up, 6,400 Update, and 3,200 Down events, plus transaction barriers and
+session lifecycle events. No production changes were needed. The full suite now
+passes **449 tests**, with formatting, clippy, and Rust 1.85 checks also passing.
+See [local reproduction](../.github/README.md#network-tests-and-coverage) to increase
+the cycle count. This does not measure heap growth, simultaneous clients, TLS
+churn, or multi-day stability. Dedicated `cargo-fuzz` targets remain a validation
+gap; coverage percentages have not been recollected for this checkpoint.
 
 See [CI documentation](../.github/README.md) for exact jobs and reproduction
 commands. Linux tests run in a disposable network namespace with strict GTSM
