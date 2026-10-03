@@ -62,6 +62,66 @@ with an independent modem, or arbitrary implementations. The namespace TTL
 setting is necessary for this peer; this is not an out-of-box deployment test.
 Session Update and link-characteristics exchanges are outside these scenarios.
 
+## Independent modem interoperability
+
+The MIT LL-DLEP job runs our router against
+[LL-DLEP](https://github.com/mit-ll/LL-DLEP) revision
+`184e148ae4747dee11263a7ccedf952e36861ec0`. A digest-pinned Ubuntu 24.04 container
+builds the upstream executable with its dependencies. No host packages are
+installed. Compiler warnings are allowed, and `-include map` supplies a standard
+header missing from the upstream example client; protocol source is unchanged.
+
+```sh
+cargo build -p dlep-daemon --example interop_router --locked
+docker build -t dlep-interop-ll:184e148 .github/interop/ll-dlep
+bash .github/scripts/interop-ll-dlep.sh
+```
+
+Docker is required. The Rust fixture must run on Ubuntu 24.04's libc; CI builds
+it on an Ubuntu 24.04 runner. The local tested binary requires GLIBC 2.38 and
+runs on the container's GLIBC 2.39. A binary built on a newer host may need
+rebuilding in a compatible environment.
+
+The runtime container has no external network, a read-only repository mount,
+and a writable `target/interop-ll-dlep/` artifact mount. It drops capabilities
+except NET_RAW (strict GTSM and capture) and DAC_OVERRIDE (writing the mounted
+artifact directory). It sets TTL 255 only in the container: LL-DLEP configures
+TCP TTL after acceptance, so its SYN-ACK otherwise uses the system default.
+The host's network settings are unaffected. Artifacts can be root-owned locally;
+CI returns their ownership before upload.
+
+Two scenarios check initialization, destination Up/Update/Down, session-wide
+metric updates, complete Link Characteristics Request/Response, bidirectional
+periodic heartbeats, and termination initiated by each peer. Assertions check
+the router's public events and exact metrics, as well as independent modem
+logs. Each session emits one SessionDown. PCAPs, the generated core profile,
+both peer logs, and `summary.json` are uploaded as `ll-dlep-interoperability`.
+The Cargo test count excludes these external scenarios.
+
+These are qualified static IPv4 plaintext results. Three upstream example
+behaviors required explicit configuration, without relaxing our validation:
+
+- The default XML profile includes experimental extensions and emits a Latency
+  Range item without advertising it. Our router rejected initialization with
+  status 130. The harness copies the core profile and removes its two XInclude
+  extension entries through the supported protocol-configuration mechanism.
+- The example's automatic link reply echoes only the requested metrics. Our
+  router rejected that incomplete response with status 130. The harness disables
+  `linkchar-autoreply` and supplies every supported metric via the upstream
+  `linkchar reply` CLI, as required by
+  [RFC 8175 §12.19](https://www.rfc-editor.org/rfc/rfc8175.html#section-12.19).
+- The XML profile omits the RFC's Shutting Down status 255. Without it, LL-DLEP
+  rejects our termination and our router can time out waiting for a response.
+  The generated profile adds that standard status with failure mode `terminate`.
+  Capture assertions require the actual termination request and response in
+  both scenarios, so a TCP disconnect alone cannot pass the test.
+
+Discovery, IPv6, TLS, extension negotiation, and interoperability with arbitrary
+peers remain outside these scenarios. This is not a stock-configuration
+deployment test; the TTL setting, corrected core profile, and explicit link
+reply matter. The PCAP checks also reconstruct each direction's TCP payload,
+reject capture gaps, and require at least two Heartbeats in each direction.
+
 ## Network tests and coverage
 
 Both Linux test jobs use `scripts/test-network.sh`. It creates a disposable

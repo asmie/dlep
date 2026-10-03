@@ -101,6 +101,34 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  independent_modem:
+    name: Independent MIT LL-DLEP modem
+    # Match the container's libc when building the Rust fixture on the runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p dlep-daemon --example interop_router --locked
+      - name: Build pinned independent modem
+        run: docker build -t dlep-interop-ll:184e148 .github/interop/ll-dlep
+      - name: Exercise router against independent modem
+        run: bash .github/scripts/interop-ll-dlep.sh
+      - name: Return interoperability artifacts to the runner user
+        if: always()
+        run: |
+          if test -d target/interop-ll-dlep; then
+            sudo chown -R "$(id -u):$(id -g)" target/interop-ll-dlep
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ll-dlep-interoperability
+          path: target/interop-ll-dlep/
+          if-no-files-found: warn
+          retention-days: 14
+
   msrv:
     name: Rust 1.85 minimum supported version
     runs-on: ubuntu-latest

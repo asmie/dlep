@@ -430,9 +430,17 @@ termination initiated by either side. Loopback PCAPs and both peers' logs are
 retained. Strict GTSM stays enabled; the disposable namespace's default TTL is
 set to 255 because the independent router does not configure it itself.
 See [reproduction and limits](../.github/README.md#independent-router-interoperability).
-This does not validate our router against an independent modem, discovery,
-IPv6, TLS, session updates, or link-characteristics interoperability. Sustained
-churn and dedicated `cargo-fuzz` targets remain separate validation gaps.
+An additional pinned MIT LL-DLEP job checks our router against an independent
+modem in a networkless container. It covers initialization, destination and
+session metric updates, link-characteristics replies, heartbeats, and both
+termination directions. Its generated core profile removes unnegotiated
+experimental items and adds the standard Shutting Down status omitted upstream;
+complete link replies are supplied through the peer's documented CLI. TCP
+capture checks require actual termination responses and bidirectional
+heartbeats. See [setup and qualifications](../.github/README.md#independent-modem-interoperability).
+Neither peer check establishes discovery, IPv6, TLS, extension negotiation, or
+stock-configuration compatibility. Sustained churn and dedicated `cargo-fuzz`
+targets remain separate validation gaps.
 
 See [CI documentation](../.github/README.md) for exact jobs and reproduction
 commands. Linux tests run in a disposable network namespace with strict GTSM
