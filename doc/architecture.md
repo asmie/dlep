@@ -402,8 +402,16 @@ CAP_NET_RAW and verifies that strict connectors and acceptors fail explicitly,
 release their sockets, and require an explicit GTSM opt-out to communicate.
 A locked socket filter forces a real attachment failure and verifies socket
 cleanup and subsequent monitor creation. Both tests exercise IPv4 and IPv6;
-the private setup-helper extraction preserves production behavior.
-The full local suite now passes **442 tests**; formatting, clippy with warnings
+the private setup-helper extraction preserves production behavior. That
+checkpoint passed 442 tests.
+
+Six further FSM regressions cover initialization without optional extensions,
+omission of each required initialization item, modem shutdown before TCP accept,
+initialization decode errors, fatal response status echoing, and repeated decode
+errors during and after teardown. They check heartbeat negotiation, preservation
+of the original failure reason, and a single SessionDown notification through
+real initialization transitions. Production behavior is unchanged.
+The full local suite now passes **448 tests**; formatting, clippy with warnings
 denied, and Rust 1.85 checks for all targets/features also pass. Coverage was not
 recollected for these checkpoints.
 

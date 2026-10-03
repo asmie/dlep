@@ -1,10 +1,15 @@
 //! Regression cases from the RFC 8175 audit. Each session performs the real
 //! initialization exchange rather than bypassing setup by assigning a state.
-use dlep_core::{DataItem, MacAddress, Message, MessageType, Signal, SignalType, StatusCode};
+use dlep_core::{
+    DataItem, DataItemType, MacAddress, Message, MessageType, Signal, SignalType, StatusCode,
+};
 use dlep_fsm::events::EmittedEvent;
 use dlep_fsm::session_modem::{ModemSessionFsm, ModemSessionState};
-use dlep_fsm::session_router::RouterSessionFsm;
-use dlep_fsm::{DestinationAddrs, FsmAction, FsmEvent, LinkMetrics};
+use dlep_fsm::session_router::{RouterSessionFsm, RouterSessionState};
+use dlep_fsm::{
+    DestinationAddrs, FsmAction, FsmEvent, LinkMetrics, SessionConfig, TIMER_HEARTBEAT,
+    TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION, TimerKind,
+};
 use std::time::Duration;
 
 fn mac() -> MacAddress {
@@ -428,4 +433,283 @@ fn modem_termination_timeout_closes_once_and_reports_timeout() {
         )))
         .is_empty()
     );
+}
+
+#[test]
+fn initialization_without_optional_extensions_preserves_heartbeat_negotiation() {
+    let mut r = RouterSessionFsm::with_config(SessionConfig {
+        heartbeat_interval_ms: 2_000,
+        ..Default::default()
+    });
+    let mut m = ModemSessionFsm::with_config(SessionConfig {
+        heartbeat_interval_ms: 3_000,
+        ..Default::default()
+    });
+    m.step(FsmEvent::TcpAccepted);
+    let mut init = sent(
+        r.step(FsmEvent::TcpConnected),
+        MessageType::SESSION_INITIALIZATION,
+    );
+    init.data_items
+        .retain(|i| i.type_id() != DataItemType::EXTENSIONS_SUPPORTED);
+    let modem_actions = m.step(FsmEvent::RecvMessage(init));
+    let mut response = modem_actions
+        .iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(msg)
+                if msg.message_type == MessageType::SESSION_INITIALIZATION_RESPONSE =>
+            {
+                Some(msg.clone())
+            }
+            _ => None,
+        })
+        .expect("initialization response");
+    response
+        .data_items
+        .retain(|i| i.type_id() != DataItemType::EXTENSIONS_SUPPORTED);
+    let router_actions = r.step(FsmEvent::RecvMessage(response));
+    assert_eq!(r.state(), RouterSessionState::InSession);
+    assert_eq!(m.state(), ModemSessionState::InSession);
+    assert!(r.peer_extensions.is_empty() && m.peer_extensions.is_empty());
+    assert_eq!(r.peer_heartbeat_interval, Some(Duration::from_secs(3)));
+    assert_eq!(m.peer_heartbeat_interval, Some(Duration::from_secs(2)));
+    for (actions, local, peer) in [(router_actions, 2, 3), (modem_actions, 3, 2)] {
+        assert!(actions.iter().any(|a| matches!(a,
+            FsmAction::CancelTimer(id) if *id == TIMER_SESSION_INIT)));
+        assert_eq!(actions.iter().filter(|a| matches!(a,
+            FsmAction::Emit(EmittedEvent::SessionUp { peer_extensions }) if peer_extensions.is_empty())).count(), 1);
+        assert!(actions.iter().any(|a| matches!(a,
+            FsmAction::StartTimer { id: TIMER_HEARTBEAT, kind: TimerKind::Heartbeat, duration, periodic: true }
+                if *duration == Duration::from_secs(local))));
+        assert!(actions.iter().any(|a| matches!(a,
+            FsmAction::ResetHeartbeat { timer_id: TIMER_HEARTBEAT_MISSED, missed_deadline }
+                if *missed_deadline == Duration::from_secs(peer * 2))));
+    }
+}
+
+#[test]
+fn each_required_initialization_item_is_checked_before_session_up() {
+    for missing in [DataItemType::PEER_TYPE, DataItemType::HEARTBEAT_INTERVAL] {
+        let mut r = RouterSessionFsm::new();
+        let mut m = ModemSessionFsm::new();
+        m.step(FsmEvent::TcpAccepted);
+        let mut init = sent(
+            r.step(FsmEvent::TcpConnected),
+            MessageType::SESSION_INITIALIZATION,
+        );
+        init.data_items.retain(|i| i.type_id() != missing);
+        let actions = m.step(FsmEvent::RecvMessage(init));
+        assert_eq!(m.state(), ModemSessionState::Terminated, "{missing:?}");
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [
+                    FsmAction::CancelTimer(TIMER_SESSION_INIT),
+                    FsmAction::CloseTcp,
+                    FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
+                ]
+            ),
+            "{missing:?}: {actions:?}"
+        );
+    }
+    for missing in [
+        DataItemType::STATUS,
+        DataItemType::PEER_TYPE,
+        DataItemType::HEARTBEAT_INTERVAL,
+        DataItemType::MAXIMUM_DATA_RATE_RECEIVE,
+        DataItemType::MAXIMUM_DATA_RATE_TRANSMIT,
+        DataItemType::CURRENT_DATA_RATE_RECEIVE,
+        DataItemType::CURRENT_DATA_RATE_TRANSMIT,
+        DataItemType::LATENCY,
+    ] {
+        let mut r = RouterSessionFsm::new();
+        let mut m = ModemSessionFsm::new();
+        m.step(FsmEvent::TcpAccepted);
+        let init = sent(
+            r.step(FsmEvent::TcpConnected),
+            MessageType::SESSION_INITIALIZATION,
+        );
+        let mut response = sent(
+            m.step(FsmEvent::RecvMessage(init)),
+            MessageType::SESSION_INITIALIZATION_RESPONSE,
+        );
+        response.data_items.retain(|i| i.type_id() != missing);
+        let actions = r.step(FsmEvent::RecvMessage(response));
+        assert_eq!(r.state(), RouterSessionState::Terminating, "{missing:?}");
+        assert!(
+            !actions.iter().any(|a| matches!(a, FsmAction::Emit(_))),
+            "{missing:?}"
+        );
+        let termination = sent(actions, MessageType::SESSION_TERMINATION);
+        assert!(
+            matches!(
+                termination.data_items.as_slice(),
+                [DataItem::Status {
+                    code: StatusCode::INVALID_DATA,
+                    ..
+                }]
+            ),
+            "{missing:?}"
+        );
+        assert_eq!(r.peer_heartbeat_interval, None);
+        assert!(r.peer_extensions.is_empty());
+    }
+}
+
+#[test]
+fn modem_stopped_before_tcp_accept_emits_no_session_lifecycle_events() {
+    for event in [
+        FsmEvent::TcpClosed,
+        FsmEvent::AppShutdown {
+            reason: StatusCode::SHUTTING_DOWN,
+        },
+    ] {
+        let mut m = ModemSessionFsm::new();
+        assert!(m.step(event).is_empty());
+        assert_eq!(m.state(), ModemSessionState::Terminated);
+        assert!(m.step(FsmEvent::TcpAccepted).is_empty());
+        assert!(m.step(FsmEvent::TcpClosed).is_empty());
+        assert_eq!(m.state(), ModemSessionState::Terminated);
+    }
+}
+
+#[test]
+fn initialization_decode_error_closes_modem_without_sending_a_message() {
+    let mut m = ModemSessionFsm::new();
+    m.step(FsmEvent::TcpAccepted);
+    let actions = m.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            FsmAction::CancelTimer(TIMER_SESSION_INIT),
+            FsmAction::CloseTcp,
+            FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
+        ]
+    ));
+    assert_eq!(m.state(), ModemSessionState::Terminated);
+    assert!(
+        m.step(FsmEvent::ProtocolError(StatusCode::UNKNOWN_MESSAGE))
+            .is_empty()
+    );
+    assert!(m.step(FsmEvent::TcpClosed).is_empty());
+    assert!(
+        m.step(FsmEvent::TimerExpired(
+            TIMER_SESSION_INIT,
+            TimerKind::SessionInit
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn modem_echoes_fatal_response_status_and_reports_it_after_acknowledgement() {
+    let (_, mut m) = sessions();
+    sent(
+        m.step(FsmEvent::AppSessionUpdate {
+            metrics: LinkMetrics::default(),
+        }),
+        MessageType::SESSION_UPDATE,
+    );
+    let fatal = DataItem::Status {
+        code: StatusCode::INVALID_DATA,
+        text: "peer rejected update: café".into(),
+    };
+    let actions = m.step(FsmEvent::RecvMessage(
+        Message::new(MessageType::SESSION_UPDATE_RESPONSE).with_item(fatal),
+    ));
+    assert_eq!(m.state(), ModemSessionState::Terminating);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, FsmAction::CloseTcp | FsmAction::Emit(_)))
+    );
+    let termination = sent(actions, MessageType::SESSION_TERMINATION);
+    assert!(matches!(termination.data_items.as_slice(),
+        [DataItem::Status { code: StatusCode::INVALID_DATA, text }]
+            if text == "peer rejected update: café"));
+    let actions = m.step(FsmEvent::RecvMessage(Message::new(
+        MessageType::SESSION_TERMINATION_RESPONSE,
+    )));
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            FsmAction::CancelTimer(TIMER_TERMINATION),
+            FsmAction::CloseTcp,
+            FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
+        ]
+    ));
+    assert_eq!(m.state(), ModemSessionState::Terminated);
+    assert!(m.step(FsmEvent::TcpClosed).is_empty());
+}
+
+#[test]
+fn repeated_decode_errors_do_not_restart_teardown_or_replace_its_reason() {
+    for tcp_closed in [false, true] {
+        let (mut r, mut m) = sessions();
+        let steps: [&mut dyn FnMut(FsmEvent) -> Vec<FsmAction>; 2] =
+            [&mut |event| r.step(event), &mut |event| m.step(event)];
+        for step in steps {
+            let actions = step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
+            assert!(terminates(&actions));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(
+                        a,
+                        FsmAction::StartTimer {
+                            id: TIMER_TERMINATION,
+                            kind: TimerKind::Termination,
+                            periodic: false,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, FsmAction::CloseTcp | FsmAction::Emit(_)))
+            );
+            assert!(step(FsmEvent::ProtocolError(StatusCode::UNKNOWN_MESSAGE)).is_empty());
+            let actions = step(if tcp_closed {
+                FsmEvent::TcpClosed
+            } else {
+                FsmEvent::RecvMessage(Message::new(MessageType::SESSION_TERMINATION_RESPONSE))
+            });
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(
+                        a,
+                        FsmAction::Emit(EmittedEvent::SessionDown(StatusCode::INVALID_DATA))
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, FsmAction::CloseTcp))
+                    .count(),
+                usize::from(!tcp_closed)
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, FsmAction::CancelTimer(TIMER_TERMINATION)))
+            );
+            assert!(step(FsmEvent::ProtocolError(StatusCode::TIMED_OUT)).is_empty());
+            assert!(step(FsmEvent::TcpClosed).is_empty());
+            assert!(
+                step(FsmEvent::TimerExpired(
+                    TIMER_TERMINATION,
+                    TimerKind::Termination
+                ))
+                .is_empty()
+            );
+        }
+        assert_eq!(r.state(), RouterSessionState::Terminated);
+        assert_eq!(m.state(), ModemSessionState::Terminated);
+    }
 }
