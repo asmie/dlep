@@ -395,9 +395,17 @@ short-write/error propagation, and subsequent recovery. The production send
 loop is shared through a private helper with no change to its retry policy.
 Unix datagram sockets supply deterministic kernel backpressure; separate
 IPv4/IPv6 tests exercise real UDP send failures followed by successful discovery
-signals with correct TTL/interface metadata. The full local suite now passes
-**440 tests**; formatting, clippy with warnings denied, and Rust 1.85 checks for
-all targets/features also pass. Coverage was not recollected for these checkpoints.
+signals with correct TTL/interface metadata. That checkpoint passed 440 tests.
+
+Two further regressions cover packet-monitor setup failures. A subprocess loses
+CAP_NET_RAW and verifies that strict connectors and acceptors fail explicitly,
+release their sockets, and require an explicit GTSM opt-out to communicate.
+A locked socket filter forces a real attachment failure and verifies socket
+cleanup and subsequent monitor creation. Both tests exercise IPv4 and IPv6;
+the private setup-helper extraction preserves production behavior.
+The full local suite now passes **442 tests**; formatting, clippy with warnings
+denied, and Rust 1.85 checks for all targets/features also pass. Coverage was not
+recollected for these checkpoints.
 
 | Layer | Where | Coverage |
 |---|---|---|

@@ -48,6 +48,10 @@ mod platform {
                     ),
                 )
             })?;
+            Self::from_socket(socket)
+        }
+
+        fn from_socket(socket: Socket) -> io::Result<Arc<Self>> {
             filter_low_ttl(&socket)?;
             Self::start(socket)
         }
@@ -362,6 +366,133 @@ mod platform {
                 .unwrap();
             let (local, _) = listener.accept().await.unwrap();
             (local, peer)
+        }
+
+        #[tokio::test]
+        async fn missing_packet_privilege_fails_closed_and_allows_explicit_opt_out() {
+            use crate::transport::{Acceptor, Connector};
+            use std::os::unix::process::CommandExt;
+
+            const CHILD: &str = "DLEP_TEST_WITHOUT_CAP_NET_RAW";
+            if std::env::var_os(CHILD).is_none() {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tcp_monitor::platform::tests::missing_packet_privilege_fails_closed_and_allows_explicit_opt_out",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1");
+                // SAFETY: only an async-signal-safe syscall runs between fork
+                // and exec. The child alone loses CAP_NET_RAW (Linux ABI 13)
+                // from its bounding set; exec removes it from effective caps.
+                // The privileged namespace test harness retains CAP_SETPCAP.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::prctl(
+                            libc::PR_CAPBSET_DROP,
+                            13 as libc::c_ulong,
+                            0 as libc::c_ulong,
+                            0 as libc::c_ulong,
+                            0 as libc::c_ulong,
+                        ) < 0
+                        {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "unprivileged child failed:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                // Capability removal must not affect other tests in this process.
+                assert!(Monitor::new().is_ok());
+                return;
+            }
+
+            let assert_denied = |error: io::Error| {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("CAP_NET_RAW"), "{error}");
+            };
+            assert_denied(Monitor::new().err().expect("packet socket must be denied"));
+            for bind in ["127.0.0.1:0", "[::1]:0"] {
+                let listener = TcpListener::bind(bind).await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                assert_denied(
+                    Acceptor::plain(listener)
+                        .err()
+                        .expect("strict acceptor must reject missing privileges"),
+                );
+                // Failed setup owns and closes the original listener.
+                let listener = TcpListener::bind(addr).await.unwrap();
+                assert_denied(
+                    Connector::plain()
+                        .connect(addr)
+                        .await
+                        .err()
+                        .expect("strict connector must reject missing privileges"),
+                );
+                assert!(
+                    timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "failed monitor setup must not initiate a TCP connection"
+                );
+
+                let acceptor = Acceptor::plain_with_gtsm(listener, false).unwrap();
+                let connector = Connector::plain().with_gtsm(false);
+                timeout(Duration::from_secs(2), async {
+                    let (client, server) = tokio::join!(connector.connect(addr), acceptor.accept());
+                    let mut client = client.unwrap();
+                    let mut server = server.unwrap();
+                    client.write_all(b"ok").await.unwrap();
+                    let mut buf = [0; 2];
+                    server.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(&buf, b"ok");
+                })
+                .await
+                .expect("explicit GTSM opt-out must work without packet privileges");
+            }
+        }
+
+        #[tokio::test]
+        async fn filter_setup_failure_releases_socket_and_allows_retry() {
+            for bind in ["127.0.0.1:0", "[::1]:0"] {
+                let addr: SocketAddr = bind.parse().unwrap();
+                // Use a TCP listener so rebinding its port proves that failed
+                // setup closed the owned socket, without fd-reuse races.
+                let socket =
+                    Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+                        .unwrap();
+                socket.bind(&addr.into()).unwrap();
+                socket.listen(1).unwrap();
+                let addr = socket.local_addr().unwrap().as_socket().unwrap();
+                filter_low_ttl(&socket).unwrap();
+                let locked: libc::c_int = 1;
+                // SAFETY: locked is a live integer of the size SO_LOCK_FILTER
+                // expects. The kernel forbids subsequent filter replacement.
+                let result = unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LOCK_FILTER,
+                        (&locked as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&locked) as libc::socklen_t,
+                    )
+                };
+                assert_eq!(result, 0, "{}", io::Error::last_os_error());
+                let error = Monitor::from_socket(socket)
+                    .err()
+                    .expect("locked filter must reject monitor setup");
+                assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+                let _rebound = TcpListener::bind(addr).await.unwrap();
+                assert!(Monitor::new().is_ok());
+            }
         }
 
         #[tokio::test]
