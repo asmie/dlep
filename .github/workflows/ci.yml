@@ -71,6 +71,36 @@ jobs:
           sudo env "PATH=$PATH" "RUSTUP_HOME=$HOME/.rustup" "CARGO_HOME=$HOME/.cargo" \
             bash .github/scripts/test-network.sh cargo test --workspace --locked --offline
 
+  interoperability:
+    name: Independent dlepard router
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pinned independent peer
+        run: |
+          git clone --no-checkout https://github.com/Rohde-Schwarz/dlepard.git "$RUNNER_TEMP/dlepard"
+          git -C "$RUNNER_TEMP/dlepard" checkout --detach 9300773a566290897839b845c4ec9f2feba3e93b
+      - run: cargo build -p dlep-daemon --example interop_modem --locked
+      - name: Exercise destination lifecycle, heartbeats, and both termination directions
+        run: |
+          sudo bash .github/scripts/interop-dlepard.sh --peer-source "$RUNNER_TEMP/dlepard"
+      - name: Return interoperability artifacts to the runner user
+        if: always()
+        run: |
+          if test -d target/interop-dlepard; then
+            sudo chown -R "$(id -u):$(id -g)" target/interop-dlepard
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dlepard-interoperability
+          path: target/interop-dlepard/
+          if-no-files-found: warn
+          retention-days: 14
+
   msrv:
     name: Rust 1.85 minimum supported version
     runs-on: ubuntu-latest

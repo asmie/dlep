@@ -423,9 +423,16 @@ recollected for these checkpoints.
 | Independent peer scenarios | `dlep-daemon/tests/review_regressions.rs`, `termination_timeout.rs` | Malformed input, silent peers, pending requests, bounded writes, and virtual-time termination deadlines. |
 | CLI | binary unit tests and `crates/dlep-{router,modem}/tests/` | Configuration checks, overrides, signals, reconnection/backoff, event-loss recovery, and concurrent connection scheduling. |
 
-Reference-implementation packet captures and dedicated `cargo-fuzz` targets are
-still absent. Property tests and two-daemon loopback tests do not establish
-interoperability with independent DLEP implementations.
+A separate CI job now checks our modem against the pinned, unmodified session
+and codec from Rohde & Schwarz dlepard. Two static IPv4 plaintext scenarios
+cover initialization metrics, Destination Up/Update/Down, heartbeats, and
+termination initiated by either side. Loopback PCAPs and both peers' logs are
+retained. Strict GTSM stays enabled; the disposable namespace's default TTL is
+set to 255 because the independent router does not configure it itself.
+See [reproduction and limits](../.github/README.md#independent-router-interoperability).
+This does not validate our router against an independent modem, discovery,
+IPv6, TLS, session updates, or link-characteristics interoperability. Sustained
+churn and dedicated `cargo-fuzz` targets remain separate validation gaps.
 
 See [CI documentation](../.github/README.md) for exact jobs and reproduction
 commands. Linux tests run in a disposable network namespace with strict GTSM

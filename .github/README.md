@@ -25,6 +25,43 @@ The macOS job covers `dlep-core`, `dlep-fsm`, and `dlep-ext`. It does **not**
 validate the daemons or advertise macOS transport support. Discovery ancillary
 socket handling and strict TCP GTSM reset monitoring currently require Linux.
 
+## Independent router interoperability
+
+The interoperability job runs our modem against the unmodified session and
+codec from [Rohde & Schwarz dlepard](https://github.com/Rohde-Schwarz/dlepard),
+pinned to commit `9300773a566290897839b845c4ec9f2feba3e93b`. It imports those
+modules directly; the upstream REST application and its aiohttp dependency
+are not used. No external Python packages are needed.
+
+```sh
+git clone --no-checkout https://github.com/Rohde-Schwarz/dlepard.git /tmp/dlepard
+git -C /tmp/dlepard checkout --detach 9300773a566290897839b845c4ec9f2feba3e93b
+cargo build -p dlep-daemon --example interop_modem --locked
+unshare --user --map-root-user bash .github/scripts/interop-dlepard.sh \
+  --peer-source /tmp/dlepard
+```
+
+The wrapper creates a disposable network namespace and sets its IPv4 default
+TTL to 255 because dlepard's TCP proxy does not set a socket TTL. The host's
+setting is unaffected, and our modem retains strict GTSM enforcement. The Python
+runner checks the namespace, TTL setting, source revision, and tracked-file
+cleanliness before starting either peer.
+
+Two scenarios verify initialization and exact session metrics, Destination
+Up/Update/Down and their metrics, bidirectional heartbeats, and termination
+initiated by each participant. Assertions inspect dlepard's information base
+and our modem's lifecycle notifications. The Rust fixture uses the public
+daemon API for all traffic; it has no independent wire codec. Bounded waits
+make failures fail the job. Logs, loopback Ethernet PCAP files, and a successful
+run's `summary.json` are saved in `target/interop-dlepard/` and uploaded even if
+the scenario fails (a failed run has no success summary).
+
+This is evidence for static IPv4 TCP sessions with TLS disabled and extensions
+disabled. It does not establish discovery, IPv6, TLS, our router's compatibility
+with an independent modem, or arbitrary implementations. The namespace TTL
+setting is necessary for this peer; this is not an out-of-box deployment test.
+Session Update and link-characteristics exchanges are outside these scenarios.
+
 ## Network tests and coverage
 
 Both Linux test jobs use `scripts/test-network.sh`. It creates a disposable
