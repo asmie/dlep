@@ -1418,3 +1418,45 @@ fn every_termination_path_uses_four_local_heartbeats_or_explicit_override() {
         }
     }
 }
+
+// --- Extensions Supported in Session Initialization (RFC 8175 §12.5) -------
+
+fn router_session_init(config: dlep_fsm::SessionConfig) -> dlep_core::Message {
+    let mut fsm = RouterSessionFsm::with_config(config);
+    fsm.step(FsmEvent::TcpConnected)
+        .into_iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(msg)
+                if msg.message_type == MessageType::SESSION_INITIALIZATION =>
+            {
+                Some(msg)
+            }
+            _ => None,
+        })
+        .expect("expected SendMessage(Session Initialization)")
+}
+
+fn extensions_supported(msg: &dlep_core::Message) -> Option<&Vec<dlep_core::ExtensionId>> {
+    msg.data_items.iter().find_map(|item| match item {
+        DataItem::ExtensionsSupported(ids) => Some(ids),
+        _ => None,
+    })
+}
+
+/// An absent item is how §12.5 says "no extensions"; an empty one is refused
+/// by stricter peers (OONF's dlep_radio resets the session over it).
+#[test]
+fn router_session_init_omits_extensions_supported_when_none_are_advertised() {
+    let msg = router_session_init(dlep_fsm::SessionConfig::default());
+    assert_eq!(extensions_supported(&msg), None);
+}
+
+#[test]
+fn router_session_init_lists_the_extensions_it_advertises() {
+    let ids = vec![dlep_core::ExtensionId(1)];
+    let msg = router_session_init(dlep_fsm::SessionConfig {
+        advertised_extensions: ids.clone(),
+        ..Default::default()
+    });
+    assert_eq!(extensions_supported(&msg), Some(&ids));
+}
