@@ -810,15 +810,18 @@ impl RouterSessionFsm {
 }
 
 fn build_session_initialization(config: &SessionConfig) -> Message {
-    Message::new(MessageType::SESSION_INITIALIZATION)
+    let message = Message::new(MessageType::SESSION_INITIALIZATION)
         .with_item(DataItem::HeartbeatInterval(local_heartbeat_interval(
             config,
         )))
         .with_item(DataItem::PeerType {
             flags: PeerFlags::default(),
             description: config.peer_description.clone(),
-        })
-        .with_item(DataItem::ExtensionsSupported(
-            config.advertised_extensions.clone(),
-        ))
+        });
+    if config.advertised_extensions.is_empty() {
+        return message;
+    }
+    message.with_item(DataItem::ExtensionsSupported(
+        config.advertised_extensions.clone(),
+    ))
 }
