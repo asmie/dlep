@@ -66,7 +66,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 Run network tests using the [isolated namespace command below](#network-tests).
 CI also checks Rust 1.85, the portable crates on macOS, coverage, workflow syntax,
-and dependency advisories. See [CI documentation](.github/README.md) for job scope,
+and dependency advisories. See [CI documentation](doc/ci.md) for job scope,
 local commands, coverage artifacts, and the guarded audit exception.
 
 ## Run

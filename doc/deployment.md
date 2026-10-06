@@ -7,7 +7,7 @@ and unit files live in [`examples/`](../examples/).
 ## 1. Build and install
 
 Requires Linux and Rust 1.85+ (edition 2024). macOS CI covers the portable
-protocol crates, not the daemon transport. See [CI documentation](../.github/README.md).
+protocol crates, not the daemon transport. See [CI documentation](ci.md).
 
 Install version 0.2.0 from crates.io after publication:
 

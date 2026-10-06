@@ -1,17 +1,17 @@
 # Continuous integration
 
-`workflows/ci.yml` runs formatting and workflow validation, clippy, a Linux
-workspace build/test, a Rust 1.85.0 check of all targets and features, macOS tests
-of the portable crates, and instrumented Linux tests. Cargo commands use the
-committed lockfile. Jobs have read-only repository permissions and deadlines;
-new pushes cancel obsolete runs for the same branch or pull request.
+`.github/workflows/ci.yml` runs formatting and workflow validation, clippy, a
+Linux workspace build/test, a Rust 1.85.0 check of all targets and features,
+macOS tests of the portable crates, and instrumented Linux tests. Cargo commands
+use the committed lockfile. Jobs have read-only repository permissions and
+deadlines; new pushes cancel obsolete runs for the same branch or pull request.
 
 The release job verifies all crates.io archives, fetches the complete locked
 dependency set (including test-only dependencies), compiles their test targets in
 an isolated extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
 under `target/release-install`, then checks every CLI flag and four local
 plaintext/mutual-TLS session scenarios in a disposable network namespace.
-It does not publish packages. See [release checks](../doc/releasing.md).
+It does not publish packages. See [release checks](releasing.md).
 Package verification alone does not populate every development dependency;
 the explicit fetch makes subsequent offline checks independent of cache hits.
 
@@ -124,11 +124,12 @@ reject capture gaps, and require at least two Heartbeats in each direction.
 
 ## Network tests and coverage
 
-Both Linux test jobs use `scripts/test-network.sh`. It creates a disposable
-network namespace, configures loopback and a multicast-capable dummy interface
-with IPv4/IPv6 addresses, and preserves the child command's exit status. The
-script always enters a new network namespace before making network changes.
-GitHub runners use `sudo` to provide the capabilities needed by strict GTSM.
+Both Linux test jobs use `.github/scripts/test-network.sh`. It creates a
+disposable network namespace, configures loopback and a multicast-capable dummy
+interface with IPv4/IPv6 addresses, and preserves the child command's exit
+status. The script always enters a new network namespace before making network
+changes. GitHub runners use `sudo` to provide the capabilities needed by strict
+GTSM.
 
 For local Linux runs where unprivileged user namespaces are enabled:
 
@@ -181,9 +182,10 @@ which is already ignored by Git.
 
 ## Dependency audit
 
-`workflows/audit.yml` runs cargo-audit 0.22.2 for dependency, audit-policy, or
-workflow changes, every Monday, and on manual dispatch. It fetches the current
-RustSec database and fails on vulnerabilities and warnings. Run locally with:
+`.github/workflows/audit.yml` runs cargo-audit 0.22.2 for dependency,
+audit-policy, or workflow changes, every Monday, and on manual dispatch. It
+fetches the current RustSec database and fails on vulnerabilities and warnings.
+Run locally with:
 
 ```sh
 cargo metadata --locked --all-features --format-version 1 | \

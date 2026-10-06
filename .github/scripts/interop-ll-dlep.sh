@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build interop_router and the pinned image first; see .github/README.md.
+# Build interop_router and the pinned image first; see doc/ci.md.
 set -euo pipefail
 mkdir -p target/interop-ll-dlep
 exec docker run --rm --network none --cap-drop ALL --cap-add NET_RAW --cap-add DAC_OVERRIDE \

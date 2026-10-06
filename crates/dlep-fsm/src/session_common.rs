@@ -31,7 +31,8 @@ pub struct SessionConfig {
     /// `ExtensionId`s this side announces in the Session Initialization
     /// / Session Initialization Response `ExtensionsSupported` data item.
     /// Empty by default — populated by `dlep-daemon` from the registered
-    /// extensions' union of `advertised_ids()`.
+    /// extensions' union of `advertised_ids()`. When empty, the item is
+    /// omitted rather than sent with zero length (RFC 8175 §12.5/§12.6).
     ///
     /// Note: this is a snapshot taken at session spawn-time. The daemon
     /// has no hot-load API for runtime extension registration in M8; an
@@ -453,6 +454,16 @@ pub(crate) fn push_metric_items(mut msg: Message, m: &LinkMetrics) -> Message {
         msg = msg.with_item(DataItem::Mtu(value));
     }
     msg
+}
+
+/// Append Extensions Supported only when this side advertises extensions.
+/// RFC 8175 §12.5/§12.6 express "no extensions" by omitting the item, and
+/// some peers reject a zero-length one (OONF's `dlep_radio` resets the session).
+pub(crate) fn push_extensions_supported(msg: Message, ids: &[ExtensionId]) -> Message {
+    if ids.is_empty() {
+        return msg;
+    }
+    msg.with_item(DataItem::ExtensionsSupported(ids.to_vec()))
 }
 
 #[cfg(test)]

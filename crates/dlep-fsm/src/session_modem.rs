@@ -800,22 +800,19 @@ impl ModemSessionFsm {
 }
 
 fn build_session_initialization_response(config: &SessionConfig) -> Message {
-    crate::session_common::push_metric_items(
-        Message::new(MessageType::SESSION_INITIALIZATION_RESPONSE)
-            .with_item(DataItem::Status {
-                code: StatusCode::SUCCESS,
-                text: String::new(),
-            })
-            .with_item(DataItem::HeartbeatInterval(local_heartbeat_interval(
-                config,
-            )))
-            .with_item(DataItem::PeerType {
-                flags: PeerFlags::default(),
-                description: config.peer_description.clone(),
-            })
-            .with_item(DataItem::ExtensionsSupported(
-                config.advertised_extensions.clone(),
-            )),
-        &config.initial_metrics,
-    )
+    let message = Message::new(MessageType::SESSION_INITIALIZATION_RESPONSE)
+        .with_item(DataItem::Status {
+            code: StatusCode::SUCCESS,
+            text: String::new(),
+        })
+        .with_item(DataItem::HeartbeatInterval(local_heartbeat_interval(
+            config,
+        )))
+        .with_item(DataItem::PeerType {
+            flags: PeerFlags::default(),
+            description: config.peer_description.clone(),
+        });
+    let message =
+        crate::session_common::push_extensions_supported(message, &config.advertised_extensions);
+    crate::session_common::push_metric_items(message, &config.initial_metrics)
 }

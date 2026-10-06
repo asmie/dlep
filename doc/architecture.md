@@ -281,8 +281,8 @@ Internal command flow (CLI → daemon → session task) is `mpsc`, single-consum
 
 Extensions are dispatched per session by the session task. Their lifecycle:
 
-1. At `spawn` time, the registry's union of `advertised_ids()` is stamped into `SessionConfig.advertised_extensions` and goes onto the wire in `ExtensionsSupported`.
-2. On the inbound `Session Initialization` (modem) or `Session Initialization Response` (router), the FSM extracts the peer's `ExtensionsSupported` into `peer_extensions` and emits `EmittedEvent::SessionUp { peer_extensions }`.
+1. At `spawn` time, the registry's union of `advertised_ids()` is stamped into `SessionConfig.advertised_extensions` and goes onto the wire in `ExtensionsSupported`. With no advertised IDs the item is omitted, which RFC 8175 §12.5/§12.6 define as "no extensions"; some peers (OONF's `dlep_radio`) reject a zero-length item.
+2. On the inbound `Session Initialization` (modem) or `Session Initialization Response` (router), the FSM extracts the peer's `ExtensionsSupported` into `peer_extensions` (an absent or empty item both mean none) and emits `EmittedEvent::SessionUp { peer_extensions }`.
 3. The registry activates only plugins whose nonempty advertised ID set is supported by the peer and whose negotiation callback accepts the session. A plugin implementing independent extensions can register separate instances if it needs partial negotiation.
 4. The public `SessionUp` event is emitted before `on_session_state(up=true)` runs.
 5. In-session unknown messages and items are first offered to negotiated extensions. Unclaimed input reaches the FSM's strict validation; handled messages reset the peer-silence deadline. Extension callbacks do not process terminating-session traffic.
@@ -429,7 +429,7 @@ cover initialization metrics, Destination Up/Update/Down, heartbeats, and
 termination initiated by either side. Loopback PCAPs and both peers' logs are
 retained. Strict GTSM stays enabled; the disposable namespace's default TTL is
 set to 255 because the independent router does not configure it itself.
-See [reproduction and limits](../.github/README.md#independent-router-interoperability).
+See [reproduction and limits](ci.md#independent-router-interoperability).
 An additional pinned MIT LL-DLEP job checks our router against an independent
 modem in a networkless container. It covers initialization, destination and
 session metric updates, link-characteristics replies, heartbeats, and both
@@ -437,7 +437,7 @@ termination directions. Its generated core profile removes unnegotiated
 experimental items and adds the standard Shutting Down status omitted upstream;
 complete link replies are supplied through the peer's documented CLI. TCP
 capture checks require actual termination responses and bidirectional
-heartbeats. See [setup and qualifications](../.github/README.md#independent-modem-interoperability).
+heartbeats. See [setup and qualifications](ci.md#independent-modem-interoperability).
 Neither peer check establishes discovery, IPv6, TLS, extension negotiation, or
 stock-configuration compatibility.
 
@@ -449,12 +449,12 @@ connection capacity and descriptor cleanup after every session. The default run
 checks 6,600 Up, 6,400 Update, and 3,200 Down events, plus transaction barriers and
 session lifecycle events. No production changes were needed. The full suite now
 passes **449 tests**, with formatting, clippy, and Rust 1.85 checks also passing.
-See [local reproduction](../.github/README.md#network-tests-and-coverage) to increase
+See [local reproduction](ci.md#network-tests-and-coverage) to increase
 the cycle count. This does not measure heap growth, simultaneous clients, TLS
 churn, or multi-day stability. Dedicated `cargo-fuzz` targets remain a validation
 gap; coverage percentages have not been recollected for this checkpoint.
 
-See [CI documentation](../.github/README.md) for exact jobs and reproduction
+See [CI documentation](ci.md) for exact jobs and reproduction
 commands. Linux tests run in a disposable network namespace with strict GTSM
 privileges. CI additionally checks Rust 1.85, portable crates on macOS,
 formatting, clippy, workflow syntax, and dependency advisories. Coverage reports
@@ -475,7 +475,7 @@ The order of work was:
 5. Destinations and metrics end-to-end. **Done (M5)** — modem→router `Destination_Up`/`Update`/`Down` round-trip, including FSM transitions, daemon command/event plumbing, and the `destination_round_trip_over_loopback` integration test. Out-of-scope follow-ups: `Destination_Announce` (router-initiated query) and `Link_Characteristics_Request`/`Response`.
 6. UDP multicast discovery, including GTSM cmsg handling. **Done (M6)** — IPv4 multicast group join, `socket2`-built UDP sockets with TTL=255 outbound (GTSM), cmsg-based inbound TTL extraction via `nix::recvmsg`, router + modem discovery FSMs, and the `discovery_loopback_finds_modem_and_establishes_session` integration test. The router is an *active probe* (sends `Peer_Discovery` to the well-known group from an ephemeral source port; does **not** join the group) — the modem is the only group member and replies with unicast `Peer_Offer` to the discovery's source. Without an explicit interface, modem-side discovery socket bind remains best-effort for direct `connect_static` callers. Named interface failures are fatal. Interface selection is implemented below. IPv6 transport is implemented below. Follow-up: `OfferBurst` retries.
 7. TLS via tokio-rustls, then flip the `use_tls` default. **Done (M7)** — `tokio_rustls::TlsConnector` / `TlsAcceptor` wired through `Connector::tls(client_cfg)` / `Acceptor::tls(listener, server_cfg)` factory constructors with private fields; `Transport` implemented for both `tokio_rustls::{client,server}::TlsStream<TcpStream>`; `NetworkConfig::default().use_tls` flipped to `true`; `with_rustls_client(...)` / `with_rustls_server(...)` becomes the required setup step when TLS is on (spawn fails fast otherwise). Cert verification uses `ServerName::IpAddress` derived from the connect target's IP. Verified by the `tls_session_establishes_and_carries_destination_lifecycle` integration test covering handshake plus a destination Up/Down round-trip. The Drop/Up race now returns an explicit Busy error; TLS tests retry on that result rather than waiting a guessed 50 ms. Follow-ups: DNS-based `ServerName` resolution and custom certificate verifier hooks.
-8. Wire the extension plug-in API and round-trip a private-use ID through a test-only extension. **Done (M8)** — `ExtensionRegistry` is now plumbed from `RouterBuilder`/`ModemBuilder` into each session task; `SessionConfig.advertised_extensions` is populated from `registry.advertised()` and shows up in the `ExtensionsSupported` data item of `Session Initialization` / `Session Initialization Response`; both FSMs capture the peer's advertised IDs into `peer_extensions` and surface them via `EmittedEvent::SessionUp { peer_extensions }`; the daemon computes `negotiated_extensions = advertised_local ∩ peer_extensions` for `DaemonEvent::SessionUp`. The session task routes inbound messages with an unknown `MessageType` through `on_unknown_message`, dispatches `DataItem::Unknown` items inside known messages through `on_unknown_data_item`, and drives `on_session_state` / `on_destination_state` on lifecycle transitions. Verified by the `private_use_extension_round_trips_session_init_and_unknown_message` integration test (Private-Use `ExtensionId(0xF000)` + `MessageType(0xF000)`). Follow-ups: extension-driven Session Termination, per-extension config plumbing, extensions over the UDP discovery socket, and an "ask FSM to terminate" hook.
+8. Wire the extension plug-in API and round-trip a private-use ID through a test-only extension. **Done (M8)** — `ExtensionRegistry` is now plumbed from `RouterBuilder`/`ModemBuilder` into each session task; `SessionConfig.advertised_extensions` is populated from `registry.advertised()` and shows up in the `ExtensionsSupported` data item of `Session Initialization` / `Session Initialization Response` (omitted when empty); both FSMs capture the peer's advertised IDs into `peer_extensions` and surface them via `EmittedEvent::SessionUp { peer_extensions }`; the daemon computes `negotiated_extensions = advertised_local ∩ peer_extensions` for `DaemonEvent::SessionUp`. The session task routes inbound messages with an unknown `MessageType` through `on_unknown_message`, dispatches `DataItem::Unknown` items inside known messages through `on_unknown_data_item`, and drives `on_session_state` / `on_destination_state` on lifecycle transitions. Verified by the `private_use_extension_round_trips_session_init_and_unknown_message` integration test (Private-Use `ExtensionId(0xF000)` + `MessageType(0xF000)`). Follow-ups: extension-driven Session Termination, per-extension config plumbing, extensions over the UDP discovery socket, and an "ask FSM to terminate" hook.
 9. Polish the CLI binaries and document deployment. **Done (M9)** — the binaries build rustls configs from the TOML `[tls]` section via `dlep_daemon::tls::{client_config, server_config}`: the router requires `ca_bundle` (private PKI; no system-roots fallback) and presents `cert`+`key` as its mTLS identity when set; the modem requires `cert`+`key` and, with `require_client_cert = true`, enforces client certificates through `WebPkiClientVerifier` — closing the mutual-TLS follow-up from M7. New flags: `--cert` / `--key` / `--ca-bundle` overrides, `--check-config` (validates TOML shape, static peers and TLS material via `check_router_config` / `check_modem_config`, then exits), and the router's repeatable `--peer` (implies static mode). The router binary gained its missing run loop: static peers connect at startup, discovery mode auto-connects on `PeerDiscovered` (deduplicated by address). `NetworkConfig` is now `#[serde(default)]` so partial `[network]` sections parse, and the `[network]`/`[tls]`/`[timers]` sections reject unknown keys. Deployment guide at `doc/deployment.md` (private-CA openssl walkthrough, port-854 privileges, firewall/GTSM, systemd) plus working artifacts in `examples/` (TOML configs, hardened systemd units with a static `dlep` user). Verified by the `mtls_session_requires_and_accepts_client_certificate` / `mtls_modem_rejects_client_without_certificate` integration tests and an end-to-end smoke run with openssl-issued certificates. Follow-ups: `--tcp-port`/`--bind-addr` overrides, shell completions, packaging, reconnect-on-drop for the router's run loop.
 10. Close the RFC-conformance gaps a post-M9 audit turned up. **Done (M10)** — three defects, all of which had survived because nothing in the tree exercised them:
     - **`Session Update` / `Session Update Response` (RFC 8175 §12.7-12.8) were entirely absent.** Neither FSM had an arm, so an inbound `Session Update` fell through the `InSession` catch-all: the missed-heartbeat deadline was reset and the message was then dropped **without the mandatory Response** ("A Session Update Response Message MUST be sent … when a Session Update Message is received"). Both FSMs acknowledge valid Session Updates and close matching transactions. The subsequent review corrected the original interpretation of §12.7: only modem-originated updates may contain metrics. Inbound session-wide metrics now surface as `DaemonEvent::Metrics`, which had been a defined-but-never-constructed variant.
@@ -759,7 +759,7 @@ The order of work was:
     initial findings prompted patched rustls/anyhow versions and replacement
     of the unmaintained PEM wrapper. The parser-disabled `time` dependency used
     by certificate helpers has a documented, CI-guarded exception to retain
-    Rust 1.85 compatibility. See `.github/README.md` for job scope, local
+    Rust 1.85 compatibility. See `doc/ci.md` for job scope, local
     reproduction, coverage artifacts, and the exception's exact conditions.
 
 29. Documentation and deployment examples. **Done** — refreshed build/test/CI

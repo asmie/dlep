@@ -818,10 +818,5 @@ fn build_session_initialization(config: &SessionConfig) -> Message {
             flags: PeerFlags::default(),
             description: config.peer_description.clone(),
         });
-    if config.advertised_extensions.is_empty() {
-        return message;
-    }
-    message.with_item(DataItem::ExtensionsSupported(
-        config.advertised_extensions.clone(),
-    ))
+    crate::session_common::push_extensions_supported(message, &config.advertised_extensions)
 }

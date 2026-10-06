@@ -501,10 +501,10 @@ fn modem_awaiting_session_init_to_in_session_on_session_init_message() {
         _ => None,
     });
     let init_response = init_response.expect("expected SendMessage(InitResponse)");
-    // RFC 8175 §12.6: response carries Status, Heartbeat, PeerType,
-    // ExtensionsSupported, MTU, MaxDR Rx/Tx, CurDR Rx/Tx, Latency,
-    // Resources, RLQ Rx/Tx — at least 13 items.
-    assert!(init_response.data_items.len() >= 13);
+    // RFC 8175 §12.6: response carries Status, Heartbeat, PeerType, MTU,
+    // MaxDR Rx/Tx, CurDR Rx/Tx, Latency, Resources, RLQ Rx/Tx — at least 12
+    // items. Extensions Supported is omitted when none are advertised.
+    assert!(init_response.data_items.len() >= 12);
     assert!(actions.iter().any(|a| matches!(
         a,
         FsmAction::StartTimer {
@@ -1419,7 +1419,7 @@ fn every_termination_path_uses_four_local_heartbeats_or_explicit_override() {
     }
 }
 
-// --- Extensions Supported in Session Initialization (RFC 8175 §12.5) -------
+// --- Extensions Supported in session initialization (RFC 8175 §12.5/§12.6) --
 
 fn router_session_init(config: dlep_fsm::SessionConfig) -> dlep_core::Message {
     let mut fsm = RouterSessionFsm::with_config(config);
@@ -1436,9 +1436,9 @@ fn router_session_init(config: dlep_fsm::SessionConfig) -> dlep_core::Message {
         .expect("expected SendMessage(Session Initialization)")
 }
 
-fn extensions_supported(msg: &dlep_core::Message) -> Option<&Vec<dlep_core::ExtensionId>> {
+fn extensions_supported(msg: &dlep_core::Message) -> Option<&[dlep_core::ExtensionId]> {
     msg.data_items.iter().find_map(|item| match item {
-        DataItem::ExtensionsSupported(ids) => Some(ids),
+        DataItem::ExtensionsSupported(ids) => Some(ids.as_slice()),
         _ => None,
     })
 }
@@ -1458,5 +1458,38 @@ fn router_session_init_lists_the_extensions_it_advertises() {
         advertised_extensions: ids.clone(),
         ..Default::default()
     });
-    assert_eq!(extensions_supported(&msg), Some(&ids));
+    assert_eq!(extensions_supported(&msg), Some(ids.as_slice()));
+}
+
+fn modem_session_init_response(config: dlep_fsm::SessionConfig) -> dlep_core::Message {
+    let mut fsm = ModemSessionFsm::with_config(config);
+    fsm.step(FsmEvent::TcpAccepted);
+    fsm.step(FsmEvent::RecvMessage(make_session_init()))
+        .into_iter()
+        .find_map(|a| match a {
+            FsmAction::SendMessage(msg)
+                if msg.message_type == MessageType::SESSION_INITIALIZATION_RESPONSE =>
+            {
+                Some(msg)
+            }
+            _ => None,
+        })
+        .expect("expected SendMessage(Session Initialization Response)")
+}
+
+/// §12.6 mirrors §12.5: the router reads an absent item as "no extensions".
+#[test]
+fn modem_session_init_response_omits_extensions_supported_when_none_are_advertised() {
+    let msg = modem_session_init_response(dlep_fsm::SessionConfig::default());
+    assert_eq!(extensions_supported(&msg), None);
+}
+
+#[test]
+fn modem_session_init_response_lists_the_extensions_it_advertises() {
+    let ids = vec![dlep_core::ExtensionId(1)];
+    let msg = modem_session_init_response(dlep_fsm::SessionConfig {
+        advertised_extensions: ids.clone(),
+        ..Default::default()
+    });
+    assert_eq!(extensions_supported(&msg), Some(ids.as_slice()));
 }
