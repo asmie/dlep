@@ -237,11 +237,13 @@ impl DiscoverySocket {
                 },
                 ipi_addr: nix::libc::in_addr { s_addr: 0 },
             });
-            let info_v6 = self.interface_v6.map(|i| nix::libc::in6_pktinfo {
-                ipi6_ifindex: i.index,
-                ipi6_addr: nix::libc::in6_addr {
-                    s6_addr: i.address.octets(),
-                },
+            let info_v6 = self.interface_v6.and_then(|i| {
+                Some(nix::libc::in6_pktinfo {
+                    ipi6_ifindex: ifindex_to_pktinfo(i.index)?,
+                    ipi6_addr: nix::libc::in6_addr {
+                        s6_addr: i.address.octets(),
+                    },
+                })
             });
             let controls: Vec<_> = info
                 .as_ref()
@@ -348,13 +350,16 @@ impl DiscoverySocket {
                         interface_index = Some(info.ipi_ifindex as u32);
                     }
                     if let ControlMessageOwned::Ipv6PacketInfo(info) = cmsg {
-                        interface_index = Some(info.ipi6_ifindex);
+                        let index = ifindex_from_pktinfo(info.ipi6_ifindex);
+                        interface_index = index;
                         // IPv6 pktinfo reports the destination (often multicast),
                         // not a unicast local address as IPv4's ipi_spec_dst does.
                         local = self.interface_v6.map(|i| IpAddr::V6(i.address));
                         if let SocketAddr::V6(addr) = &mut from {
-                            if addr.ip().is_unicast_link_local() {
-                                addr.set_scope_id(info.ipi6_ifindex);
+                            if let Some(index) = index {
+                                if addr.ip().is_unicast_link_local() {
+                                    addr.set_scope_id(index);
+                                }
                             }
                         }
                     }
@@ -443,9 +448,37 @@ async fn send_datagram(
     }
 }
 
+/// `in6_pktinfo.ipi6_ifindex` is a `u32` in glibc and musl but a `c_int` in
+/// bionic (Android). Converting through `i64`, which holds both, keeps the range
+/// check real on every libc instead of a cast that would wrap.
+fn ifindex_to_pktinfo<T: TryFrom<i64>>(index: u32) -> Option<T> {
+    T::try_from(i64::from(index)).ok()
+}
+
+/// The reverse of [`ifindex_to_pktinfo`]: a negative `c_int` is no interface.
+fn ifindex_from_pktinfo(raw: impl Into<i64>) -> Option<u32> {
+    u32::try_from(raw.into()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // bionic's ipi6_ifindex is a c_int, so an index past i32::MAX cannot be sent.
+    #[test]
+    fn an_interface_index_that_does_not_fit_the_field_is_not_sent() {
+        assert_eq!(ifindex_to_pktinfo::<i32>(7), Some(7));
+        assert_eq!(ifindex_to_pktinfo::<i32>(u32::MAX), None);
+        assert_eq!(ifindex_to_pktinfo::<u32>(u32::MAX), Some(u32::MAX));
+    }
+
+    // A negative c_int is not an interface index.
+    #[test]
+    fn a_received_interface_index_is_checked_not_wrapped() {
+        assert_eq!(ifindex_from_pktinfo(7i32), Some(7));
+        assert_eq!(ifindex_from_pktinfo(-1i32), None);
+        assert_eq!(ifindex_from_pktinfo(u32::MAX), Some(u32::MAX));
+    }
 
     fn datagram_pair() -> (AsyncFd<OwnedFd>, std::os::unix::net::UnixDatagram) {
         // Unix datagrams provide deterministic kernel backpressure on loopback;
