@@ -139,7 +139,9 @@ impl DiscoverySocket {
         // takes ownership cleanly.
         let owned = unsafe { OwnedFd::from_raw_fd(raw) };
         Ok(Self {
-            fd: AsyncFd::new(owned)?,
+            // SAFETY: AsyncFd owns the descriptor; discovery only borrows it
+            // for I/O and never closes or replaces it while registered.
+            fd: unsafe { AsyncFd::register(owned)? },
             group: (params.group_v4, params.group_port.unwrap_or(resolved_port)).into(),
             port: resolved_port,
             codec: SignalCodec,
@@ -177,7 +179,9 @@ impl DiscoverySocket {
             .port();
         let owned: OwnedFd = sock.into();
         Ok(Self {
-            fd: AsyncFd::new(owned)?,
+            // SAFETY: AsyncFd owns the descriptor; discovery only borrows it
+            // for I/O and never closes or replaces it while registered.
+            fd: unsafe { AsyncFd::register(owned)? },
             group: SocketAddrV6::new(
                 params.group,
                 params.group_port.unwrap_or(port),
@@ -456,7 +460,10 @@ mod tests {
         socket2::SockRef::from(&sender)
             .set_send_buffer_size(4096)
             .unwrap();
-        (AsyncFd::new(sender.into()).unwrap(), receiver)
+        // SAFETY: AsyncFd owns the descriptor; tests only borrow it for I/O
+        // and never close or replace it while registered.
+        let sender = unsafe { AsyncFd::register(sender.into()).unwrap() };
+        (sender, receiver)
     }
 
     async fn fill_datagram_queue(fd: &AsyncFd<OwnedFd>) -> usize {

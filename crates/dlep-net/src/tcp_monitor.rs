@@ -58,7 +58,9 @@ mod platform {
 
         fn start(socket: Socket) -> io::Result<Arc<Self>> {
             socket.set_nonblocking(true)?;
-            let socket = AsyncFd::new(socket)?;
+            // SAFETY: AsyncFd owns the socket, and receive only borrows it for
+            // I/O; its descriptor stays open and unchanged until AsyncFd drops.
+            let socket = unsafe { AsyncFd::register(socket)? };
             let state = Arc::new(Mutex::new(State::default()));
             let task_state = state.clone();
             let task = tokio::spawn(async move {
