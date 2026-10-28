@@ -41,6 +41,12 @@ pub struct SessionConfig {
     /// see it as unsupported. A future M-number can add a runtime
     /// register/renegotiate hook if needed.
     pub advertised_extensions: Vec<ExtensionId>,
+    /// Modem only. When true, an inbound Link Characteristics Request stays
+    /// pending until the application answers with
+    /// `FsmEvent::AppLinkCharacteristicsResponse`; RFC 8175 §12.18 allows such
+    /// requests to take an extended time. When false, the modem immediately
+    /// replies Request Denied with its current metrics.
+    pub defer_link_characteristics: bool,
 }
 
 impl Default for SessionConfig {
@@ -53,6 +59,7 @@ impl Default for SessionConfig {
             session_init_timeout: Duration::from_millis(5_000),
             termination_timeout: None,
             advertised_extensions: Vec::new(),
+            defer_link_characteristics: false,
         }
     }
 }
@@ -183,6 +190,24 @@ pub fn build_link_characteristics_request(
         message.data_items.push(DataItem::Latency(value));
     }
     message
+}
+
+/// Characteristics a router asked for in a Link Characteristics Request.
+pub fn extract_link_characteristics(msg: &Message) -> dlep_core::LinkCharacteristics {
+    let mut requested = dlep_core::LinkCharacteristics::default();
+    for item in &msg.data_items {
+        match item {
+            DataItem::CurrentDataRateReceive(value) => {
+                requested.current_data_rate_rx_bps = Some(*value);
+            }
+            DataItem::CurrentDataRateTransmit(value) => {
+                requested.current_data_rate_tx_bps = Some(*value);
+            }
+            DataItem::Latency(value) => requested.latency = Some(*value),
+            _ => {}
+        }
+    }
+    requested
 }
 
 /// RFC 8175 §12.19 requires current metrics, including on Request Denied.

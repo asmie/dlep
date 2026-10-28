@@ -55,6 +55,13 @@ pub enum DestinationEvent {
         text: String,
         metrics: LinkMetrics,
     },
+    /// Modem side: the router asked to change this destination's link. The
+    /// registered link-control backend, if any, decides the response;
+    /// otherwise the modem has already replied Request Denied.
+    LinkCharacteristicsRequested {
+        id: DestinationId,
+        requested: LinkCharacteristics,
+    },
     AddressesChanged {
         id: DestinationId,
         changes: AddressChanges,

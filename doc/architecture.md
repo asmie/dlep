@@ -344,7 +344,7 @@ extension registration, TLS configuration, and event subscription.
 `connect_discovered` to establish sessions. Automatic connection scheduling and
 reconnection are policies of the router binary, not the library handle.
 
-The modem-side API is symmetric, with `add_destination`, `update_destination` and `drop_destination` taking the place of `start_discovery` / `connect_static`.
+The modem-side API is symmetric, with `add_destination`, `update_destination` and `drop_destination` taking the place of `start_discovery` / `connect_static`. `ModemBuilder::link_control` registers the backend that answers router Link Characteristics Requests; without one they are denied.
 
 Only the modem can originate metric changes via `update_session_metrics`. The router compatibility method returns an error; router Session Update payloads are restricted to Layer 3 information. `announce_destination` is **router-side only**, because RFC 8175 §12.13 makes `Destination Announce` router-originated — the modem receives it, answers per §12.14, and surfaces it to its application as `DestinationEvent::Announced`.
 
@@ -482,7 +482,7 @@ The order of work was:
     - **`Destination Announce` was on the wrong role.** `ModemDaemon::announce_destination` existed, took a MAC, discarded it and returned `Ok(())` — a public method that silently did nothing, advertised in both the README and §7. But §12.13 makes Destination Announce *router*-originated ("MAY be sent by a router to announce such an interest"), and §12.14 obliges the *modem* to answer it. The no-op is gone; `RouterDaemon::announce_destination` sends the message under a per-destination transaction, and the modem answers and emits `DestinationEvent::Announced` (another previously-dead variant) so its application can decide whether to follow up with a `Destination_Up`. A malformed announce with no MAC now terminates the session with Invalid Data.
     - **The router binary could never reconnect.** `run_event_loop` inserted each peer into a `connected` dedup set and never removed it, and the `SessionDown` arm only logged, so a modem restart orphaned the router until the process was restarted — re-discovery hit the dedup `continue` and was skipped forever. The root cause was an API gap: `DaemonEvent::SessionDown` carried only a `StatusCode`, so the loop could not tell *which* peer had dropped. `SessionDown` now carries `PeerInfo`, and the loop evicts the dead peer and re-dials it via a `ReconnectQueue` (1 s base, doubling, 30 s cap; `forget` on `SessionUp` so each drop starts a fresh sequence). The queue takes its clock as a parameter, so the backoff is unit-tested without sleeping.
 
-    Follow-up: a modem backend capable of applying requested link changes. Session-wide metric configuration and support declarations are implemented below. Commands rejected by busy transactions now return explicit errors, as described below.
+    The modem link-control backend is implemented as item 30. Session-wide metric configuration and support declarations are implemented below. Commands rejected by busy transactions now return explicit errors, as described below.
 
 11. **Link Characteristics Request/Response (RFC 8175 §12.18–12.19).**
     The router API targets one session and accepts optional receive rate,
@@ -491,10 +491,10 @@ The order of work was:
     without an independent deadline (RFC §8). Responses update stored metrics
     and emit a session-attributed `DestinationEvent::LinkCharacteristicsResponse`
     containing status, text, and metrics. The router requires the complete set
-    of core metrics declared by that peer during initialization. The modem
-    currently has no link-control backend, so it immediately replies Request
-    Denied with the current destination metrics. It does not fabricate a
-    successful physical link change. Tests cover denial and success replies,
+    of core metrics declared by that peer during initialization. A modem without
+    a link-control backend (item 30) immediately replies Request Denied with the
+    current destination metrics. It does not fabricate a successful physical
+    link change. Tests cover denial and success replies,
     missing/undeclared metrics, serialization across destinations, responses
     delayed for minutes while the peer remains active, heartbeat-based failure
     detection, and targeting modems sharing a MAC.
@@ -770,6 +770,38 @@ The order of work was:
     Deployment instructions cover both peers' PKI/config installation and the
     limits of --check-config. Repository-local contributor guidance identifies
     this workspace as DLEP rather than the unrelated parent project.
+
+30. Modem link-control backend (RFC 8175 §12.18–12.19). **Done** —
+    `SessionConfig.defer_link_characteristics` makes the modem FSM hold an
+    inbound request and emit `LinkCharacteristicsRequested { pending: true }`
+    until the application steps `AppLinkCharacteristicsResponse`. The pending
+    request occupies the destination's transaction scope in both directions:
+    a second request or Destination Down from the router terminates with
+    Unexpected Message, and local Destination Down returns Busy. Destination
+    Update is not a transaction and stays available. Answers reject
+    session-terminating statuses, undeclared metrics, and unencodable text, and
+    a missing request returns `NoPendingRequest`. Answer metrics merge into the
+    stored destination metrics, and the response carries the complete
+    effective set.
+
+    `ModemBuilder::link_control` registers a `LinkControl` backend; closures
+    returning a `Send` future implement it. The session task runs each call on
+    a `JoinSet` and steps its answer. Invalid answers and panics become Request
+    Denied, so the router's transaction always completes. Dropping the session
+    aborts outstanding calls. Without a backend, deferral is off and the modem
+    denies immediately; direct `run_session` users who enable deferral without
+    a backend also get denials. Both modes publish
+    `DestinationEvent::LinkCharacteristicsRequested` to the modem application.
+    A granted change is reported only on the requesting session; embedders
+    call `update_destination` when it affects other routers. The bundled modem
+    binary has no radio integration and keeps denying.
+
+    FSM tests cover immediate and deferred modes, heartbeats while pending,
+    grants with retained optional metrics, denials reporting updates made while
+    pending, per-destination independence, peer and local conflicts, and
+    invalid answers that leave the request pending. Daemon tests use real
+    sessions for a granted change, a slow backend holding Busy until release,
+    fallbacks for invalid answers and panics, and cancellation at session end.
 
 ---
 

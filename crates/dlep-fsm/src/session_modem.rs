@@ -1,5 +1,5 @@
 use crate::{AddressChanges, DestinationAddrs};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use dlep_core::data_item::PeerFlags;
@@ -52,6 +52,10 @@ pub struct ModemSessionFsm {
     /// `EmittedEvent::SessionUp { peer_extensions }` so the runtime can
     /// negotiate registered extensions.
     pub peer_extensions: Vec<dlep_core::ExtensionId>,
+    /// Destinations whose inbound Link Characteristics Request awaits the
+    /// application's answer. Each occupies that destination's transaction
+    /// scope in both directions (RFC 8175 §8).
+    pending_link_requests: HashSet<MacAddress>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +93,7 @@ impl ModemSessionFsm {
             termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
             peer_extensions: Vec::new(),
+            pending_link_requests: HashSet::new(),
         }
     }
 
@@ -98,6 +103,11 @@ impl ModemSessionFsm {
 
     pub fn mac_address_format(&self) -> dlep_core::MacAddressFormat {
         self.config.mac_address_format
+    }
+
+    /// Whether a Link Characteristics Request for `mac` awaits an answer.
+    pub fn link_characteristics_pending(&self, mac: &MacAddress) -> bool {
+        self.pending_link_requests.contains(mac)
     }
 
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
@@ -136,9 +146,21 @@ impl ModemSessionFsm {
                             if initializing {
                                 return Ok(());
                             }
-                            let known = extract_destination_mac(msg)
+                            let mac = extract_destination_mac(msg);
+                            let known = mac
                                 .and_then(|mac| self.destinations.get(&mac))
                                 .is_some_and(|d| d.announced);
+                            // The router's own unanswered request occupies
+                            // this destination's single transaction slot.
+                            if mac.is_some_and(|mac| self.pending_link_requests.contains(&mac))
+                                && matches!(
+                                    msg.message_type,
+                                    MessageType::DESTINATION_DOWN
+                                        | MessageType::LINK_CHARACTERISTICS_REQUEST
+                                )
+                            {
+                                return Err(StatusCode::UNEXPECTED_MESSAGE);
+                            }
                             validate_transaction(msg, &self.tx, known)
                         });
                 if let Err(code) = checked {
@@ -523,26 +545,70 @@ impl ModemSessionFsm {
                 }
                 actions
             }
-            // This modem has no backend capable of changing radio parameters.
-            // The mandatory response reports actual stored metrics and denies
-            // the requested alteration, rather than claiming it was applied.
+            // With deferral, the application's link-control backend answers
+            // later (§12.18 permits long-running requests). Without one, the
+            // mandatory response reports actual stored metrics and denies the
+            // requested alteration, rather than claiming it was applied.
             (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::LINK_CHARACTERISTICS_REQUEST =>
             {
                 let mac = extract_destination_mac(&msg).expect("validated MAC");
                 let metrics = self.destinations[&mac].metrics;
-                let mut actions = vec![FsmAction::SendMessage(
-                    crate::session_common::build_link_characteristics_response(
+                let pending = self.config.defer_link_characteristics;
+                let mut actions = Vec::new();
+                if pending {
+                    self.pending_link_requests.insert(mac);
+                } else {
+                    actions.push(FsmAction::SendMessage(
+                        crate::session_common::build_link_characteristics_response(
+                            mac,
+                            StatusCode::REQUEST_DENIED,
+                            &metrics,
+                        ),
+                    ));
+                }
+                actions.push(FsmAction::Emit(
+                    EmittedEvent::LinkCharacteristicsRequested {
                         mac,
-                        StatusCode::REQUEST_DENIED,
-                        &metrics,
-                    ),
-                )];
+                        requested: crate::session_common::extract_link_characteristics(&msg),
+                        metrics,
+                        pending,
+                    },
+                ));
                 actions.extend(heartbeat_reset_action(
                     TIMER_HEARTBEAT_MISSED,
                     self.peer_heartbeat_interval,
                 ));
                 actions
+            }
+            // Metrics in the response describe the link after processing, so
+            // they also become the destination's stored metrics (§12.19).
+            (
+                ModemSessionState::InSession,
+                FsmEvent::AppLinkCharacteristicsResponse {
+                    mac,
+                    status,
+                    text,
+                    metrics,
+                },
+            ) => {
+                self.pending_link_requests.remove(&mac);
+                let destination = self
+                    .destinations
+                    .get_mut(&mac)
+                    .expect("checked destination");
+                if let Some(metrics) = metrics {
+                    crate::session_common::merge_link_metrics(
+                        &build_session_update(&metrics),
+                        &mut destination.metrics,
+                    );
+                }
+                vec![FsmAction::SendMessage(build_link_characteristics_reply(
+                    mac,
+                    status,
+                    text,
+                    &destination.metrics,
+                ))]
             }
             (ModemSessionState::InSession, FsmEvent::AppSessionAddresses { changes }) => {
                 crate::session_common::apply_local_address_update(
@@ -682,6 +748,16 @@ impl ModemSessionFsm {
             if !self.config.mac_address_format.accepts(mac) {
                 return Err(E::MacAddressFormatMismatch);
             }
+            if let FsmEvent::AppLinkCharacteristicsResponse { .. } = event {
+                if !self.pending_link_requests.contains(&mac) {
+                    return Err(E::NoPendingRequest);
+                }
+            } else if self.pending_link_requests.contains(&mac)
+                && matches!(event, FsmEvent::AppDropDestination { .. })
+            {
+                // Destination Down would be a second request in this scope.
+                return Err(E::Busy);
+            }
             if let Some(pending) = self.tx.per_destination.get(&mac) {
                 // Updates during Up are retained/coalesced. During Down, the
                 // destination will be removed, so accepting updates loses them.
@@ -750,6 +826,29 @@ impl ModemSessionFsm {
                     return Err(E::InvalidInput);
                 }
             }
+            FsmEvent::AppLinkCharacteristicsResponse {
+                mac,
+                status,
+                text,
+                metrics,
+            } => {
+                if status.terminates_session() {
+                    return Err(E::InvalidInput);
+                }
+                let mut effective = self.destinations[mac].metrics;
+                if let Some(metrics) = metrics {
+                    if !self.valid_metrics(metrics) {
+                        return Err(E::InvalidInput);
+                    }
+                    crate::session_common::merge_link_metrics(
+                        &build_session_update(metrics),
+                        &mut effective,
+                    );
+                }
+                build_link_characteristics_reply(*mac, *status, text.clone(), &effective)
+                    .encode()
+                    .map_err(|_| E::InvalidInput)?;
+            }
             FsmEvent::AppSessionAddresses { changes } => {
                 crate::session_common::validate_local_address_update(
                     &self.local_addresses,
@@ -797,6 +896,23 @@ impl ModemSessionFsm {
             },
         ]
     }
+}
+
+fn build_link_characteristics_reply(
+    mac: MacAddress,
+    status: StatusCode,
+    text: String,
+    metrics: &LinkMetrics,
+) -> Message {
+    let mut message =
+        crate::session_common::build_link_characteristics_response(mac, status, metrics);
+    for item in &mut message.data_items {
+        if let DataItem::Status { text: slot, .. } = item {
+            *slot = text;
+            break;
+        }
+    }
+    message
 }
 
 fn build_session_initialization_response(config: &SessionConfig) -> Message {

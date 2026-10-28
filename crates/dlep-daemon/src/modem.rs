@@ -13,12 +13,13 @@ use tracing::{info, warn};
 use crate::config::{ModemConfig, TimersConfig};
 use crate::connections::ConnectedRouters;
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
+use crate::link_control::LinkControl;
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
     new_event_channel,
 };
 use crate::session::{
-    SessionIdCounter, new_session_id_counter, run_session, session_config_from_timers,
+    SessionIdCounter, new_session_id_counter, run_session_tracked, session_config_from_timers,
 };
 
 pub struct ModemDaemon {
@@ -233,6 +234,7 @@ pub struct ModemBuilder {
     config: Option<ModemConfig>,
     extensions: ExtensionRegistry,
     server_tls: Option<Arc<ServerConfig>>,
+    link_control: Option<Arc<dyn LinkControl>>,
 }
 
 impl ModemBuilder {
@@ -248,6 +250,13 @@ impl ModemBuilder {
 
     pub fn with_rustls_server(mut self, cfg: Arc<ServerConfig>) -> Self {
         self.server_tls = Some(cfg);
+        self
+    }
+
+    /// Answer router Link Characteristics Requests with this backend instead
+    /// of denying them. See [`crate::link_control`].
+    pub fn link_control(mut self, backend: Arc<dyn LinkControl>) -> Self {
+        self.link_control = Some(backend);
         self
     }
 
@@ -331,6 +340,7 @@ impl ModemBuilder {
             session_id_counter.clone(),
             stop_rx,
             connected_routers,
+            self.link_control,
         ));
 
         Ok(ModemDaemon {
@@ -405,6 +415,7 @@ async fn modem_accept_loop(
     session_id_counter: SessionIdCounter,
     stopping: watch::Receiver<bool>,
     connected_routers: ConnectedRouters,
+    link_control: Option<Arc<dyn LinkControl>>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
@@ -430,6 +441,7 @@ async fn modem_accept_loop(
         let peer_description = peer_description.clone();
         let counter = session_id_counter.clone();
         let commands = session_cmds.clone();
+        let link_control = link_control.clone();
         let mut stopping = stopping.clone();
         let mut running = tasks.lock().await;
         let handle = tokio::spawn(async move {
@@ -466,6 +478,7 @@ async fn modem_accept_loop(
                 session_config_from_timers(&timers, peer_description, extensions.advertised());
             cfg.initial_metrics = initial_metrics;
             cfg.mac_address_format = mac_address_format;
+            cfg.defer_link_characteristics = link_control.is_some();
             let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
             {
                 let mut senders = commands.lock().await;
@@ -475,7 +488,7 @@ async fn modem_accept_loop(
                 senders.retain(|s| !s.is_closed());
                 senders.push(tx);
             }
-            if let Err(e) = run_session(
+            if let Err(e) = run_session_tracked(
                 ModemSessionFsm::with_config(cfg),
                 transport,
                 dlep_fsm::FsmEvent::TcpAccepted,
@@ -485,6 +498,8 @@ async fn modem_accept_loop(
                 extensions,
                 Role::Modem,
                 counter,
+                None,
+                link_control,
             )
             .await
             {

@@ -198,6 +198,7 @@ impl RouterDaemon {
             Role::Router,
             self.session_id_counter.clone(),
             Some(tracker),
+            None,
         );
         let handle = tokio::spawn(async move {
             let _permit = permit;

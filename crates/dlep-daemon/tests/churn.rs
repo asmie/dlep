@@ -83,8 +83,15 @@ async fn session_down(events: &mut Events, expected_session: SessionId, expected
 
 // The request follows all prior Up/Down responses on the same TCP stream.
 // Its reply proves the modem processed those responses before MAC reuse or
-// metric updates; command acceptance alone would not prove that.
-async fn barrier(router: &RouterDaemon, events: &mut Events, session: SessionId, peer: SocketAddr) {
+// metric updates; command acceptance alone would not prove that. The modem
+// application also observes each request it denies.
+async fn barrier(
+    router: &RouterDaemon,
+    events: &mut Events,
+    session: SessionId,
+    peer: SocketAddr,
+    modem: (&mut Events, SessionId, SocketAddr),
+) {
     router
         .request_link_characteristics(
             session,
@@ -108,6 +115,14 @@ async fn barrier(router: &RouterDaemon, events: &mut Events, session: SessionId,
             assert_eq!(actual, metrics(0));
         }
         other => panic!("expected barrier response, got {other:?}"),
+    }
+    let (modem_events, modem_session, modem_peer) = modem;
+    match destination_event(modem_events, modem_session, modem_peer).await {
+        DestinationEvent::LinkCharacteristicsRequested { id, requested } => {
+            assert_eq!(id, destination(0));
+            assert_eq!(requested.latency, Some(Duration::from_micros(1)));
+        }
+        other => panic!("expected barrier request, got {other:?}"),
     }
 }
 
@@ -244,7 +259,14 @@ async fn churn(bind: &str, cycles: usize) {
                         other => panic!("expected Up, got {other:?}"),
                     }
                 }
-                barrier(&router, &mut router_events, router_id, peer).await;
+                barrier(
+                    &router,
+                    &mut router_events,
+                    router_id,
+                    peer,
+                    (&mut modem_events, modem_id, modem_peer),
+                )
+                .await;
                 for index in 1..=DESTINATIONS {
                     modem
                         .update_destination(destination(index), metrics(sequence + 1))
@@ -283,7 +305,14 @@ async fn churn(bind: &str, cycles: usize) {
                             other => panic!("expected Down, got {other:?}"),
                         }
                     }
-                    barrier(&router, &mut router_events, router_id, peer).await;
+                    barrier(
+                        &router,
+                        &mut router_events,
+                        router_id,
+                        peer,
+                        (&mut modem_events, modem_id, modem_peer),
+                    )
+                    .await;
                 }
             }
             // Leave destinations live so session teardown must discard their state.

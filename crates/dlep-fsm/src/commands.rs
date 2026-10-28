@@ -14,6 +14,7 @@ pub enum CommandKind {
     SessionMetrics,
     AnnounceDestination,
     LinkCharacteristics,
+    LinkCharacteristicsResponse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +38,8 @@ pub enum CommandError {
     Unsupported,
     #[error("invalid or unencodable command values")]
     InvalidInput,
+    #[error("no Link Characteristics Request from the peer awaits a response")]
+    NoPendingRequest,
     #[error("destination MAC does not match the configured session address format")]
     MacAddressFormatMismatch,
 }
@@ -59,6 +62,9 @@ impl FsmEvent {
             Self::AppSessionUpdate { .. } => (K::SessionMetrics, None),
             Self::AppAnnounceDestination { mac } => (K::AnnounceDestination, Some(*mac)),
             Self::AppRequestLinkCharacteristics { mac, .. } => (K::LinkCharacteristics, Some(*mac)),
+            Self::AppLinkCharacteristicsResponse { mac, .. } => {
+                (K::LinkCharacteristicsResponse, Some(*mac))
+            }
             // Shutdown bypasses transaction serialization, as required by §8.
             _ => return None,
         };

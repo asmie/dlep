@@ -28,6 +28,7 @@ use tracing::debug;
 use crate::config::TimersConfig;
 use crate::connections::ConnectionTracker;
 use crate::events::{DaemonEvent, PeerInfo};
+use crate::link_control::{LinkControl, LinkJobs, LinkRequest};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionCommand, SessionRequest,
 };
@@ -92,6 +93,8 @@ struct SessionLifecycle {
     active_exts: Vec<Arc<dyn DlepExtension>>,
     down_emitted: bool,
     mac_address_format: dlep_core::MacAddressFormat,
+    /// Backend calls answering deferred Link Characteristics Requests.
+    link_jobs: LinkJobs,
 }
 
 impl Drop for SessionLifecycle {
@@ -147,6 +150,7 @@ pub fn session_config_from_timers(
         advertised_extensions,
         initial_metrics: Default::default(),
         mac_address_format: Default::default(),
+        defer_link_characteristics: false,
     }
 }
 
@@ -316,6 +320,7 @@ pub async fn run_session<F: SessionFsm>(
         role,
         session_id_counter,
         None,
+        None,
     )
     .await
 }
@@ -332,6 +337,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
     role: Role,
     session_id_counter: SessionIdCounter,
     connection: Option<ConnectionTracker>,
+    link_control: Option<Arc<dyn LinkControl>>,
 ) -> Result<(), DaemonError> {
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut read_buf = BytesMut::with_capacity(4096);
@@ -348,6 +354,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
         active_exts: Vec::new(),
         down_emitted: false,
         mac_address_format: fsm.mac_address_format(),
+        link_jobs: LinkJobs::new(link_control),
     };
     let mut pending_sends: Vec<Message> = Vec::new();
 
@@ -509,6 +516,26 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                 ).await?;
                 if let Some(receipt) = receipt { let _ = receipt.send(Some((session_id, outcome))); }
                 if closed { break; }
+            }
+
+            // A link-control backend answered a deferred request. If the FSM
+            // rejects the answer (e.g. undeclared metrics), deny instead so
+            // the router's transaction still completes.
+            Some(event) = lifecycle.link_jobs.next(), if !lifecycle.link_jobs.is_empty() => {
+                let fallback = crate::link_control::fallback_denial(&event);
+                let mut actions = fsm.step(event);
+                if actions.iter().any(|action| matches!(action, FsmAction::Emit(EmittedEvent::CommandRejected(r)) if r.reason == dlep_fsm::CommandError::InvalidInput)) {
+                    tracing::warn!(session = session_id.0, "link-control backend returned an invalid response; denying the request");
+                    actions.extend(fsm.step(fallback.expect("link-control response")));
+                }
+                if process_actions(
+                    actions, &mut writer, &mut timers,
+                    &timer_expiry_tx, &events_tx, &peer,
+                    &extensions, session_id, is_router_side,
+                    &mut lifecycle, &mut pending_sends,
+                ).await? {
+                    break;
+                }
             }
 
             Some((id, kind, generation)) = timer_expiry_rx.recv() => {
@@ -716,6 +743,20 @@ async fn process_actions(
                             StatusCode::SUCCESS,
                         );
                     }
+                    EmittedEvent::LinkCharacteristicsRequested {
+                        mac,
+                        requested,
+                        metrics,
+                        pending: true,
+                    } => {
+                        lifecycle.link_jobs.start(LinkRequest {
+                            session_id,
+                            peer: peer.clone(),
+                            id: (*mac).into(),
+                            requested: *requested,
+                            current: *metrics,
+                        });
+                    }
                     EmittedEvent::DestinationDown { mac, reason } => {
                         dispatch_destination_state(
                             active_exts,
@@ -849,6 +890,16 @@ fn translate_emitted(
                 requested_addresses: requested_addresses.clone(),
             },
         }),
+        EmittedEvent::LinkCharacteristicsRequested { mac, requested, .. } => {
+            Some(DaemonEvent::Destination {
+                session_id,
+                peer: peer.clone(),
+                event: DestinationEvent::LinkCharacteristicsRequested {
+                    id: DestinationId(*mac),
+                    requested: *requested,
+                },
+            })
+        }
         EmittedEvent::SessionMetricsUpdate { metrics } => Some(DaemonEvent::Metrics {
             session_id,
             peer: peer.clone(),

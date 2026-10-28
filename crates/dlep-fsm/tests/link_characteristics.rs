@@ -54,11 +54,22 @@ fn status(m: &Message) -> S {
         .unwrap()
 }
 fn sessions() -> (RouterSessionFsm, ModemSessionFsm) {
-    let mut r = RouterSessionFsm::new();
-    let mut m = ModemSessionFsm::with_config(dlep_fsm::SessionConfig {
+    sessions_with(dlep_fsm::SessionConfig {
         initial_metrics: metrics(),
         ..Default::default()
-    });
+    })
+}
+fn deferred_sessions() -> (RouterSessionFsm, ModemSessionFsm) {
+    sessions_with(dlep_fsm::SessionConfig {
+        initial_metrics: metrics(),
+        defer_link_characteristics: true,
+        ..Default::default()
+    })
+}
+fn sessions_with(config: dlep_fsm::SessionConfig) -> (RouterSessionFsm, ModemSessionFsm) {
+    let destination = config.initial_metrics;
+    let mut r = RouterSessionFsm::new();
+    let mut m = ModemSessionFsm::with_config(config);
     m.step(E::TcpAccepted);
     let init = sent(&r.step(E::TcpConnected), M::SESSION_INITIALIZATION);
     let reply = sent(
@@ -66,14 +77,22 @@ fn sessions() -> (RouterSessionFsm, ModemSessionFsm) {
         M::SESSION_INITIALIZATION_RESPONSE,
     );
     r.step(E::RecvMessage(reply));
-    add(&mut r, &mut m, mac(1));
+    add_with(&mut r, &mut m, mac(1), destination);
     (r, m)
 }
 fn add(r: &mut RouterSessionFsm, m: &mut ModemSessionFsm, mac: MacAddress) {
+    add_with(r, m, mac, metrics());
+}
+fn add_with(
+    r: &mut RouterSessionFsm,
+    m: &mut ModemSessionFsm,
+    mac: MacAddress,
+    metrics: LinkMetrics,
+) {
     let up = sent(
         &m.step(E::AppAddDestination {
             mac,
-            metrics: metrics(),
+            metrics,
             addrs: DestinationAddrs::default(),
         }),
         M::DESTINATION_UP,
@@ -354,4 +373,199 @@ fn response_metric_set_matches_what_this_peer_declared() {
             assert_eq!(r.state(), RouterSessionState::InSession);
         }
     }
+}
+
+fn answer(status: S, text: &str, metrics: Option<LinkMetrics>) -> E {
+    E::AppLinkCharacteristicsResponse {
+        mac: mac(1),
+        status,
+        text: text.into(),
+        metrics,
+    }
+}
+fn no_wire_messages(actions: &[A]) -> bool {
+    !actions.iter().any(|a| matches!(a, A::SendMessage(_)))
+}
+
+#[test]
+fn immediate_denial_still_reports_the_request() {
+    let (mut r, mut m) = sessions();
+    let actions = m.step(E::RecvMessage(request(&mut r, mac(1))));
+    assert_eq!(
+        status(&sent(&actions, M::LINK_CHARACTERISTICS_RESPONSE)),
+        S::REQUEST_DENIED
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        A::Emit(EmittedEvent::LinkCharacteristicsRequested { pending: false, requested: got, .. })
+            if *got == requested()
+    )));
+    assert!(!m.link_characteristics_pending(&mac(1)));
+    common::assert_rejected(
+        m.step(answer(S::SUCCESS, "", None)),
+        dlep_fsm::CommandError::NoPendingRequest,
+    );
+}
+
+#[test]
+fn deferred_request_waits_for_application_and_grant_updates_metrics() {
+    let (mut r, mut m) = deferred_sessions();
+    let actions = m.step(E::RecvMessage(request(&mut r, mac(1))));
+    assert!(no_wire_messages(&actions));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        A::Emit(EmittedEvent::LinkCharacteristicsRequested { mac: got, pending: true, requested: req, metrics: current })
+            if *got == mac(1) && *req == requested() && *current == metrics()
+    )));
+    assert!(m.link_characteristics_pending(&mac(1)));
+    // §8: no deadline; heartbeats keep the request outstanding.
+    for _ in 0..10 {
+        assert!(no_wire_messages(
+            &m.step(E::RecvMessage(Message::new(M::HEARTBEAT)))
+        ));
+    }
+    assert!(m.link_characteristics_pending(&mac(1)));
+
+    let granted = LinkMetrics {
+        latency: Duration::from_micros(200),
+        mtu: None,
+        ..metrics()
+    };
+    let response = sent(
+        &m.step(answer(S::SUCCESS, "applied", Some(granted))),
+        M::LINK_CHARACTERISTICS_RESPONSE,
+    );
+    assert!(!m.link_characteristics_pending(&mac(1)));
+    // Omitted optional metrics are retained, and every declared metric is sent.
+    assert_eq!(response.data_items.len(), 11);
+    assert_eq!(m.destinations[&mac(1)].metrics.latency, granted.latency);
+    assert_eq!(m.destinations[&mac(1)].metrics.mtu, metrics().mtu);
+    let actions = r.step(E::RecvMessage(response));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        A::Emit(EmittedEvent::LinkCharacteristicsResponse { status: S::SUCCESS, text, metrics: got, .. })
+            if text == "applied" && got.latency == granted.latency
+    )));
+    assert!(!r.tx.destination_busy(&mac(1)));
+    assert_eq!(m.state(), ModemSessionState::InSession);
+}
+
+#[test]
+fn deferred_denial_reports_metrics_updated_while_pending() {
+    let (mut r, mut m) = deferred_sessions();
+    m.step(E::RecvMessage(request(&mut r, mac(1))));
+    let changed = LinkMetrics {
+        current_data_rate_rx_bps: 1_234,
+        ..metrics()
+    };
+    // Destination Update is not a transaction and may still be sent.
+    let update = sent(
+        &m.step(E::AppUpdateMetrics {
+            mac: mac(1),
+            metrics: changed,
+        }),
+        M::DESTINATION_UPDATE,
+    );
+    r.step(E::RecvMessage(update));
+    let response = sent(
+        &m.step(answer(S::REQUEST_DENIED, "", None)),
+        M::LINK_CHARACTERISTICS_RESPONSE,
+    );
+    assert_eq!(status(&response), S::REQUEST_DENIED);
+    assert!(
+        response
+            .data_items
+            .iter()
+            .any(|item| matches!(item, DataItem::CurrentDataRateReceive(1_234)))
+    );
+    r.step(E::RecvMessage(response));
+    assert!(!r.tx.destination_busy(&mac(1)));
+}
+
+#[test]
+fn pending_request_occupies_the_destination_transaction_scope() {
+    let (mut r, mut m) = deferred_sessions();
+    add(&mut r, &mut m, mac(2));
+    m.step(E::RecvMessage(request(&mut r, mac(1))));
+    common::assert_rejected(
+        m.step(E::AppDropDestination {
+            mac: mac(1),
+            reason: S::SUCCESS,
+        }),
+        dlep_fsm::CommandError::Busy,
+    );
+    common::assert_rejected(
+        m.step(E::AppLinkCharacteristicsResponse {
+            mac: mac(2),
+            status: S::SUCCESS,
+            text: String::new(),
+            metrics: None,
+        }),
+        dlep_fsm::CommandError::NoPendingRequest,
+    );
+    // Other destinations are independent.
+    m.step(E::RecvMessage(request(&mut r, mac(2))));
+    assert!(m.link_characteristics_pending(&mac(1)));
+    assert!(m.link_characteristics_pending(&mac(2)));
+    assert_eq!(m.state(), ModemSessionState::InSession);
+}
+
+#[test]
+fn peer_request_in_a_pending_scope_terminates_the_session() {
+    for conflicting in [
+        build_link_characteristics_request(mac(1), &requested()),
+        Message::new(M::DESTINATION_DOWN).with_item(DataItem::MacAddress(mac(1))),
+    ] {
+        let (mut r, mut m) = deferred_sessions();
+        m.step(E::RecvMessage(request(&mut r, mac(1))));
+        assert_eq!(
+            status(&sent(
+                &m.step(E::RecvMessage(conflicting)),
+                M::SESSION_TERMINATION
+            )),
+            S::UNEXPECTED_MESSAGE
+        );
+    }
+}
+
+#[test]
+fn invalid_answers_are_rejected_and_leave_the_request_pending() {
+    let mut config = dlep_fsm::SessionConfig {
+        defer_link_characteristics: true,
+        ..Default::default()
+    };
+    config.initial_metrics.mtu = Some(1500);
+    let (mut r, mut m) = sessions_with(config);
+    m.step(E::RecvMessage(request(&mut r, mac(1))));
+    for invalid in [
+        answer(S::INVALID_DATA, "", None),
+        answer(
+            S::SUCCESS,
+            "",
+            Some(LinkMetrics {
+                resources: Some(10),
+                ..Default::default()
+            }),
+        ),
+        answer(S::SUCCESS, &"x".repeat(70_000), None),
+    ] {
+        common::assert_rejected(m.step(invalid), dlep_fsm::CommandError::InvalidInput);
+        assert!(m.link_characteristics_pending(&mac(1)));
+    }
+    let response = sent(
+        &m.step(answer(S::REQUEST_DENIED, "", None)),
+        M::LINK_CHARACTERISTICS_RESPONSE,
+    );
+    r.step(E::RecvMessage(response));
+    assert_eq!(r.state(), RouterSessionState::InSession);
+    assert!(!r.tx.destination_busy(&mac(1)));
+}
+
+#[test]
+fn router_rejects_link_characteristics_answers() {
+    let (mut r, _) = sessions();
+    common::assert_rejected(
+        r.step(answer(S::SUCCESS, "", None)),
+        dlep_fsm::CommandError::Unsupported,
+    );
 }

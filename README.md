@@ -22,8 +22,10 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > for the milestone log and remaining follow-ups, and
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
 >
-> Not yet implemented: a modem backend that applies
-> requested link changes. Busy commands return explicit acceptance errors.
+>
+> Embedders can register a modem link-control backend that applies requested
+> link changes; the bundled modem binary has no radio and denies them. Busy
+> commands return explicit acceptance errors.
 
 ## Goals
 
@@ -245,10 +247,36 @@ transaction deadlines. Peer silence is detected by the session heartbeat
 mechanism. The former `[timers].link_characteristics_timeout_ms` setting has
 been removed and is rejected if present in a configuration file.
 
-The bundled modem cannot change physical link parameters. It returns
-`Request Denied` with current destination metrics, keeping the session alive.
-Applying requested changes requires a modem control backend, which remains
-unimplemented.
+On the modem, `ModemBuilder::link_control(backend)` registers a
+`dlep_daemon::LinkControl` backend that decides each request. It receives a
+`LinkRequest` (session, peer, destination, requested values, and current
+metrics) and returns a `LinkResponse`: `granted(metrics)` for an applied change
+or `denied()` when it cannot be met, optionally `with_text(..)`. The future may
+run as long as the radio needs; the request holds that destination's transaction
+slot, so the router's further requests and the modem's `drop_destination` for it
+return Busy until the answer. Destination updates remain available. Granted
+metrics merge into the destination like `update_destination` and are reported
+only on the requesting session. Undeclared metrics, session-terminating
+statuses, and backend panics produce `Request Denied` with current metrics. The
+backend future is dropped if the session ends first. A closure works:
+
+```rust
+let modem = ModemDaemon::builder()
+    .config(config)
+    .link_control(Arc::new(|request: LinkRequest| async move {
+        match apply_to_radio(&request).await {
+            Ok(metrics) => LinkResponse::granted(metrics),
+            Err(reason) => LinkResponse::denied().with_text(reason.to_string()),
+        }
+    }))
+    .spawn()
+    .await?;
+```
+
+Without a backend, including in the bundled `dlep-modem` binary, the modem
+returns `Request Denied` with current destination metrics, keeping the session
+alive. Either way, the modem application receives
+`DestinationEvent::LinkCharacteristicsRequested` for each request.
 
 Command methods now await local acceptance by the session task. `Ok(())` means
 the command was applied, sent, or retained as a pending Up update; peer responses

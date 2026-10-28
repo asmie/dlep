@@ -73,6 +73,16 @@ pub enum FsmEvent {
         mac: MacAddress,
         requested: LinkCharacteristics,
     },
+    /// Modem answer to a pending Link Characteristics Request (RFC 8175
+    /// §12.19). `metrics` are merged into the destination like a metric update
+    /// and describe the link after processing; None reports current metrics.
+    /// The response always carries the complete effective metric set.
+    AppLinkCharacteristicsResponse {
+        mac: MacAddress,
+        status: StatusCode,
+        text: String,
+        metrics: Option<LinkMetrics>,
+    },
     AppStartDiscovery,
     AppShutdown {
         reason: StatusCode,
@@ -158,6 +168,17 @@ pub enum EmittedEvent {
         status: StatusCode,
         text: String,
         metrics: LinkMetrics,
+    },
+    /// The router asked this modem to change a destination's link (RFC 8175
+    /// §12.18). `metrics` are the destination's current effective metrics.
+    /// When `pending`, no response has been sent: the application must answer
+    /// with `FsmEvent::AppLinkCharacteristicsResponse`. Otherwise the modem
+    /// already replied Request Denied.
+    LinkCharacteristicsRequested {
+        mac: MacAddress,
+        requested: LinkCharacteristics,
+        metrics: LinkMetrics,
+        pending: bool,
     },
     /// Session-wide metric change the peer reported in a Session Update
     /// Message (RFC 8175 §12.7). Distinct from `DestinationUpdate`, which

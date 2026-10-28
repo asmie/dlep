@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Modem link-control backend: `ModemBuilder::link_control` registers a
+  `LinkControl` implementation (or closure) that answers router Link
+  Characteristics Requests, taking as long as the radio needs. Invalid answers
+  and backend panics fall back to Request Denied. Without a backend, including
+  in the `dlep-modem` binary, requests are still denied immediately.
+- The modem application receives `DestinationEvent::LinkCharacteristicsRequested`
+  for every request. Applications that match `DestinationEvent` exhaustively
+  must handle the new variant.
+- FSM: `SessionConfig.defer_link_characteristics`,
+  `FsmEvent::AppLinkCharacteristicsResponse`,
+  `EmittedEvent::LinkCharacteristicsRequested`,
+  `CommandKind::LinkCharacteristicsResponse`, and
+  `CommandError::NoPendingRequest`. A deferred request occupies its
+  destination's transaction scope, so the modem's `drop_destination` returns
+  Busy until it is answered. The new field and variants break `SessionConfig`
+  literals without `..Default::default()` and exhaustive matches.
+
 ## 0.2.0
 
 The first functional release of this repository's DLEP implementation. The

@@ -304,7 +304,8 @@ The units restrict filesystem writes, device access, kernel/control-group
 changes, real-time scheduling, and set-ID file creation. Socket families include
 `AF_PACKET` for strict GTSM monitoring and `AF_NETLINK` for interface enumeration.
 The router grants only `CAP_NET_RAW`; the modem also grants
-`CAP_NET_BIND_SERVICE`. A future modem backend needing device access will need
+`CAP_NET_BIND_SERVICE`. The bundled modem denies Link Characteristics
+Requests. An embedder whose `LinkControl` backend needs device access will need
 a corresponding unit override.
 
 Both binaries handle SIGTERM (`systemctl stop`) and SIGINT (Ctrl-C). They stop
