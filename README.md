@@ -22,10 +22,10 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > for the milestone log and remaining follow-ups, and
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
 >
->
-> Embedders can register a modem link-control backend that applies requested
-> link changes; the bundled modem binary has no radio and denies them. Busy
-> commands return explicit acceptance errors.
+> The modem binary integrates a radio through an external
+> [adapter process](doc/radio-adapter.md) that reports destinations and answers
+> Link Characteristics Requests; embedders can register a link-control backend
+> directly. Busy commands return explicit acceptance errors.
 
 ## Goals
 
@@ -273,9 +273,10 @@ let modem = ModemDaemon::builder()
     .await?;
 ```
 
-Without a backend, including in the bundled `dlep-modem` binary, the modem
-returns `Request Denied` with current destination metrics, keeping the session
-alive. Either way, the modem application receives
+Without a backend, the modem returns `Request Denied` with current destination
+metrics, keeping the session alive. The `dlep-modem` binary uses its
+[radio adapter](doc/radio-adapter.md) as the backend when `[radio]` is
+configured and denies requests otherwise. Either way, the modem application receives
 `DestinationEvent::LinkCharacteristicsRequested` for each request.
 
 Command methods now await local acceptance by the session task. `Ok(())` means
@@ -399,6 +400,10 @@ and incomplete TLS handshakes are cancelled during shutdown.
   per-crate responsibilities, design decisions, configuration schema, public
   API shape, testing strategy, milestone status and open questions. Read this
   before contributing.
+- [`doc/deployment.md`](doc/deployment.md) — PKI, privileges, firewall, and
+  systemd deployment.
+- [`doc/radio-adapter.md`](doc/radio-adapter.md) — the JSON Lines protocol
+  between `dlep-modem` and an external radio adapter.
 - [RFC 8175] — the protocol specification.
 
 ## License

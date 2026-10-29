@@ -5,6 +5,8 @@ use clap::Parser;
 use dlep_daemon::{ModemConfig, ModemDaemon, check_modem_config, load_toml_config};
 use tracing_subscriber::EnvFilter;
 
+mod radio;
+
 /// DLEP (RFC 8175) modem-side daemon.
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -85,20 +87,50 @@ where
         None
     };
 
+    // Start the adapter before opening sockets so a bad command fails early.
+    let initial_metrics = config.metrics.link_metrics();
+    let mut adapter = match &config.radio {
+        Some(radio) => Some(radio::Adapter::spawn(radio)?),
+        None => None,
+    };
+
     let mut builder = ModemDaemon::builder().config(config);
     if let Some(tls) = tls {
         builder = builder.with_rustls_server(tls);
+    }
+    if let Some(adapter) = &adapter {
+        builder = builder.link_control(adapter.link_control());
     }
     let daemon = builder
         .spawn()
         .await
         .context("failed to start modem daemon")?;
+    let events = daemon.subscribe();
     tracing::info!("modem listening on {}", daemon.local_addr());
 
-    shutdown.recv().await;
-    tracing::info!("shutdown requested");
+    // An adapter failure terminates sessions like a shutdown signal, then
+    // exits with an error so a supervisor restarts the modem and adapter.
+    let outcome = match &mut adapter {
+        Some(adapter) => tokio::select! {
+            () = shutdown.recv() => Ok(()),
+            result = adapter.run(&daemon, events, initial_metrics) => {
+                result.map(|never| match never {}).context("radio adapter failed")
+            }
+        },
+        None => {
+            shutdown.recv().await;
+            Ok(())
+        }
+    };
+    match &outcome {
+        Ok(()) => tracing::info!("shutdown requested"),
+        Err(e) => tracing::error!("{e:#}; shutting down"),
+    }
     daemon.shutdown().await?;
-    Ok(())
+    if let Some(adapter) = adapter {
+        adapter.stop().await;
+    }
+    outcome
 }
 
 fn init_tracing(requested: &str) {

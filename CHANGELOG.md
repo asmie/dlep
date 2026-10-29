@@ -2,11 +2,22 @@
 
 ## Unreleased
 
+- Radio adapter for the `dlep-modem` binary: a `[radio]` section runs an
+  external program that reports destinations, metrics, and addresses and
+  answers Link Characteristics Requests over JSON Lines (see
+  `doc/radio-adapter.md`). Destinations are replayed to routers that connect
+  later. `link_request_timeout_ms` (default 30000) denies requests a stalled
+  adapter does not answer. If the adapter fails, the modem terminates its
+  sessions and exits with an error. The adapter does not inherit the modem's
+  ambient capabilities; adapters needing devices require a systemd drop-in.
+- New dependency: `serde_json` (adapter protocol). `ModemConfig` gains
+  `radio: Option<RadioConfig>`, which breaks exhaustive struct literals.
 - Modem link-control backend: `ModemBuilder::link_control` registers a
   `LinkControl` implementation (or closure) that answers router Link
   Characteristics Requests, taking as long as the radio needs. Invalid answers
-  and backend panics fall back to Request Denied. Without a backend, including
-  in the `dlep-modem` binary, requests are still denied immediately.
+  and backend panics fall back to Request Denied. Without a backend, requests
+  are still denied immediately; the `dlep-modem` binary uses its radio adapter
+  when one is configured.
 - The modem application receives `DestinationEvent::LinkCharacteristicsRequested`
   for every request. Applications that match `DestinationEvent` exhaustively
   must handle the new variant.

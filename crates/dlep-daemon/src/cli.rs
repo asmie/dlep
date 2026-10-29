@@ -54,6 +54,8 @@ pub enum ConfigCheckError {
     Interface(#[source] std::io::Error),
     #[error("invalid modem metrics: {0}")]
     Metrics(String),
+    #[error("invalid [radio] adapter: {0}")]
+    Radio(String),
     #[error(transparent)]
     Tls(#[from] TlsSetupError),
     #[error("mode = \"static\" requires at least one entry in static_peers")]
@@ -92,6 +94,15 @@ pub fn check_modem_config(cfg: &ModemConfig) -> Result<(), ConfigCheckError> {
         .validate_discovery_interface()
         .map_err(ConfigCheckError::Interface)?;
     cfg.metrics.validate().map_err(ConfigCheckError::Metrics)?;
+    if let Some(radio) = &cfg.radio {
+        radio.validate().map_err(ConfigCheckError::Radio)?;
+        if !radio.command.is_file() {
+            return Err(ConfigCheckError::Radio(format!(
+                "command {} is not a file",
+                radio.command.display()
+            )));
+        }
+    }
     if cfg.shared.network.use_tls {
         server_config(&cfg.shared.tls)?;
     }

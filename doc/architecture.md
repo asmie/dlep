@@ -173,7 +173,8 @@ embedders should use `dlep-daemon` instead. Each role:
    and exits without opening sockets.
 5. When `use_tls` is on, builds the rustls config from the `[tls]` section
    via `dlep_daemon::tls::{client_config, server_config}` and hands it to
-   the builder.
+   the builder. The modem starts its `[radio]` adapter, if configured, and
+   registers it as the link-control backend (`src/radio.rs`).
 6. Builds and spawns the daemon. The router then starts discovery (or
    connects to its static peers) and runs an event loop that connects to
    modems as `PeerDiscovered` arrives (deduplicated by address) and logs
@@ -794,7 +795,7 @@ The order of work was:
     `DestinationEvent::LinkCharacteristicsRequested` to the modem application.
     A granted change is reported only on the requesting session; embedders
     call `update_destination` when it affects other routers. The bundled modem
-    binary has no radio integration and keeps denying.
+    binary uses the radio adapter of item 31 as its backend.
 
     FSM tests cover immediate and deferred modes, heartbeats while pending,
     grants with retained optional metrics, denials reporting updates made while
@@ -802,6 +803,36 @@ The order of work was:
     invalid answers that leave the request pending. Daemon tests use real
     sessions for a granted change, a slow backend holding Busy until release,
     fallbacks for invalid answers and panics, and cancellation at session end.
+
+31. Modem radio adapter. **Done** — `[radio]` makes `dlep-modem` run one
+    external program and exchange JSON Lines with it
+    ([protocol](radio-adapter.md)). The adapter reports destinations, their
+    metrics and addresses, and session metrics; the modem forwards router link
+    requests and session/announce notices and uses the adapter's answers as its
+    `LinkControl` backend. `link_request_timeout_ms` (default 30 s) denies a
+    request the adapter does not answer; this is a local bound on a stalled
+    adapter, not an RFC transaction deadline.
+
+    The bridge keeps the adapter's destination table and session metrics and
+    replays them with targeted commands on every SessionUp, so destinations
+    reported before a router connects reach it. Commands rejected as Busy are
+    retried: a Destination Down waits for a pending link request on that
+    session, and a session metrics update waits for the previous one. A lagged
+    event subscription is logged because a missed SessionUp skips replay.
+    Invalid values are logged and leave the table unchanged. Adapter exit,
+    closed output, malformed JSON, and lines over 64 KiB are fatal: the modem
+    terminates sessions with Shutting Down and exits with an error for the
+    supervisor to restart. Unknown message types are ignored for forward
+    compatibility; unknown fields in known messages are errors. The adapter is
+    started before sockets open, without the modem's ambient capabilities, and
+    is killed if it ignores input EOF for two seconds at shutdown.
+
+    Unit tests cover MAC, metric, address, and message parsing. Subprocess
+    tests run the real binary with a scripted adapter and a library router:
+    replay with metrics and addresses, a granted request, adapter timeout,
+    Destination Down during a pending request, session metrics and updates,
+    adapter exit and malformed output, `--check-config` validation, and
+    ambient-capability dropping via `setpriv`.
 
 ---
 

@@ -38,6 +38,7 @@ fn fast_timers() -> TimersConfig {
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        radio: None,
         metrics: dlep_daemon::MetricsConfig {
             resources: Some(100),
             rlq_rx: Some(100),

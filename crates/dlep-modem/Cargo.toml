@@ -16,9 +16,14 @@ name = "dlep-modem"
 path = "src/main.rs"
 
 [dependencies]
+dlep-core.workspace = true
 dlep-daemon.workspace = true
 dlep-ext.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
+ipnet.workspace = true
+nix.workspace = true
 clap.workspace = true
 toml.workspace = true
 anyhow.workspace = true
@@ -26,7 +31,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-dlep-core.workspace = true
 dlep-fsm.workspace = true
 dlep-net = { workspace = true, features = ["test-helpers"] }
 tempfile.workspace = true

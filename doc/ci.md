@@ -131,6 +131,10 @@ status. The script always enters a new network namespace before making network
 changes. GitHub runners use `sudo` to provide the capabilities needed by strict
 GTSM.
 
+The `dlep-modem` radio adapter tests run a Python 3 adapter script and use
+`setpriv` (util-linux) to check that the adapter does not inherit ambient
+capabilities; the capability check is skipped when `setpriv` is unavailable.
+
 For local Linux runs where unprivileged user namespaces are enabled:
 
 ```sh

@@ -331,11 +331,55 @@ impl MetricsConfig {
     }
 }
 
+/// External radio adapter run by the `dlep-modem` binary. The adapter reports
+/// destinations and answers Link Characteristics Requests over JSON Lines on
+/// its standard output and input; see `doc/radio-adapter.md`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadioConfig {
+    /// Absolute path of the adapter executable; it is not searched in PATH.
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Local deadline for the adapter's answer to one link request, after
+    /// which the modem replies Request Denied. RFC 8175 §8 sets no protocol
+    /// deadline; this only bounds a stalled adapter.
+    #[serde(default = "default_link_request_timeout_ms")]
+    pub link_request_timeout_ms: u32,
+}
+
+impl RadioConfig {
+    pub fn new(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+            link_request_timeout_ms: default_link_request_timeout_ms(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.command.is_absolute() {
+            return Err("command must be an absolute path".into());
+        }
+        if self.link_request_timeout_ms == 0 {
+            return Err("link_request_timeout_ms must be positive".into());
+        }
+        Ok(())
+    }
+}
+
+fn default_link_request_timeout_ms() -> u32 {
+    30_000
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(from = "ModemConfigFile")]
 pub struct ModemConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Used by the `dlep-modem` binary; library embedders integrate directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio: Option<RadioConfig>,
     #[serde(flatten)]
     pub shared: SharedConfig,
     #[serde(default = "default_modem_peer_description")]
@@ -346,6 +390,7 @@ impl Default for ModemConfig {
     fn default() -> Self {
         Self {
             metrics: MetricsConfig::default(),
+            radio: None,
             shared: SharedConfig::default(),
             peer_description: default_modem_peer_description(),
         }
@@ -401,6 +446,7 @@ struct ModemConfigFile {
     timers: TimersConfig,
     #[serde(default)]
     metrics: MetricsConfig,
+    radio: Option<RadioConfig>,
     #[serde(default = "default_modem_peer_description")]
     peer_description: String,
 }
@@ -414,6 +460,7 @@ impl From<ModemConfigFile> for ModemConfig {
                 timers: file.timers,
             },
             metrics: file.metrics,
+            radio: file.radio,
             peer_description: file.peer_description,
         }
     }

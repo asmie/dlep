@@ -60,3 +60,12 @@ latency_us = 2500
 # rlq_rx = 95     # percent, 0–100
 # rlq_tx = 95     # percent, 0–100
 # mtu = 1500     # bytes
+
+# External radio adapter reporting destinations and answering Link
+# Characteristics Requests over JSON Lines; see doc/radio-adapter.md.
+# Without it the modem reports no destinations. A device-accessing adapter
+# needs a systemd drop-in relaxing PrivateDevices.
+# [radio]
+# command = "/usr/local/libexec/dlep-radio"  # absolute path
+# args = ["--device", "/dev/ttyUSB0"]
+# link_request_timeout_ms = 30000           # deny if the adapter stalls

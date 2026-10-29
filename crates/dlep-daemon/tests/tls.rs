@@ -19,6 +19,7 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        radio: None,
         metrics: dlep_daemon::MetricsConfig {
             resources: Some(100),
             rlq_rx: Some(100),

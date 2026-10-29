@@ -40,6 +40,7 @@ fn discovery_test_port() -> u16 {
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        radio: None,
         metrics: Default::default(),
         shared: SharedConfig {
             network: NetworkConfig {

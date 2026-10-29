@@ -147,7 +147,9 @@ impl ModemDaemon {
         .await
     }
 
-    fn validate_metrics(&self, metrics: &LinkMetrics) -> Result<(), DaemonError> {
+    /// Validate metric declarations and wire encoding without sending an update.
+    /// Link-control backends can use this before retaining response metrics.
+    pub fn validate_metrics(&self, metrics: &LinkMetrics) -> Result<(), DaemonError> {
         if !metrics.supported_by(&self.initial_metrics) {
             return Err(DaemonError::Config(
                 "optional metric was not declared in ModemConfig.metrics".into(),
