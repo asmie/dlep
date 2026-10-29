@@ -794,7 +794,8 @@ impl Bridge<'_> {
                         addrs: known.addresses.clone(),
                     }
                 }
-                Retry::Drop(mac) if self.destinations.contains_key(&mac) => continue,
+                // This session still holds the withdrawn entry even if the
+                // adapter re-reported the MAC: its re-add was AlreadyExists.
                 Retry::Drop(mac) => SessionCommand::DropDestination {
                     mac,
                     reason: StatusCode::SUCCESS,
@@ -806,6 +807,13 @@ impl Bridge<'_> {
             let result = self.daemon.send_command_to(session_id, command).await;
             self.accepted("retried command", &result);
             self.schedule_busy(&result, retry);
+            if let (Retry::Drop(mac), Ok(())) = (retry, &result) {
+                if self.destinations.contains_key(&mac) {
+                    // Re-add current state once the router acknowledges the Down.
+                    self.retries
+                        .push((Instant::now() + RETRY_DELAY, session_id, Retry::Add(mac)));
+                }
+            }
         }
     }
 
@@ -866,19 +874,67 @@ mod tests {
     use dlep_core::{Message, MessageType};
     use dlep_daemon::ModemConfig;
     use dlep_fsm::session_common::{
-        build_destination_down_response, build_destination_up_response, extract_link_metrics,
+        build_destination_down_response, build_destination_up_response,
+        build_link_characteristics_request, extract_link_metrics,
     };
     use tokio::net::TcpStream;
 
     const WAIT: Duration = Duration::from_secs(5);
 
     async fn modem() -> ModemDaemon {
+        modem_with(None).await
+    }
+
+    async fn modem_with(backend: Option<Arc<dyn LinkControl>>) -> ModemDaemon {
         let mut config = ModemConfig::default();
         config.shared.network.use_tls = false;
         config.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
         config.shared.network.tcp_port = 0;
         config.shared.network.discovery_port = 0;
-        ModemDaemon::builder().config(config).spawn().await.unwrap()
+        let mut builder = ModemDaemon::builder().config(config);
+        if let Some(backend) = backend {
+            builder = builder.link_control(backend);
+        }
+        builder.spawn().await.unwrap()
+    }
+
+    /// Establish a session from a hand-driven router FSM over raw TCP.
+    async fn session(
+        daemon: &ModemDaemon,
+        events: &mut broadcast::Receiver<DaemonEvent>,
+    ) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        dlep_net::gtsm::configure_tcp(&socket, false, true).unwrap();
+        let mut peer = socket.connect(daemon.local_addr()).await.unwrap();
+        let mut router = dlep_fsm::session_router::RouterSessionFsm::new();
+        for action in router.step(dlep_fsm::FsmEvent::TcpConnected) {
+            if let dlep_fsm::FsmAction::SendMessage(message) = action {
+                send(&mut peer, message).await;
+            }
+        }
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_INITIALIZATION_RESPONSE
+        );
+        wait_for(events, |e| matches!(e, DaemonEvent::SessionUp { .. })).await;
+        peer
+    }
+
+    async fn wait_for(
+        events: &mut broadcast::Receiver<DaemonEvent>,
+        predicate: impl Fn(&DaemonEvent) -> bool,
+    ) {
+        tokio::time::timeout(WAIT, async {
+            while !predicate(&events.recv().await.unwrap()) {}
+        })
+        .await
+        .unwrap();
+    }
+
+    fn fire_retries(bridge: &mut Bridge<'_>) {
+        for retry in &mut bridge.retries {
+            retry.0 = Instant::now();
+        }
     }
 
     fn bridge(daemon: &ModemDaemon) -> Bridge<'_> {
@@ -1010,6 +1066,106 @@ mod tests {
         for retry in &mut bridge.retries {
             retry.0 = Instant::now();
         }
+        bridge.retry().await;
+        let readded = read(&mut peer).await;
+        assert_eq!(readded.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&readded).unwrap().latency,
+            Duration::from_micros(1234)
+        );
+        assert!(bridge.retries.is_empty());
+        drop(peer);
+        daemon.shutdown().await.unwrap();
+    }
+
+    // A pending link request makes the withdrawal Busy, and the re-report finds
+    // the old entry still present (AlreadyExists). The router must still see
+    // the withdrawal followed by the destination's current state.
+    #[tokio::test]
+    async fn destination_rereported_while_its_drop_awaits_a_link_answer_is_replaced() {
+        let (release, released) = oneshot::channel::<()>();
+        let released = Arc::new(std::sync::Mutex::new(Some(released)));
+        let backend = move |_request: LinkRequest| {
+            let released = released.lock().unwrap().take();
+            async move {
+                if let Some(released) = released {
+                    let _ = released.await;
+                }
+                LinkResponse::denied()
+            }
+        };
+        let daemon = modem_with(Some(Arc::new(backend))).await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+
+        bridge.inbound(up(Metrics::default())).await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        send(
+            &mut peer,
+            build_link_characteristics_request(
+                mac(),
+                &dlep_daemon::LinkCharacteristics {
+                    latency: Some(Duration::from_micros(1)),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        wait_for(&mut events, |e| {
+            matches!(
+                e,
+                DaemonEvent::Destination {
+                    event: DestinationEvent::LinkCharacteristicsRequested { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+
+        bridge
+            .inbound(Inbound::DestinationDown { mac: Mac(mac()) })
+            .await;
+        assert!(matches!(bridge.retries.as_slice(), [(_, _, Retry::Drop(m))] if *m == mac()));
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(1234),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            bridge.retries.len(),
+            1,
+            "re-add was AlreadyExists, not Busy"
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::LINK_CHARACTERISTICS_RESPONSE
+        );
+        flush_peer(&mut peer).await;
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_DOWN
+        );
+        send(
+            &mut peer,
+            build_destination_down_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        fire_retries(&mut bridge);
         bridge.retry().await;
         let readded = read(&mut peer).await;
         assert_eq!(readded.message_type, MessageType::DESTINATION_UP);

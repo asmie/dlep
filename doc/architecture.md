@@ -817,7 +817,10 @@ The order of work was:
     replays them with targeted commands on every SessionUp, so destinations
     reported before a router connects reach it. Commands rejected as Busy are
     retried: a Destination Down waits for a pending link request on that
-    session, and a session metrics update waits for the previous one. A lagged
+    session, a re-reported destination is re-added with its current state once
+    that session acknowledges the withdrawal (including when the Down itself
+    was delayed by a link request), and a session metrics update waits for the
+    previous one. A lagged
     event subscription is logged because a missed SessionUp skips replay.
     Invalid values are logged and leave the table unchanged. Adapter exit,
     closed output, malformed JSON, and lines over 64 KiB are fatal: the modem
