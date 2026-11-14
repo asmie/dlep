@@ -163,6 +163,16 @@ async fn backend_grant_reaches_router_with_applied_metrics() {
     assert_eq!(metrics.current_data_rate_tx_bps, 123_000);
 
     let request = seen.recv().await.unwrap();
+    assert_eq!(
+        pair.router.state().borrow().sessions[&pair.session_id].destinations[&destination()]
+            .metrics,
+        metrics
+    );
+    assert_eq!(
+        pair.modem.state().borrow().sessions[&request.session_id].destinations[&destination()]
+            .metrics,
+        metrics
+    );
     assert_eq!(request.id, destination());
     assert_eq!(request.requested, requested());
     assert_eq!(request.current, current());

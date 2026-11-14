@@ -274,7 +274,22 @@ structural checks, not IPsec integrity verification.
 
 The public event bus is `tokio::sync::broadcast::Sender<DaemonEvent>` with a fixed capacity (256). Slow subscribers lose old events; bridging this stream into another channel does not recover events already dropped.
 
-Router reconnection instead uses `RouterDaemon::connection_states()`, a `watch` snapshot with one entry per contacted endpoint, retained until the daemon is dropped. It tracks active session tasks and cumulative successful initializations. Consumers read the initial snapshot and subsequent changes, releasing borrow guards before awaiting. Coalescing preserves the latest state and the successful-initialization count without accumulating an event queue.
+Router reconnection instead uses `RouterDaemon::connection_states()`, a `watch` snapshot with one entry per contacted endpoint, subject to the configured history limits and expiry. It tracks active session tasks and cumulative successful initializations. Consumers read the initial snapshot and subsequent changes, releasing borrow guards before awaiting. Coalescing preserves the latest state and the successful-initialization count without accumulating an event queue.
+
+Both daemons also expose `state()`, a watch feed of `DaemonSnapshot`. Session
+tasks publish their current session/destination view directly from the FSM before public events and
+command acceptance receipts; no broadcast consumer reconstructs it. This includes
+modem changes that emit no public event, such as updates held during Destination
+Up acknowledgement or after a router withdraws interest. Sessions contain peer
+identity, negotiated extensions, phase, effective metrics, peer addresses, and
+destinations with metrics, addresses, and pending/up/withdrawn phases. Only
+established sessions are included; they remain while terminating and are removed
+on completion, I/O failure, or cancellation. A daemon-wide generation increases
+only when retained state changes. Per-session Arc values keep consumer snapshot
+clones cheap. Read and clone the initial value and each new value, releasing watch
+borrows before awaiting. Coalescing preserves current state, not transient
+command outcomes, extension payloads, or historical termination reasons; older
+broadcast events must not be applied over a newer snapshot.
 
 Internal command flow (CLI → daemon → session task) is `mpsc`, single-consumer. Because the session task is the **sole owner and mutator of its FSM**, no locks are needed around the state — concurrency happens only at channel boundaries.
 
@@ -820,8 +835,13 @@ The order of work was:
     session, a re-reported destination is re-added with its current state once
     that session acknowledges the withdrawal (including when the Down itself
     was delayed by a link request), and a session metrics update waits for the
-    previous one. A lagged
-    event subscription is logged because a missed SessionUp skips replay.
+    previous one. Session membership and replay use the retained daemon state,
+    so a missed SessionUp no longer skips replay. A new `session_sync` adapter
+    notice supplies authoritative membership after startup and membership changes;
+    legacy lifecycle and announce notices remain available. Reconciliation
+    preserves existing session-specific destination values and withdrawals,
+    retries busy initialization, and discards retries and pending adapter requests
+    for ended sessions. Lag only loses transient notices, not current membership.
     Invalid values are logged and leave the table unchanged. Adapter exit,
     closed output, malformed JSON, and lines over 64 KiB are fatal: the modem
     terminates sessions with Shutting Down and exits with an error for the
@@ -836,6 +856,17 @@ The order of work was:
     Destination Down during a pending request, session metrics and updates,
     adapter exit and malformed output, `--check-config` validation, and
     ambient-capability dropping via `setpriv`.
+
+32. Retained protocol state and adapter recovery. **Done** — both daemons expose
+    the `state()` snapshot feed described in §5.11. Session tasks publish directly
+    from the FSM, including modem updates without public events, and remove state
+    on all exit paths. The radio bridge reconciles session membership and replay
+    from this feed and sends `session_sync` to its adapter. Tests cover IPv4/IPv6
+    broadcast overflow, late subscriptions, immutable prior snapshots, session
+    and destination metrics/addresses, withdrawn and pending destinations,
+    termination/cancellation, identical MACs on separate modems, and reconnects.
+    Bridge regressions also cover missed SessionUp, busy initialization, preserving
+    existing overrides, and cleanup of requests and retries for ended sessions.
 
 ---
 

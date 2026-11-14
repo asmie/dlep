@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Both daemon handles expose retained `state()` snapshots with a generation,
+  session/peer identity, negotiated extensions, effective metrics, addresses,
+  and destination phases. Late or lagged consumers can reconcile current state
+  without relying on public broadcast delivery. Session cleanup removes retained
+  entries on termination, I/O failure, and cancellation.
+- Radio bridge replay now follows retained session state, including after a lost
+  SessionUp. The adapter receives `session_sync` membership snapshots. Replay
+  retries busy session initialization and preserves existing destination metrics
+  and router withdrawals; ended sessions release pending requests and retries.
+
 - Radio adapter for the `dlep-modem` binary: a `[radio]` section runs an
   external program that reports destinations, metrics, and addresses and
   answers Link Characteristics Requests over JSON Lines (see

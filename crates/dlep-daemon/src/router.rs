@@ -27,6 +27,7 @@ type SessionTaskHandle = JoinHandle<Result<(), DaemonError>>;
 /// background task handles.
 pub struct RouterDaemon {
     events_tx: EventTx,
+    state: Arc<crate::state::StateRegistry>,
     connections: Arc<ConnectionRegistry>,
     session_slots: Arc<tokio::sync::Semaphore>,
     _history_reaper: HistoryReaper,
@@ -55,6 +56,14 @@ impl RouterDaemon {
 
     pub fn subscribe(&self) -> EventRx {
         self.events_tx.subscribe()
+    }
+
+    /// Retained protocol state for late or lagged consumers. Read the initial
+    /// snapshot and subsequent changes; clone and release watch borrows before
+    /// awaiting. Do not replay older broadcast events over a newer snapshot.
+    /// This feed coalesces state changes and does not retain command outcomes.
+    pub fn state(&self) -> watch::Receiver<crate::DaemonSnapshot> {
+        self.state.subscribe()
     }
 
     /// Subscribe to retained connection state for reconnect decisions. Unlike
@@ -199,6 +208,7 @@ impl RouterDaemon {
             self.session_id_counter.clone(),
             Some(tracker),
             None,
+            Some(self.state.clone()),
         );
         let handle = tokio::spawn(async move {
             let _permit = permit;
@@ -402,6 +412,7 @@ impl RouterBuilder {
         let (events_tx, _events_rx) = new_event_channel();
         Ok(RouterDaemon {
             events_tx,
+            state: crate::state::StateRegistry::new(),
             connections,
             session_slots: Arc::new(tokio::sync::Semaphore::new(cfg.limits.max_sessions)),
             _history_reaper: reaper,
@@ -556,6 +567,52 @@ mod cancellation_tests {
         let states = daemon.connection_states();
         assert_eq!(states.borrow()[&addr], PeerConnectionState::default());
         daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_established_session_removes_protocol_snapshot_before_down_event() {
+        let daemon = router().await;
+        let mut config = crate::ModemConfig::default();
+        config.shared.network.use_tls = false;
+        config.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
+        config.shared.network.tcp_port = 0;
+        config.shared.network.discovery_port = 0;
+        let modem = crate::ModemDaemon::builder()
+            .config(config)
+            .spawn()
+            .await
+            .unwrap();
+        let mut events = daemon.subscribe();
+        daemon.connect_static(modem.local_addr()).await.unwrap();
+        let session_id = timeout(Duration::from_secs(3), async {
+            loop {
+                if let crate::DaemonEvent::SessionUp { session_id, .. } =
+                    events.recv().await.unwrap()
+                {
+                    break session_id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let before = daemon.state().borrow().clone();
+        assert!(before.sessions.contains_key(&session_id));
+        let task = daemon.tasks.lock().await.pop().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if let crate::DaemonEvent::SessionDown { .. } = events.recv().await.unwrap() {
+                    assert!(daemon.state().borrow().sessions.is_empty());
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(daemon.state().borrow().generation > before.generation);
+        daemon.shutdown().await.unwrap();
+        modem.shutdown().await.unwrap();
     }
 
     #[tokio::test]

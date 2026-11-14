@@ -105,6 +105,11 @@ impl ModemSessionFsm {
         self.config.mac_address_format
     }
 
+    /// Effective local session metrics, including accepted application updates.
+    pub fn session_metrics(&self) -> LinkMetrics {
+        self.session_metrics
+    }
+
     /// Whether a Link Characteristics Request for `mac` awaits an answer.
     pub fn link_characteristics_pending(&self, mac: &MacAddress) -> bool {
         self.pending_link_requests.contains(mac)

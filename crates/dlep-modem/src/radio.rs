@@ -19,9 +19,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use dlep_core::{MacAddress, StatusCode};
 use dlep_daemon::link_control::LinkControlFuture;
 use dlep_daemon::{
-    AddressChanges, CommandError, DaemonError, DaemonEvent, DestinationAddrs, DestinationEvent,
-    DestinationId, LinkControl, LinkMetrics, LinkRequest, LinkResponse, ModemDaemon, RadioConfig,
-    SessionCommand,
+    AddressChanges, CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs,
+    DestinationEvent, DestinationId, LinkControl, LinkMetrics, LinkRequest, LinkResponse,
+    ModemDaemon, PeerInfo, RadioConfig, SessionCommand, SessionPhase,
 };
 use dlep_ext::SessionId;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -267,6 +267,10 @@ fn parse_inbound(line: &str) -> Result<Inbound> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Outbound {
+    /// Authoritative session membership, including after lost lifecycle events.
+    SessionSync {
+        sessions: Vec<SessionPeer>,
+    },
     SessionUp {
         session: u64,
         peer: SocketAddr,
@@ -288,6 +292,12 @@ enum Outbound {
         requested: Requested,
         current: Metrics,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct SessionPeer {
+    session: u64,
+    peer: SocketAddr,
 }
 
 type Ask = (LinkRequest, oneshot::Sender<LinkResponse>);
@@ -393,15 +403,27 @@ impl Adapter {
             daemon,
             out: self.out.clone(),
             destinations: BTreeMap::new(),
-            initial,
             session_metrics: initial,
             pending: HashMap::new(),
             next_request: 1,
             retries: Vec::new(),
+            sessions: HashMap::new(),
+            synced: false,
         };
+        let mut state = daemon.state();
         loop {
+            if !bridge.synced || state.has_changed().unwrap_or(false) {
+                let snapshot = state.borrow_and_update().clone();
+                bridge.reconcile(&snapshot).await;
+            }
             let next_retry = bridge.retries.iter().map(|r| r.0).min();
             tokio::select! {
+                changed = state.changed() => {
+                    if changed.is_err() { bail!("modem state feed stopped"); }
+                    // `changed` marks the value seen; reconcile it explicitly.
+                    let snapshot = state.borrow_and_update().clone();
+                    bridge.reconcile(&snapshot).await;
+                },
                 line = self.lines.recv() => match line {
                     Some(Ok(line)) => {
                         let message = parse_inbound(&line)
@@ -416,7 +438,7 @@ impl Adapter {
                     Ok(event) => bridge.event(event).await,
                     Err(broadcast::error::RecvError::Lagged(missed)) => warn!(
                         missed,
-                        "radio bridge missed daemon events; a new router may lack destinations"
+                        "radio bridge missed transient notices; session state is reconciled separately"
                     ),
                     Err(broadcast::error::RecvError::Closed) => bail!("modem daemon stopped"),
                 },
@@ -520,6 +542,7 @@ async fn read_lines(
 
 #[derive(Clone, Copy, Debug)]
 enum Retry {
+    InitializeSession,
     Add(MacAddress),
     Drop(MacAddress),
     SessionMetrics,
@@ -531,6 +554,7 @@ struct Known {
 }
 
 struct Pending {
+    session_id: SessionId,
     answer: oneshot::Sender<LinkResponse>,
     mac: MacAddress,
     current: LinkMetrics,
@@ -540,11 +564,12 @@ struct Bridge<'a> {
     daemon: &'a ModemDaemon,
     out: mpsc::UnboundedSender<String>,
     destinations: BTreeMap<MacAddress, Known>,
-    initial: LinkMetrics,
     session_metrics: LinkMetrics,
     pending: HashMap<u64, Pending>,
     next_request: u64,
     retries: Vec<(Instant, SessionId, Retry)>,
+    sessions: HashMap<SessionId, PeerInfo>,
+    synced: bool,
 }
 
 impl Bridge<'_> {
@@ -713,6 +738,7 @@ impl Bridge<'_> {
         self.pending.insert(
             id,
             Pending {
+                session_id: request.session_id,
                 answer,
                 mac: request.id.0,
                 current: request.current,
@@ -720,43 +746,114 @@ impl Bridge<'_> {
         );
     }
 
-    async fn event(&mut self, event: DaemonEvent) {
-        match event {
-            DaemonEvent::SessionUp {
-                session_id, peer, ..
-            } => {
-                // Bring the new router up to date with the adapter's state.
-                if self.session_metrics != self.initial {
-                    let result = self
-                        .daemon
-                        .send_command_to(
-                            session_id,
-                            SessionCommand::SessionUpdate {
-                                metrics: self.session_metrics,
-                            },
-                        )
-                        .await;
-                    self.accepted("session metrics replay", &result);
-                }
-                for (mac, known) in &self.destinations {
-                    let result = self
-                        .daemon
-                        .send_command_to(
-                            session_id,
-                            SessionCommand::AddDestination {
-                                mac: *mac,
-                                metrics: known.metrics,
-                                addrs: known.addresses.clone(),
-                            },
-                        )
-                        .await;
-                    self.accepted("destination replay", &result);
-                }
+    /// Reconcile membership from retained runtime state, never lifecycle events.
+    /// Replay only for a new session; replaying existing sessions would undo a
+    /// router's withdrawal or overwrite a session-specific link-control grant.
+    async fn reconcile(&mut self, snapshot: &DaemonSnapshot) {
+        let sessions: HashMap<_, _> = snapshot
+            .sessions
+            .iter()
+            .map(|(id, session)| (*id, session.peer.clone()))
+            .collect();
+        self.retries.retain(|(_, id, _)| {
+            snapshot
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.phase == SessionPhase::Established)
+        });
+        self.pending.retain(|_, pending| {
+            snapshot.sessions.contains_key(&pending.session_id) && !pending.answer.is_closed()
+        });
+        if self.synced && self.sessions == sessions {
+            return;
+        }
+        for (&session_id, session) in &snapshot.sessions {
+            if !self.sessions.contains_key(&session_id)
+                && session.phase == SessionPhase::Established
+            {
+                self.replay_session(session_id, session).await;
                 self.send(&Outbound::SessionUp {
                     session: session_id.0,
-                    peer: peer.addr,
+                    peer: session.peer.addr,
                 });
             }
+        }
+        let mut peers: Vec<_> = sessions
+            .iter()
+            .map(|(id, peer)| SessionPeer {
+                session: id.0,
+                peer: peer.addr,
+            })
+            .collect();
+        peers.sort_by_key(|peer| peer.session);
+        self.send(&Outbound::SessionSync { sessions: peers });
+        self.sessions = sessions;
+        self.synced = true;
+    }
+
+    async fn replay_session(
+        &mut self,
+        session_id: SessionId,
+        session: &dlep_daemon::SessionSnapshot,
+    ) {
+        if self.session_metrics != session.metrics {
+            let result = self
+                .daemon
+                .send_command_to(
+                    session_id,
+                    SessionCommand::SessionUpdate {
+                        metrics: self.session_metrics,
+                    },
+                )
+                .await;
+            self.accepted("session metrics replay", &result);
+            self.schedule_busy(&result, Retry::InitializeSession);
+            if result.is_err() {
+                return;
+            }
+            // A report or a link-control grant may have reached this session
+            // before we observed it. Session Update overwrites every existing
+            // destination, so restore those effective per-session values.
+            for (id, destination) in &session.destinations {
+                let result = self
+                    .daemon
+                    .send_command_to(
+                        session_id,
+                        SessionCommand::UpdateDestination {
+                            mac: id.0,
+                            metrics: destination.metrics,
+                        },
+                    )
+                    .await;
+                self.accepted("destination metrics replay", &result);
+            }
+        }
+        let commands: Vec<_> = self
+            .destinations
+            .iter()
+            // Reports may already have reached this session before its
+            // initialization was observed by the bridge.
+            .filter(|(mac, _)| !session.destinations.contains_key(&(**mac).into()))
+            .map(|(mac, known)| {
+                (
+                    *mac,
+                    SessionCommand::AddDestination {
+                        mac: *mac,
+                        metrics: known.metrics,
+                        addrs: known.addresses.clone(),
+                    },
+                )
+            })
+            .collect();
+        for (mac, command) in commands {
+            let result = self.daemon.send_command_to(session_id, command).await;
+            self.accepted("destination replay", &result);
+            self.schedule_busy(&result, Retry::Add(mac));
+        }
+    }
+
+    async fn event(&mut self, event: DaemonEvent) {
+        match event {
             DaemonEvent::SessionDown {
                 session_id,
                 peer,
@@ -784,6 +881,15 @@ impl Bridge<'_> {
         self.retries = later;
         for (_, session_id, retry) in due {
             let command = match retry {
+                Retry::InitializeSession => {
+                    let snapshot = self.daemon.state().borrow().clone();
+                    if let Some(session) = snapshot.sessions.get(&session_id) {
+                        if session.phase == SessionPhase::Established {
+                            self.replay_session(session_id, session).await;
+                        }
+                    }
+                    continue;
+                }
                 Retry::Add(mac) => {
                     let Some(known) = self.destinations.get(&mac) else {
                         continue;
@@ -942,11 +1048,12 @@ mod tests {
             daemon,
             out: mpsc::unbounded_channel().0,
             destinations: BTreeMap::new(),
-            initial: ModemConfig::default().metrics.link_metrics(),
             session_metrics: ModemConfig::default().metrics.link_metrics(),
             pending: HashMap::new(),
             next_request: 1,
             retries: Vec::new(),
+            sessions: HashMap::new(),
+            synced: false,
         }
     }
 
@@ -990,6 +1097,358 @@ mod tests {
             read(peer).await.message_type,
             MessageType::SESSION_UPDATE_RESPONSE
         );
+    }
+
+    #[tokio::test]
+    async fn retained_sessions_replay_after_event_loss_and_remove_stale_retries() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut lagged = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::unbounded_channel();
+        bridge.out = out;
+        bridge.inbound(up(Metrics::default())).await;
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(42),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let mut peer = session(&daemon, &mut events).await;
+
+        // Lose SessionUp in a real daemon broadcast, without feeding any
+        // lifecycle event to the bridge. Each alternating address update emits
+        // a public event; its response is a deterministic processing barrier.
+        for i in 0..300 {
+            let addresses = DestinationAddrs {
+                v4: vec!["192.0.2.2".parse().unwrap()],
+                ..Default::default()
+            };
+            let changes = if i % 2 == 0 {
+                AddressChanges {
+                    added: addresses,
+                    removed: Default::default(),
+                }
+            } else {
+                AddressChanges {
+                    removed: addresses,
+                    added: Default::default(),
+                }
+            };
+            send(
+                &mut peer,
+                changes.append_to(Message::new(MessageType::SESSION_UPDATE)),
+            )
+            .await;
+            assert_eq!(
+                read(&mut peer).await.message_type,
+                MessageType::SESSION_UPDATE_RESPONSE
+            );
+        }
+        assert!(matches!(
+            lagged.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        let snapshot = daemon.state().borrow().clone();
+        let session_id = *snapshot.sessions.keys().next().unwrap();
+        bridge.reconcile(&snapshot).await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        let destination = read(&mut peer).await;
+        assert_eq!(destination.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&destination).unwrap().latency,
+            Duration::from_micros(42)
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        let notice: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(notice["type"], "session_up");
+        let sync: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(sync["type"], "session_sync");
+        assert_eq!(sync["sessions"][0]["session"], session_id.0);
+
+        // Further snapshots must not re-add a destination the router withdrew.
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_destination_down(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_DOWN_RESPONSE
+        );
+        flush_peer(&mut peer).await;
+        let snapshot = daemon.state().borrow().clone();
+        assert_eq!(
+            snapshot.sessions[&session_id].destinations[&mac().into()].phase,
+            dlep_daemon::DestinationPhase::Withdrawn
+        );
+        bridge.reconcile(&snapshot).await;
+        assert!(notices.try_recv().is_err());
+        bridge
+            .inbound(Inbound::DestinationUpdate {
+                mac: Mac(mac()),
+                metrics: Metrics {
+                    latency_us: Some(99),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            daemon.state().borrow().sessions[&session_id].destinations[&mac().into()]
+                .metrics
+                .latency,
+            Duration::from_micros(99)
+        );
+
+        bridge
+            .retries
+            .push((Instant::now(), session_id, Retry::Add(mac())));
+        let (answer, abandoned) = oneshot::channel();
+        bridge.pending.insert(
+            999,
+            Pending {
+                session_id,
+                answer,
+                mac: mac(),
+                current: LinkMetrics::default(),
+            },
+        );
+        let mut state = daemon.state();
+        drop(peer);
+        tokio::time::timeout(WAIT, async {
+            while !state.borrow_and_update().sessions.is_empty() {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = state.borrow().clone();
+        bridge.reconcile(&snapshot).await;
+        assert!(bridge.retries.is_empty());
+        assert!(bridge.pending.is_empty());
+        assert!(abandoned.await.is_err());
+        let sync: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(sync["sessions"], serde_json::json!([]));
+
+        // A new session is replayed, with current adapter state and a new ID.
+        let mut fresh_events = daemon.subscribe();
+        let mut peer = session(&daemon, &mut fresh_events).await;
+        let snapshot = daemon.state().borrow().clone();
+        assert!(!snapshot.sessions.contains_key(&session_id));
+        bridge.reconcile(&snapshot).await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        let destination = read(&mut peer).await;
+        assert_eq!(destination.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&destination).unwrap().latency,
+            Duration::from_micros(99)
+        );
+        drop(peer);
+        drop(bridge);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_replay_retries_busy_defaults_without_losing_existing_destination_metrics() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(42),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let mut peer = session(&daemon, &mut events).await;
+        // A destination report reaches the session before the bridge observes
+        // its retained membership. Later replay must preserve this override.
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(99),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        let snapshot = daemon.state().borrow().clone();
+        let session_id = *snapshot.sessions.keys().next().unwrap();
+        assert_eq!(
+            snapshot.sessions[&session_id].destinations[&mac().into()].phase,
+            dlep_daemon::DestinationPhase::PendingUp
+        );
+        bridge
+            .inbound(Inbound::DestinationUpdate {
+                mac: Mac(mac()),
+                metrics: Metrics {
+                    latency_us: Some(100),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            daemon.state().borrow().sessions[&session_id].destinations[&mac().into()]
+                .metrics
+                .latency,
+            Duration::from_micros(100)
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UPDATE
+        );
+        flush_peer(&mut peer).await;
+
+        daemon
+            .update_session_addresses(
+                session_id,
+                AddressChanges {
+                    added: DestinationAddrs {
+                        v4: vec!["192.0.2.5".parse().unwrap()],
+                        ..Default::default()
+                    },
+                    removed: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await;
+        assert_eq!(bridge.retries.len(), 1);
+        assert!(matches!(bridge.retries[0].2, Retry::InitializeSession));
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        assert!(bridge.retries.is_empty());
+        let defaults = read(&mut peer).await;
+        assert_eq!(defaults.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&defaults).unwrap().latency,
+            Duration::from_micros(42)
+        );
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        let restored = read(&mut peer).await;
+        assert_eq!(restored.message_type, MessageType::DESTINATION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&restored).unwrap().latency,
+            Duration::from_micros(100)
+        );
+        flush_peer(&mut peer).await;
+        let snapshot = daemon.state().borrow().clone();
+        assert_eq!(
+            snapshot.sessions[&session_id].metrics.latency,
+            Duration::from_micros(42)
+        );
+        assert_eq!(
+            snapshot.sessions[&session_id].destinations[&mac().into()]
+                .metrics
+                .latency,
+            Duration::from_micros(100)
+        );
+
+        send(&mut peer, Message::new(MessageType::HEARTBEAT)).await;
+        flush_peer(&mut peer).await;
+        assert_eq!(daemon.state().borrow().generation, snapshot.generation);
+
+        bridge
+            .inbound(Inbound::DestinationDown { mac: Mac(mac()) })
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_DOWN
+        );
+        assert_eq!(
+            daemon.state().borrow().sessions[&session_id].destinations[&mac().into()].phase,
+            dlep_daemon::DestinationPhase::PendingDown
+        );
+        send(
+            &mut peer,
+            build_destination_down_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        assert!(
+            daemon.state().borrow().sessions[&session_id]
+                .destinations
+                .is_empty()
+        );
+
+        daemon
+            .send_command_to(
+                session_id,
+                SessionCommand::Shutdown {
+                    reason: StatusCode::SHUTTING_DOWN,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_TERMINATION
+        );
+        assert_eq!(
+            daemon.state().borrow().sessions[&session_id].phase,
+            SessionPhase::Terminating
+        );
+        let mut state = daemon.state();
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_termination_response(),
+        )
+        .await;
+        tokio::time::timeout(WAIT, async {
+            while !state.borrow_and_update().sessions.is_empty() {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        drop(peer);
+        drop(bridge);
+        daemon.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1253,6 +1712,7 @@ mod tests {
             bridge.pending.insert(
                 1,
                 Pending {
+                    session_id: SessionId(1),
                     answer,
                     mac: mac(),
                     current: original,
@@ -1278,6 +1738,7 @@ mod tests {
         bridge.pending.insert(
             2,
             Pending {
+                session_id: SessionId(1),
                 answer,
                 mac: mac(),
                 current: original,

@@ -304,10 +304,20 @@ async fn adapter_destination_reaches_router_and_grants_link_request() {
     assert_eq!(metrics.current_data_rate_tx_bps, 123_000);
 
     let messages = modem.adapter_messages();
-    assert_eq!(messages[0]["type"], "session_up");
-    assert_eq!(messages[0]["session"], 1);
-    let request = &messages[1];
-    assert_eq!(request["type"], "link_request");
+    let up = messages.iter().find(|m| m["type"] == "session_up").unwrap();
+    assert_eq!(up["session"], 1);
+    let sync = messages
+        .iter()
+        .rfind(|m| m["type"] == "session_sync")
+        .unwrap();
+    assert_eq!(
+        sync["sessions"],
+        serde_json::json!([{ "session": 1, "peer": up["peer"] }])
+    );
+    let request = messages
+        .iter()
+        .find(|m| m["type"] == "link_request")
+        .unwrap();
     assert_eq!(request["mac"], "02:00:00:00:00:01");
     assert_eq!(
         request["requested"],
@@ -315,6 +325,21 @@ async fn adapter_destination_reaches_router_and_grants_link_request() {
     );
     assert_eq!(request["current"]["current_data_rate_tx_bps"], 70_000);
     router.daemon.shutdown().await.unwrap();
+    timeout(WAIT, async {
+        loop {
+            let messages = modem.adapter_messages();
+            if messages
+                .iter()
+                .rfind(|m| m["type"] == "session_sync")
+                .is_some_and(|m| m["sessions"] == serde_json::json!([]))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("adapter did not receive empty session membership after shutdown");
     modem.stop().await;
 }
 

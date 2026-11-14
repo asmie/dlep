@@ -183,6 +183,23 @@ feed described below. Library applications must supply their own policy and
 handle `broadcast::error::RecvError::Lagged` if they need to continue after event
 loss.
 
+Both daemons expose `state()`, a retained `watch::Receiver<DaemonSnapshot>` for
+late or slow consumers. Read its initial value and subsequent changes; clone the
+snapshot and release the watch borrow before awaiting. It contains a monotonic
+generation and sessions keyed by `SessionId`, with peer identity, negotiated
+extensions, session metrics, peer addresses, and destinations with effective
+metrics and addresses. Destination phases distinguish pending Up/Down, Up, and
+modem knowledge retained after a router withdraws interest. Established sessions
+remain visible while terminating and are removed when they end, including task
+cancellation. Initializing sessions are absent.
+
+Snapshots come directly from each session's FSM before public events and command
+acceptance receipts. They are authoritative local state, not confirmation of peer
+delivery. Changes can coalesce: reconcile from the latest snapshot instead of
+applying older broadcast events over it. Transient command outcomes, extension
+payloads, and termination reasons remain events and are not recovered by this
+feed. The connection-state feed below remains the source for reconnect policy.
+
 The modem-side API is symmetric, with
 `add_destination` / `update_destination` / `drop_destination` in place of
 `start_discovery` / `connect_static`.

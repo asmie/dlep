@@ -15,6 +15,7 @@ pub mod router;
 pub mod runtime;
 pub mod session;
 pub mod shutdown;
+pub mod state;
 pub mod tls;
 
 pub use cli::{
@@ -32,6 +33,9 @@ pub use events::{
 pub use link_control::{LinkControl, LinkRequest, LinkResponse};
 pub use modem::{ModemBuilder, ModemDaemon};
 pub use router::{RouterBuilder, RouterDaemon};
+pub use state::{
+    DaemonSnapshot, DestinationPhase, DestinationSnapshot, SessionPhase, SessionSnapshot,
+};
 pub use tls::TlsSetupError;
 
 pub use dlep_fsm::{CommandError, CommandInfo, CommandKind, CommandRejection};

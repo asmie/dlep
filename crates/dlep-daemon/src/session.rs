@@ -32,6 +32,9 @@ use crate::link_control::{LinkControl, LinkJobs, LinkRequest};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionCommand, SessionRequest,
 };
+use crate::state::{
+    DestinationPhase, DestinationSnapshot, SessionPhase, SessionSnapshot, StateRegistry,
+};
 
 /// Per-daemon monotonic counter for `SessionId`. Each daemon constructs
 /// its own `Arc<AtomicU64>` and passes it into every `run_session` call;
@@ -85,6 +88,9 @@ impl<'a> ExtensionCtx for SessionCtx<'a> {
 /// Ensures a terminal notification on every exit, including I/O errors and
 /// task cancellation. Explicit FSM shutdown marks the guard complete.
 struct SessionLifecycle {
+    state: Option<Arc<StateRegistry>>,
+    established: bool,
+    negotiated_extensions: Vec<dlep_core::ExtensionId>,
     connection: Option<ConnectionTracker>,
     session_id: SessionId,
     peer: PeerInfo,
@@ -99,6 +105,9 @@ struct SessionLifecycle {
 
 impl Drop for SessionLifecycle {
     fn drop(&mut self) {
+        if let Some(state) = &self.state {
+            state.remove(self.session_id);
+        }
         if !self.down_emitted {
             let _ = self.events_tx.send(DaemonEvent::SessionDown {
                 session_id: self.session_id,
@@ -114,6 +123,21 @@ impl Drop for SessionLifecycle {
                 &self.events_tx,
                 false,
             );
+        }
+    }
+}
+
+impl SessionLifecycle {
+    fn publish(&self, fsm: &impl SessionFsm) {
+        let Some(state) = &self.state else { return };
+        if self.down_emitted {
+            state.remove(self.session_id);
+        } else if self.established {
+            if let Some(snapshot) =
+                fsm.state_snapshot(self.peer.clone(), self.negotiated_extensions.clone())
+            {
+                state.update(self.session_id, snapshot);
+            }
         }
     }
 }
@@ -158,9 +182,62 @@ pub trait SessionFsm {
     fn mac_address_format(&self) -> dlep_core::MacAddressFormat;
     fn step(&mut self, event: FsmEvent) -> Vec<FsmAction>;
     fn in_session(&self) -> bool;
+    /// Local post-transition state for daemon snapshots. Custom FSMs used with
+    /// `run_session` need not implement this; that API does not retain state.
+    fn state_snapshot(
+        &self,
+        _peer: PeerInfo,
+        _negotiated_extensions: Vec<dlep_core::ExtensionId>,
+    ) -> Option<SessionSnapshot> {
+        None
+    }
 }
 
 impl SessionFsm for dlep_fsm::session_router::RouterSessionFsm {
+    fn state_snapshot(
+        &self,
+        peer: PeerInfo,
+        negotiated_extensions: Vec<dlep_core::ExtensionId>,
+    ) -> Option<SessionSnapshot> {
+        use dlep_fsm::session_router::RouterSessionState;
+        use dlep_fsm::transaction::RequestKind;
+        let phase = match self.state() {
+            RouterSessionState::InSession => SessionPhase::Established,
+            RouterSessionState::Terminating => SessionPhase::Terminating,
+            _ => return None,
+        };
+        Some(SessionSnapshot {
+            peer,
+            negotiated_extensions,
+            phase,
+            metrics: self.session_metrics,
+            peer_addresses: self.peer_addresses.clone(),
+            destinations: self
+                .destinations
+                .iter()
+                .map(|(mac, dest)| {
+                    let phase = if self
+                        .tx
+                        .per_destination
+                        .get(mac)
+                        .is_some_and(|p| p.kind == RequestKind::DestinationDown)
+                    {
+                        DestinationPhase::PendingDown
+                    } else {
+                        DestinationPhase::Up
+                    };
+                    (
+                        (*mac).into(),
+                        DestinationSnapshot {
+                            phase,
+                            metrics: dest.metrics,
+                            addresses: dest.addrs.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
     fn mac_address_format(&self) -> dlep_core::MacAddressFormat {
         dlep_fsm::session_router::RouterSessionFsm::mac_address_format(self)
     }
@@ -173,6 +250,46 @@ impl SessionFsm for dlep_fsm::session_router::RouterSessionFsm {
 }
 
 impl SessionFsm for dlep_fsm::session_modem::ModemSessionFsm {
+    fn state_snapshot(
+        &self,
+        peer: PeerInfo,
+        negotiated_extensions: Vec<dlep_core::ExtensionId>,
+    ) -> Option<SessionSnapshot> {
+        use dlep_fsm::session_modem::ModemSessionState;
+        use dlep_fsm::transaction::RequestKind;
+        let phase = match self.state() {
+            ModemSessionState::InSession => SessionPhase::Established,
+            ModemSessionState::Terminating => SessionPhase::Terminating,
+            _ => return None,
+        };
+        Some(SessionSnapshot {
+            peer,
+            negotiated_extensions,
+            phase,
+            metrics: self.session_metrics(),
+            peer_addresses: self.peer_addresses.clone(),
+            destinations: self
+                .destinations
+                .iter()
+                .map(|(mac, dest)| {
+                    let phase = match self.tx.per_destination.get(mac).map(|p| p.kind) {
+                        Some(RequestKind::DestinationUp) => DestinationPhase::PendingUp,
+                        Some(RequestKind::DestinationDown) => DestinationPhase::PendingDown,
+                        _ if dest.announced => DestinationPhase::Up,
+                        _ => DestinationPhase::Withdrawn,
+                    };
+                    (
+                        (*mac).into(),
+                        DestinationSnapshot {
+                            phase,
+                            metrics: dest.metrics,
+                            addresses: dest.addrs.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
     fn mac_address_format(&self) -> dlep_core::MacAddressFormat {
         dlep_fsm::session_modem::ModemSessionFsm::mac_address_format(self)
     }
@@ -321,6 +438,7 @@ pub async fn run_session<F: SessionFsm>(
         session_id_counter,
         None,
         None,
+        None,
     )
     .await
 }
@@ -338,6 +456,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
     session_id_counter: SessionIdCounter,
     connection: Option<ConnectionTracker>,
     link_control: Option<Arc<dyn LinkControl>>,
+    state: Option<Arc<StateRegistry>>,
 ) -> Result<(), DaemonError> {
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut read_buf = BytesMut::with_capacity(4096);
@@ -346,6 +465,9 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
     let session_id = next_session_id(&session_id_counter);
     let is_router_side = role.is_router();
     let mut lifecycle = SessionLifecycle {
+        state,
+        established: false,
+        negotiated_extensions: Vec::new(),
         connection,
         session_id,
         peer: peer.clone(),
@@ -365,6 +487,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
     // Process the synthetic startup event before entering the loop.
     let actions = fsm.step(initial_event);
     if process_actions(
+        &mut fsm,
         actions,
         &mut writer,
         &mut timers,
@@ -397,7 +520,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     Ok(frame) => frame,
                     Err(DaemonError::Codec(_)) => {
                         let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
-                        if process_actions(actions, &mut writer, &mut timers, &timer_expiry_tx,
+                        if process_actions(&mut fsm, actions, &mut writer, &mut timers, &timer_expiry_tx,
                             &events_tx, &peer, &extensions, session_id, is_router_side,
                             &mut lifecycle, &mut pending_sends).await? { break; }
                         continue;
@@ -417,7 +540,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                         if fsm.in_session() && !is_known_message_type(msg.message_type) && dlep_fsm::validation::validate_mac_format(
                             &msg, lifecycle.mac_address_format).is_err() {
                             let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
-                            if process_actions(actions, &mut writer, &mut timers, &timer_expiry_tx,
+                            if process_actions(&mut fsm, actions, &mut writer, &mut timers, &timer_expiry_tx,
                                 &events_tx, &peer, &extensions, session_id, is_router_side,
                                 &mut lifecycle, &mut pending_sends).await? { break; }
                             continue;
@@ -433,7 +556,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                         }
                         let event = if handled { FsmEvent::RecvExtensionMessage } else { FsmEvent::RecvMessage(msg) };
                         let actions = fsm.step(event);
-                        let close = process_actions(actions, &mut writer, &mut timers,
+                        let close = process_actions(&mut fsm, actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer, &extensions, session_id, is_router_side,
                             &mut lifecycle, &mut pending_sends).await?;
                         if close { break; }
@@ -441,7 +564,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     }
                     FrameRead::Eof => {
                         let actions = fsm.step(FsmEvent::TcpClosed);
-                        let _ = process_actions(
+                        let _ = process_actions(&mut fsm,
                             actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer,
                             &extensions, session_id, is_router_side,
@@ -508,7 +631,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     FsmAction::Emit(dlep_fsm::events::EmittedEvent::CommandRejected(rejection)) => Some(*rejection),
                     _ => None,
                 }).map_or(Ok(()), Err);
-                let closed = process_actions(
+                let closed = process_actions(&mut fsm,
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
@@ -528,7 +651,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     tracing::warn!(session = session_id.0, "link-control backend returned an invalid response; denying the request");
                     actions.extend(fsm.step(fallback.expect("link-control response")));
                 }
-                if process_actions(
+                if process_actions(&mut fsm,
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
@@ -554,7 +677,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                 // completed.
                 timers.forget(id);
                 let actions = fsm.step(FsmEvent::TimerExpired(id, kind));
-                if process_actions(
+                if process_actions(&mut fsm,
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
@@ -595,6 +718,8 @@ async fn read_frame<R: AsyncReadExt + Unpin>(
 /// break out of the select loop).
 #[allow(clippy::too_many_arguments)]
 async fn process_actions(
+    // Keep Send-only custom FSMs usable across awaits without requiring Sync.
+    fsm: &mut impl SessionFsm,
     actions: Vec<FsmAction>,
     writer: &mut WriteHalf<Box<dyn Transport>>,
     timers: &mut TimerSet,
@@ -607,8 +732,7 @@ async fn process_actions(
     lifecycle: &mut SessionLifecycle,
     pending_sends: &mut Vec<Message>,
 ) -> Result<bool, DaemonError> {
-    let active_exts = &mut lifecycle.active_exts;
-    let down_emitted = &mut lifecycle.down_emitted;
+    let mut published = false;
     let mut close = false;
     for action in actions {
         match action {
@@ -677,18 +801,28 @@ async fn process_actions(
             }
             FsmAction::Emit(emitted) => {
                 if matches!(emitted, EmittedEvent::SessionDown(_)) {
-                    *down_emitted = true;
+                    lifecycle.down_emitted = true;
                 }
                 // 1. Negotiate active_exts BEFORE translate_emitted so the
                 //    public `negotiated_extensions` reflects extensions
                 //    that actually accepted negotiation (not just the wire
                 //    intersection).
                 if let EmittedEvent::SessionUp { peer_extensions } = &emitted {
-                    *active_exts = extensions.negotiate(peer_extensions);
+                    lifecycle.active_exts = extensions.negotiate(peer_extensions);
+                    lifecycle.established = true;
+                    lifecycle.negotiated_extensions =
+                        negotiated_from_active(&lifecycle.active_exts, peer_extensions);
                     if let Some(connection) = &lifecycle.connection {
                         connection.established();
                     }
                 }
+
+                // Publish the complete post-transition state before its events.
+                if !published || lifecycle.down_emitted {
+                    lifecycle.publish(fsm);
+                    published = true;
+                }
+                let active_exts = &mut lifecycle.active_exts;
 
                 // 2. Broadcast the public lifecycle event FIRST so
                 //    subscribers see e.g. `SessionUp` before any
@@ -777,6 +911,10 @@ async fn process_actions(
                 flush_pending_sends(pending_sends, writer, lifecycle.mac_address_format).await?;
             }
         }
+    }
+    if !published {
+        // Modem updates and transaction responses often emit no public event.
+        lifecycle.publish(fsm);
     }
     if close {
         let _ = tokio::time::timeout(WRITE_TIMEOUT, writer.shutdown()).await;

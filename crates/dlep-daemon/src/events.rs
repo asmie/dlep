@@ -19,7 +19,7 @@ impl From<MacAddress> for DestinationId {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
     pub addr: SocketAddr,
     pub is_tls: bool,

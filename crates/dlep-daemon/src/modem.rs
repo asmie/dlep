@@ -25,6 +25,7 @@ use crate::session::{
 pub struct ModemDaemon {
     initial_metrics: LinkMetrics,
     events_tx: EventTx,
+    state: Arc<crate::state::StateRegistry>,
     /// Address the listen socket actually bound to (resolves `tcp_port = 0`).
     local_addr: SocketAddr,
     session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
@@ -45,6 +46,14 @@ impl ModemDaemon {
 
     pub fn subscribe(&self) -> EventRx {
         self.events_tx.subscribe()
+    }
+
+    /// Retained protocol state, including local destinations while pending or
+    /// withdrawn. Read the initial snapshot and subsequent changes; clone and
+    /// release watch borrows before awaiting. State changes may coalesce, and
+    /// old broadcast events must not be applied over a newer snapshot.
+    pub fn state(&self) -> watch::Receiver<crate::DaemonSnapshot> {
+        self.state.subscribe()
     }
 
     /// The address (and port) the modem actually bound to. Useful for tests
@@ -305,6 +314,7 @@ impl ModemBuilder {
         };
 
         let (events_tx, _events_rx) = new_event_channel();
+        let state = crate::state::StateRegistry::new();
         let session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -343,12 +353,14 @@ impl ModemBuilder {
             stop_rx,
             connected_routers,
             self.link_control,
+            state.clone(),
         ));
 
         Ok(ModemDaemon {
             initial_metrics,
             events_tx,
             local_addr,
+            state,
             session_cmds,
             tasks,
             listen_task,
@@ -418,6 +430,7 @@ async fn modem_accept_loop(
     stopping: watch::Receiver<bool>,
     connected_routers: ConnectedRouters,
     link_control: Option<Arc<dyn LinkControl>>,
+    state: Arc<crate::state::StateRegistry>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
@@ -444,6 +457,7 @@ async fn modem_accept_loop(
         let counter = session_id_counter.clone();
         let commands = session_cmds.clone();
         let link_control = link_control.clone();
+        let state = state.clone();
         let mut stopping = stopping.clone();
         let mut running = tasks.lock().await;
         let handle = tokio::spawn(async move {
@@ -502,6 +516,7 @@ async fn modem_accept_loop(
                 counter,
                 None,
                 link_control,
+                Some(state),
             )
             .await
             {

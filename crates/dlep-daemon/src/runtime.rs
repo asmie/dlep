@@ -160,8 +160,9 @@ pub(crate) async fn dispatch_command(
 
 /// Broadcast buffer size for public `DaemonEvent`s. When a subscriber lags
 /// past this many events, the oldest events are dropped for that subscriber
-/// (standard `tokio::sync::broadcast` semantics) — consumers that need
-/// lossless delivery should build their own mpsc bridge on top.
+/// (standard `tokio::sync::broadcast` semantics). Use the daemon's retained
+/// `state()` feed to reconcile current protocol state after lag; forwarding
+/// this broadcast through mpsc cannot make missed events recoverable.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Capacity of the internal commands mpsc feeding the session task.

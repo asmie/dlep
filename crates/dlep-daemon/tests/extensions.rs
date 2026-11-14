@@ -294,6 +294,29 @@ async fn private_use_extension_round_trips_session_init_and_unknown_message() {
     let modem_neg = await_session_up(&mut modem_events).await;
 
     assert_eq!(
+        router
+            .state()
+            .borrow()
+            .sessions
+            .values()
+            .next()
+            .unwrap()
+            .negotiated_extensions,
+        router_neg
+    );
+    assert_eq!(
+        modem
+            .state()
+            .borrow()
+            .sessions
+            .values()
+            .next()
+            .unwrap()
+            .negotiated_extensions,
+        modem_neg
+    );
+
+    assert_eq!(
         router_neg,
         vec![TEST_EXT_ID],
         "router-side negotiated set should contain the Private-Use ID"
