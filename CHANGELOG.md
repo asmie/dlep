@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Radio address updates validate the complete resulting destination before
+  sending or caching changes. A batch that would exceed the Destination Up wire
+  limit is rejected atomically, preserving replay for later routers; a subsequent
+  batch can remove addresses to make room for new ones.
 - Partial radio link replies preserve newer destination and session metric
   reports. Grants merge only supplied fields into each session and the replay
   cache, so overlapping requests on different routers retain each other's cached

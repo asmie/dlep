@@ -670,10 +670,10 @@ impl Bridge<'_> {
                 add,
                 remove,
             } => {
-                if !self.destinations.contains_key(&mac) {
+                let Some(known) = self.destinations.get(&mac) else {
                     warn!(%mac, "radio adapter changed addresses of an unknown destination; ignored");
                     return;
-                }
+                };
                 let changes = match (add.parse(), remove.parse()) {
                     (Ok(added), Ok(removed)) => AddressChanges { added, removed }.canonical(),
                     (Err(e), _) | (_, Err(e)) => {
@@ -681,13 +681,25 @@ impl Bridge<'_> {
                         return;
                     }
                 };
+                // Individually encodable deltas can accumulate a snapshot
+                // that no longer fits a Destination Up for a later router.
+                // Reject the entire batch before sending or retaining it.
+                let mut addresses = known.addresses.clone();
+                changes.apply_lenient(&mut addresses);
+                if let Err(e) = self.daemon.validate_destination_snapshot(
+                    mac.into(),
+                    &known.metrics,
+                    &addresses,
+                ) {
+                    warn!(%mac, "radio adapter destination addresses rejected: {e}");
+                    return;
+                }
                 let result = self
                     .daemon
                     .update_destination_addresses(mac.into(), changes.clone())
                     .await;
                 if self.accepted("destination addresses", &result) {
-                    let known = self.destinations.get_mut(&mac).expect("known");
-                    changes.apply_lenient(&mut known.addresses);
+                    self.destinations.get_mut(&mac).expect("known").addresses = addresses;
                 }
             }
             Inbound::DestinationDown { mac: Mac(mac) } => {
@@ -2553,6 +2565,117 @@ mod tests {
         );
         drop(peer);
         daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_address_updates_leave_a_replayable_cache_and_allow_recovery() {
+        for connected in [false, true] {
+            let daemon = modem().await;
+            let mut events = daemon.subscribe();
+            let mut bridge = bridge(&daemon);
+            let mut peer = if connected {
+                let peer = session(&daemon, &mut events).await;
+                let snapshot = daemon.state().borrow().clone();
+                bridge.reconcile(&snapshot).await.unwrap();
+                Some(peer)
+            } else {
+                None
+            };
+            let addresses: Vec<Ipv6Addr> = (1..=3119)
+                .map(|suffix| Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, suffix))
+                .collect();
+            let initial = Addresses {
+                ipv4: vec!["192.0.2.1".parse().unwrap()],
+                ipv6: addresses[..1600].to_vec(),
+                ipv4_subnets: vec!["198.51.100.0/24".into()],
+                ipv6_subnets: vec!["2001:db8:1::/64".into()],
+            };
+            bridge
+                .inbound(Inbound::DestinationUp {
+                    mac: Mac(mac()),
+                    metrics: Metrics::default(),
+                    addresses: initial.clone(),
+                })
+                .await;
+            if let Some(peer) = &mut peer {
+                assert_eq!(read(peer).await.message_type, MessageType::DESTINATION_UP);
+                send(
+                    peer,
+                    build_destination_up_response(mac(), StatusCode::SUCCESS),
+                )
+                .await;
+                flush_peer(peer).await;
+            }
+            // Each batch fits on the wire, but their accumulated Up does not.
+            // Even the resulting address items fit alone: 3118 * 21 bytes.
+            // Adding the MAC and mandatory metrics crosses the message limit.
+            // Rejection must also leave the removals in this batch unapplied.
+            bridge
+                .inbound(Inbound::DestinationAddresses {
+                    mac: Mac(mac()),
+                    add: Addresses {
+                        ipv6: addresses[1600..].to_vec(),
+                        ..Default::default()
+                    },
+                    remove: Addresses {
+                        ipv4: initial.ipv4.clone(),
+                        ipv6: addresses[..1].to_vec(),
+                        ipv4_subnets: initial.ipv4_subnets.clone(),
+                        ipv6_subnets: initial.ipv6_subnets.clone(),
+                    },
+                })
+                .await;
+            assert_eq!(
+                bridge.destinations[&mac()].addresses,
+                initial.parse().unwrap(),
+                "oversized address update changed the replay cache (connected: {connected})"
+            );
+            if let Some(peer) = &mut peer {
+                // No partial update reached the existing router either.
+                flush_peer(peer).await;
+                let snapshot = daemon.state().borrow().clone();
+                assert_eq!(
+                    snapshot.sessions.values().next().unwrap().destinations[&mac().into()]
+                        .addresses,
+                    initial.parse().unwrap()
+                );
+            }
+            // Making room in the same batch permits the additions again.
+            bridge
+                .inbound(Inbound::DestinationAddresses {
+                    mac: Mac(mac()),
+                    add: Addresses {
+                        ipv6: addresses[1600..].to_vec(),
+                        ..Default::default()
+                    },
+                    remove: Addresses {
+                        ipv6: addresses[..300].to_vec(),
+                        ..Default::default()
+                    },
+                })
+                .await;
+            let expected = DestinationAddrs {
+                v6: addresses[300..].to_vec(),
+                ..initial.parse().unwrap()
+            };
+            assert_eq!(bridge.destinations[&mac()].addresses, expected);
+            if let Some(peer) = &mut peer {
+                assert_eq!(
+                    read(peer).await.message_type,
+                    MessageType::DESTINATION_UPDATE
+                );
+                flush_peer(peer).await;
+            }
+            let mut late = session(&daemon, &mut events).await;
+            let snapshot = daemon.state().borrow().clone();
+            bridge.reconcile(&snapshot).await.unwrap();
+            let replay = read(&mut late).await;
+            assert_eq!(replay.message_type, MessageType::DESTINATION_UP);
+            assert_eq!(AddressChanges::from_message(&replay).added, expected);
+            drop(late);
+            drop(peer);
+            daemon.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

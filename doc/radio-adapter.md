@@ -81,6 +81,14 @@ unknown destination, is logged and ignored. Messages the modem rejects as
 invalid, such as undeclared optional metrics, are also logged and ignored
 without changing its state.
 
+Address updates must leave a complete destination that fits in one Destination
+Up message, including its MAC and metrics. Individually small batches can reach
+this limit as addresses accumulate. An oversized result rejects the whole batch
+before sending it to any router or changing the cached addresses, including any
+removals in that batch. Remove enough addresses, either in the same batch or a
+later one, before adding more. This check also applies when no routers are
+connected, so the retained destination remains replayable.
+
 Replay uses retained daemon session state and recovers even if the internal
 event subscriber falls behind. It retries busy session initialization, preserves
 existing per-session destination metrics, and respects a router's withdrawal.

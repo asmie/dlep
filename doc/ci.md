@@ -172,6 +172,10 @@ Partial-reply regressions report new destination/session metrics while a request
 is pending, then check omitted fields and invalid optional metrics. Overlapping
 requests from two real routers must preserve each session's values and accumulate
 their explicit grants in the cache replayed to a third router over IPv4/IPv6.
+Address-cache regressions accumulate individually valid batches beyond the
+Destination Up wire limit, with and without a connected router. Rejected batches
+must preserve all addresses, later replay must work, and a batch that frees space
+must recover. The real adapter pipeline covers this over both IPv4 and IPv6.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

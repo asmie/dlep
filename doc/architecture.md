@@ -962,6 +962,15 @@ The order of work was:
     metrics, denials, invalid optional metrics, overlapping IPv4/IPv6 router requests,
     and replay of the accumulated grants to a later router.
 
+39. Replayable radio address snapshots. **Done** — address deltas are checked
+    against the complete proposed cached destination before broadcast. Oversized
+    results reject both additions and removals atomically, including with no
+    active sessions. `ModemDaemon::validate_destination_snapshot` shares metric,
+    address, and Destination Up encoding checks with destination creation and
+    allows embedders to validate their own retained snapshots. Regressions cover
+    offline and connected accumulation, unchanged current and replayed state,
+    recovery by freeing space, and real IPv4/IPv6 adapter pipelines.
+
 ---
 
 ## 10. Open questions / risks

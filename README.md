@@ -239,6 +239,13 @@ snapshot, and `update_destination_addresses` sends later changes. Both daemons
 provide `update_session_addresses(session_id, changes)` for local peer addresses
 on one session, using address-only Session Update messages.
 
+Embedders retaining destinations for replay can use
+`ModemDaemon::validate_destination_snapshot(id, &metrics, &addresses)` before
+caching a complete snapshot. Supply effective metrics, including supported
+optional values. It checks metric declarations, address consistency, and the
+Destination Up wire limit without sending a command; session state and MAC-format
+policy are still checked when commands are dispatched.
+
 Applications receive `DestinationEvent::AddressesChanged` or
 `DaemonEvent::SessionAddresses`, with effective changes and the resulting full
 snapshot, plus peer/session attribution. Initialization addresses and Announce

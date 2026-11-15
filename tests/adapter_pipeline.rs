@@ -656,6 +656,98 @@ fn announcements(session: &Value, count: u64) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn oversized_radio_address_batches_preserve_replay_and_allow_recovery() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        let ipv6: Vec<_> = (1..=3119).map(|n| format!("2001:db8::{n:x}")).collect();
+        let mut initial = addresses(1);
+        initial["ipv6"] = json!(&ipv6[..1600]);
+        radio
+            .control
+            .send(json!({"type":"destination_up", "mac":MAC,
+            "addresses":initial}))
+            .await;
+        let mut router = Node::router(&[addr]).await;
+        let original = router
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let mut expected = vec![json!({"kind":"ipv4", "address":"192.0.2.1"})];
+        expected.extend(
+            ipv6[..1600]
+                .iter()
+                .map(|address| json!({"kind":"ipv6", "address":address})),
+        );
+        expected.extend([
+            json!({"kind":"ipv4_subnet", "address":"198.51.1.0/24"}),
+            json!({"kind":"ipv6_subnet", "address":"2001:db8:1::/64"}),
+        ]);
+        assert_eq!(
+            destination(&original, "modem-a", MAC).unwrap()["addresses"],
+            json!(expected)
+        );
+
+        radio
+            .control
+            .batch(vec![
+                json!({"type":"destination_addresses", "mac":MAC,
+                "add":{"ipv6":&ipv6[1600..]},
+                "remove":{"ipv4":["192.0.2.1"],"ipv6":&ipv6[..1],
+                    "ipv4_subnets":["198.51.1.0/24"],"ipv6_subnets":["2001:db8:1::/64"]}}),
+                // Receipt of this later report proves the address batch was handled.
+                json!({"type":"destination_update", "mac":MAC,"metrics":{"latency_us":4321}}),
+            ])
+            .await;
+        let rejected = router
+            .wait(|s| {
+                destination(s, "modem-a", MAC).is_some_and(|d| d["metrics"]["latency_us"] == 4321)
+            })
+            .await;
+        assert_eq!(
+            destination(&rejected, "modem-a", MAC).unwrap()["addresses"],
+            json!(expected)
+        );
+        let mut late = Node::router(&[addr]).await;
+        let replay = late
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["addresses"],
+            json!(expected)
+        );
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["metrics"],
+            destination(&rejected, "modem-a", MAC).unwrap()["metrics"]
+        );
+
+        // A later batch can free enough room and add the same addresses.
+        radio
+            .control
+            .send(json!({"type":"destination_addresses", "mac":MAC,
+            "add":{"ipv6":&ipv6[1600..]},"remove":{"ipv6":&ipv6[..300]}}))
+            .await;
+        expected.drain(1..301);
+        let subnets = expected.split_off(expected.len() - 2);
+        expected.extend(
+            ipv6[1600..]
+                .iter()
+                .map(|address| json!({"kind":"ipv6", "address":address})),
+        );
+        expected.extend(subnets);
+        for consumer in [&mut router, &mut late] {
+            consumer
+                .wait(|s| {
+                    destination(s, "modem-a", MAC)
+                        .is_some_and(|d| d["addresses"] == json!(expected))
+                })
+                .await;
+            consumer.stop().await;
+            consumer.assert_final_empty();
+        }
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn partial_link_grants_preserve_new_reports_and_other_sessions_cache_changes() {
     for ip in ["127.0.0.1", "::1"] {
         let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;

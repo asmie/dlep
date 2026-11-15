@@ -79,17 +79,11 @@ impl ModemDaemon {
         metrics: LinkMetrics,
         addresses: dlep_fsm::DestinationAddrs,
     ) -> Result<(), DaemonError> {
-        self.validate_metrics(&metrics)?;
-        let changes = dlep_fsm::AddressChanges {
-            added: addresses.canonical(),
-            removed: Default::default(),
-        };
-        crate::runtime::validate_address_changes(&changes)?;
-        dlep_fsm::session_common::build_destination_up(id.0, &metrics, &changes.added).encode()?;
+        self.validate_destination_snapshot(id, &metrics, &addresses)?;
         self.fanout(SessionCommand::AddDestination {
             mac: id.0,
             metrics,
-            addrs: changes.added,
+            addrs: addresses.canonical(),
         })
         .await
     }
@@ -165,6 +159,26 @@ impl ModemDaemon {
             ));
         }
         dlep_fsm::session_common::build_session_update(metrics).encode()?;
+        Ok(())
+    }
+
+    /// Validate metric declarations, address consistency, and Destination Up
+    /// encoding without sending a command. Supply effective metrics when
+    /// checking a retained snapshot for replay, including supported optional
+    /// values. Session state and MAC-format policy are checked on dispatch.
+    pub fn validate_destination_snapshot(
+        &self,
+        id: DestinationId,
+        metrics: &LinkMetrics,
+        addresses: &dlep_fsm::DestinationAddrs,
+    ) -> Result<(), DaemonError> {
+        self.validate_metrics(metrics)?;
+        let changes = dlep_fsm::AddressChanges {
+            added: addresses.canonical(),
+            removed: Default::default(),
+        };
+        crate::runtime::validate_address_changes(&changes)?;
+        dlep_fsm::session_common::build_destination_up(id.0, metrics, &changes.added).encode()?;
         Ok(())
     }
 
