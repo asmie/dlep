@@ -6,8 +6,32 @@ import struct
 import time
 
 
-def wire_records(path, modem_port):
-    """Reassemble the single IPv4 connection in our loopback Ethernet capture.
+def tcp_frame(frame, ip_version):
+    """Validate an unfragmented TCP frame from our controlled loopback peers."""
+    assert ip_version in (4, 6)
+    assert len(frame) >= 14 + (20 if ip_version == 4 else 40), "truncated Ethernet/IP frame"
+    ethertype = b"\x08\x00" if ip_version == 4 else b"\x86\xdd"
+    assert frame[12:14] == ethertype and frame[14] >> 4 == ip_version, "unexpected IP family"
+    if ip_version == 4:
+        ip_header = (frame[14] & 15) * 4
+        assert ip_header >= 20 and frame[23] == 6, "expected IPv4 TCP"
+        assert struct.unpack_from("!H", frame, 20)[0] & 0x3FFF == 0, "fragmented IPv4 packet"
+        ip_end = 14 + struct.unpack_from("!H", frame, 16)[0]
+        source_ip, dest_ip, hops = bytes(frame[26:30]), bytes(frame[30:34]), frame[22]
+    else:
+        ip_header = 40
+        # These fixtures send plain TCP, without extension headers or fragments.
+        # Reject unsupported headers instead of misreading them as TCP evidence.
+        assert frame[20] == 6, "expected IPv6 TCP without extension headers"
+        ip_end = 54 + struct.unpack_from("!H", frame, 18)[0]
+        source_ip, dest_ip, hops = bytes(frame[22:38]), bytes(frame[38:54]), frame[21]
+    tcp = 14 + ip_header
+    assert tcp + 20 <= ip_end <= len(frame), "truncated IP/TCP frame"
+    return tcp, ip_end, source_ip, dest_ip, hops
+
+
+def wire_records(path, modem_port, ip_version=4):
+    """Reassemble one IPv4 or IPv6 connection in our loopback Ethernet capture.
 
     Decode framing/TLV boundaries only; neither peer's codec is used. Require
     both SYN sequence bases, identical retransmissions, and complete messages.
@@ -22,28 +46,28 @@ def wire_records(path, modem_port):
         assert length == original
         offset += 16
         frame = data[offset:offset + length]
-        assert len(frame) == length and length >= 54, "truncated Ethernet/IP/TCP frame"
+        assert len(frame) == length, "truncated Ethernet/IP/TCP frame"
         offset += length
-        assert frame[12:14] == b"\x08\x00" and frame[14] >> 4 == 4 and frame[23] == 6
-        ip_header = (frame[14] & 15) * 4
-        ip_end = 14 + struct.unpack_from("!H", frame, 16)[0]
-        tcp = 14 + ip_header
-        assert ip_header >= 20 and tcp + 20 <= ip_end <= len(frame)
+        tcp, ip_end, source_ip, dest_ip, hops = tcp_frame(frame, ip_version)
+        assert hops == 255, "unexpected TTL/hop limit"
         source, dest, sequence = struct.unpack_from("!HHI", frame, tcp)
         assert modem_port in (source, dest), "unexpected TCP connection"
-        flow = (source, dest)
+        flow = (source_ip, source, dest_ip, dest)
         if frame[tcp + 13] & 2:
             base = (sequence + 1) & 0xFFFFFFFF
             assert flow not in starts or starts[flow] == base, "multiple TCP connections"
             starts[flow] = base
+        assert flow in starts, "capture is missing SYN"
         tcp_header = (frame[tcp + 12] >> 4) * 4
         assert tcp_header >= 20 and tcp + tcp_header <= ip_end
         payload = frame[tcp + tcp_header:ip_end]
         if payload:
-            assert flow in starts, "capture is missing SYN"
             streams.setdefault(flow, []).append(((sequence - starts[flow]) & 0xFFFFFFFF, payload))
+    assert len(starts) == 2, "capture must contain exactly one TCP connection"
+    source_ip, source, dest_ip, dest = next(iter(starts))
+    assert (dest_ip, dest, source_ip, source) in starts, "mismatched TCP peers"
     records = {}
-    for (source, _), segments in streams.items():
+    for (_, source, _, _), segments in streams.items():
         stream = bytearray()
         for position, payload in sorted(segments):
             assert position <= len(stream), "capture has a gap in TCP data"
@@ -99,20 +123,25 @@ async def until(predicate, description, seconds=15):
         raise AssertionError(f"timed out waiting for {description}") from error
 
 
-async def capture(path, counts):
+async def capture(path, counts, ip_version=4):
     # AF_PACKET SOCK_RAW includes the Ethernet header even on Linux loopback.
-    # Ignore the outgoing duplicate; record only IPv4 TCP, confined to lo.
-    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800)) as sock:
+    # Ignore the outgoing duplicate; record only the selected family's TCP on lo.
+    assert ip_version in (4, 6)
+    ethertype = 0x0800 if ip_version == 4 else 0x86DD
+    minimum, protocol_offset, hops_offset = (34, 23, 22) if ip_version == 4 else (54, 20, 21)
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ethertype)) as sock:
         sock.bind(("lo", 0))
         sock.setblocking(False)
         with path.open("wb") as output:
             output.write(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))
             while True:
                 packet, address = await asyncio.get_running_loop().sock_recvfrom(sock, 65535)
-                if address[2] == socket.PACKET_OUTGOING or len(packet) < 34 or packet[23] != 6:
+                if (address[2] == socket.PACKET_OUTGOING or len(packet) < minimum
+                        or packet[protocol_offset] != 6):
                     continue
                 counts["tcp_packets"] += 1
-                counts["wrong_ttl"] += packet[22] != 255
+                # Preserve the existing summary key; for IPv6 this is the hop limit.
+                counts["wrong_ttl"] += packet[hops_offset] != 255
                 stamp = time.time_ns()
                 output.write(struct.pack("<IIII", stamp // 10**9, (stamp % 10**9) // 1000,
                                          len(packet), len(packet)))

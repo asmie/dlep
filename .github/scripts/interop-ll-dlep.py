@@ -6,6 +6,7 @@ import contextlib
 import json
 import pathlib
 import re
+import socket
 import subprocess
 import xml.etree.ElementTree as ET
 
@@ -104,32 +105,36 @@ class Process:
         await self.reader
 
 
-async def scenario(output, initiator):
+async def scenario(output, initiator, ip_version):
+    name = f"ipv{ip_version}-{initiator}"
+    address = "127.0.0.1" if ip_version == 4 else "fe80::1"
+    endpoint = (f"{address}:4854" if ip_version == 4
+                else f"[{address}%{socket.if_nametoindex('lo')}]:4854")
     counts = {"tcp_packets": 0, "wrong_ttl": 0}
-    packet_task = asyncio.create_task(capture(output / f"{initiator}.pcap", counts))
+    packet_task = asyncio.create_task(capture(output / f"{name}.pcap", counts, ip_version))
     await asyncio.sleep(0)
     if packet_task.done():
         packet_task.result()
     modem = router = None
-    log_path = output / f"{initiator}-peer.log"
+    log_path = output / f"{name}-peer.log"
     try:
         modem = await Process.start([
             "/opt/ll-dlep-build/Dlep", "local-type", "modem", "discovery-enable", "0",
-            "session-address", "127.0.0.1", "session-port", "4854",
+            "session-address", address, "session-port", "4854",
             "heartbeat-interval", "1", "session-ttl", "255",
             "linkchar-autoreply", "0",
             "protocol-config-file", str(output / "core-protocol.xml"),
             "protocol-config-schema", str(PEER / "config/protocol/protocol-config.xsd"),
             "log-file", str(log_path), "log-level", "1",
-        ], output / f"{initiator}-modem.log")
+        ], output / f"{name}-modem.log")
         await modem.expect("DlepInit succeeded")
         # A show command after peer update forms a CLI processing barrier.
         await modem.command("peer update " + INITIAL + " " + cli_addresses(10))
         await modem.command("show peer")
         await until(lambda: modem.text().count("DlepService returns: ok") >= 2,
                     "LL-DLEP accepting initial peer metrics")
-        router = await Process.start(["/work/target/debug/examples/interop_router", "127.0.0.1:4854"],
-                                     output / f"{initiator}-router.log")
+        router = await Process.start(["/work/target/debug/examples/interop_router", endpoint],
+                                     output / f"{name}-router.log")
         await router.expect("UP\n")
         await router.expect("METRICS 10000000 20000000 5000000 7000000 2500\n")
         await modem.expect("Peer up,")
@@ -219,7 +224,7 @@ async def scenario(output, initiator):
         packet_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await packet_task
-        records = wire_records(output / f"{initiator}.pcap", 4854)
+        records = wire_records(output / f"{name}.pcap", 4854, ip_version)
         messages = {role: [m["type"] for m in values] for role, values in records.items()}
         def payloads(role, kind):
             return [address_items(m) for m in records[role] if m["type"] == kind]
@@ -243,7 +248,7 @@ async def scenario(output, initiator):
         assert messages[responder].count(6) == 1, messages
         assert all(types.count(16) >= 2 for types in messages.values()), messages
         peer_log = log_path.read_text()
-        return {"initiator": initiator, **counts,
+        return {"ip_version": ip_version, "initiator": initiator, **counts,
                 "heartbeats_sent": peer_log.count("Send Heartbeat to peer ID="),
                 "heartbeats_received": peer_log.count("handle_heartbeat(): from peer="),
                 "wire_messages": messages,
@@ -275,10 +280,11 @@ async def run(output):
         ET.SubElement(status, tag).text = value
     profile.write(output / "core-protocol.xml", encoding="utf-8", xml_declaration=True)
     results = []
-    for initiator in ["router", "modem"]:
-        results.append(await scenario(output, initiator))
+    for ip_version in [4, 6]:
+        for initiator in ["router", "modem"]:
+            results.append(await scenario(output, initiator, ip_version))
     summary = {"peer": "mit-ll/LL-DLEP", "revision": REVISION,
-               "transport": "static IPv4 TCP, strict GTSM, no TLS", "scenarios": results}
+               "transport": "static IPv4/IPv6 TCP, strict GTSM, no TLS", "scenarios": results}
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 
@@ -296,6 +302,13 @@ def main():
         parser.error("run with interop-ll-dlep.sh in its networkless container")
     if pathlib.Path("/proc/sys/net/ipv4/ip_default_ttl").read_text().strip() != "255":
         parser.error("the container's default TTL must be 255 for the TCP handshake")
+    if pathlib.Path("/proc/sys/net/ipv6/conf/lo/hop_limit").read_text().strip() != "255":
+        parser.error("the container's loopback hop limit must be 255 for the IPv6 TCP handshake")
+    if pathlib.Path("/proc/sys/net/ipv6/conf/lo/disable_ipv6").read_text().strip() != "0":
+        parser.error("IPv6 must be enabled on the container's loopback interface")
+    # Pinned LL-DLEP rejects non-link-local IPv6 session addresses. This runs
+    # only after the networkless-container check, never on a host interface.
+    subprocess.run(["ip", "-6", "addr", "replace", "fe80::1/64", "dev", "lo", "nodad"], check=True)
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "summary.json").unlink(missing_ok=True)
     asyncio.run(run(args.output))

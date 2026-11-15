@@ -12,4 +12,7 @@ RUN git clone https://github.com/mit-ll/LL-DLEP.git /opt/ll-dlep \
     && cmake -S /opt/ll-dlep -B /opt/ll-dlep-build -DWARNINGS_AS_ERRORS=OFF \
         -DCMAKE_CXX_FLAGS="-include map" \
     && cmake --build /opt/ll-dlep-build --target Dlep --parallel 2
+# The pinned peer requires a scoped link-local address for IPv6 sessions.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /work

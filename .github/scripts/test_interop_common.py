@@ -10,14 +10,22 @@ from interop_common import address_items, wire_records
 HEADER = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
 
 
-def packet(source, dest, sequence, payload=b"", syn=False):
-    frame = bytearray(54 + len(payload))
-    frame[12:14] = b"\x08\x00"
-    frame[14], frame[22], frame[23] = 0x45, 255, 6
-    struct.pack_into("!H", frame, 16, 40 + len(payload))
-    struct.pack_into("!HHI", frame, 34, source, dest, sequence)
-    frame[46], frame[47] = 0x50, 2 if syn else 0x10
-    frame[54:] = payload
+def packet(source, dest, sequence, payload=b"", syn=False, *, ip_version=4):
+    tcp = 34 if ip_version == 4 else 54
+    frame = bytearray(tcp + 20 + len(payload))
+    if ip_version == 4:
+        frame[12:14] = b"\x08\x00"
+        frame[14], frame[22], frame[23] = 0x45, 255, 6
+        frame[26:30] = frame[30:34] = ipaddress.ip_address("127.0.0.1").packed
+        struct.pack_into("!H", frame, 16, 40 + len(payload))
+    else:
+        frame[12:14] = b"\x86\xdd"
+        frame[14], frame[20], frame[21] = 0x60, 6, 255
+        frame[22:38] = frame[38:54] = ipaddress.ip_address("::1").packed
+        struct.pack_into("!H", frame, 18, 20 + len(payload))
+    struct.pack_into("!HHI", frame, tcp, source, dest, sequence)
+    frame[tcp + 12], frame[tcp + 13] = 0x50, 2 if syn else 0x10
+    frame[tcp + 20:] = payload
     return struct.pack("<IIII", 0, 0, len(frame), len(frame)) + frame
 
 
@@ -30,15 +38,20 @@ def message(kind, items=b""):
 
 
 class CaptureTests(unittest.TestCase):
+    ip_version = 4
+
+    def packet(self, *args, **kwargs):
+        return packet(*args, **kwargs, ip_version=self.ip_version)
+
     def read(self, packets):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "capture.pcap"
             path.write_bytes(HEADER + b"".join(packets))
-            return wire_records(path, 4854)
+            return wire_records(path, 4854, self.ip_version)
 
     def connection(self, payload):
-        return [packet(40000, 4854, 100, syn=True), packet(4854, 40000, 200, syn=True),
-                packet(4854, 40000, 201, message(16)), packet(40000, 4854, 101, payload)]
+        return [self.packet(40000, 4854, 100, syn=True), self.packet(4854, 40000, 200, syn=True),
+                self.packet(4854, 40000, 201, message(16)), self.packet(40000, 4854, 101, payload)]
 
     def test_split_reordered_and_retransmitted_segments_preserve_address_flags(self):
         items = item(8, b"\x01" + ipaddress.ip_address("192.0.2.1").packed)
@@ -47,9 +60,9 @@ class CaptureTests(unittest.TestCase):
         items += item(11, b"\x00" + ipaddress.ip_address("2001:db8:1::").packed + b"\x40")
         payload = message(3, items) + message(16)
         records = self.read([
-            packet(40000, 4854, 0xFFFFFFFF, syn=True), packet(4854, 40000, 200, syn=True),
-            packet(40000, 4854, 7, payload[7:]), packet(40000, 4854, 0, payload[:12]),
-            packet(40000, 4854, 0, payload[:12]), packet(4854, 40000, 201, message(4, item(1, b"\0"))),
+            self.packet(40000, 4854, 0xFFFFFFFF, syn=True), self.packet(4854, 40000, 200, syn=True),
+            self.packet(40000, 4854, 7, payload[7:]), self.packet(40000, 4854, 0, payload[:12]),
+            self.packet(40000, 4854, 0, payload[:12]), self.packet(4854, 40000, 201, message(4, item(1, b"\0"))),
         ])
         self.assertEqual([m["type"] for m in records["router"]], [3, 16])
         self.assertEqual(address_items(records["router"][0]), [
@@ -61,10 +74,11 @@ class CaptureTests(unittest.TestCase):
     def test_gaps_conflicts_missing_syn_and_extra_connections_fail(self):
         valid = self.connection(message(16))
         for packets in [
-            valid[:-1] + [packet(40000, 4854, 102, message(16))],
-            valid + [packet(40000, 4854, 101, message(3))],
+            valid[:-1] + [self.packet(40000, 4854, 102, message(16))],
+            valid + [self.packet(40000, 4854, 101, message(3))],
             valid[1:], valid[:-1],
-            valid + [packet(40001, 4854, 100, syn=True), packet(40001, 4854, 101, message(16))],
+            valid + [self.packet(40001, 4854, 100, syn=True), self.packet(40001, 4854, 101, message(16))],
+            valid + [self.packet(40001, 4854, 101)],
         ]:
             with self.subTest(packets=packets), self.assertRaises(AssertionError):
                 self.read(packets)
@@ -80,12 +94,51 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.read(valid + [b"\0"])
 
+    def test_packet_headers_and_hop_limit_are_checked(self):
+        valid = self.connection(message(16))
+        if self.ip_version == 4:
+            changes = [(14, b"\x44"), (14, b"\x65"), (16, b"\0\0"),
+                       (16, b"\xff\xff"), (20, b"\x20\0"), (20, b"\0\x01"),
+                       (22, b"\xfe"), (23, b"\x11"), (46, b"\x40")]
+        else:
+            changes = [(14, b"\x40"), (18, b"\0\0"), (18, b"\xff\xff"),
+                       (20, b"\0"), (20, b"\x2c"), (20, b"\x11"),
+                       (21, b"\xfe"), (66, b"\x40")]
+        for offset, value in changes:
+            broken = bytearray(valid[-1])
+            broken[16 + offset:16 + offset + len(value)] = value
+            with self.subTest(offset=offset, value=value), self.assertRaises(AssertionError):
+                self.read(valid[:-1] + [broken])
+        other_family = packet(40000, 4854, 101, message(16),
+                              ip_version=6 if self.ip_version == 4 else 4)
+        with self.assertRaisesRegex(AssertionError, "unexpected IP family"):
+            self.read(valid[:-1] + [other_family])
+
+    def test_ip_addresses_identify_the_connection(self):
+        valid = self.connection(message(16))
+        offset, address = ((26, "127.0.0.2") if self.ip_version == 4 else (22, "::2"))
+        address = ipaddress.ip_address(address).packed
+        # Matching ports and sequence numbers from a different IP must not merge.
+        changed = list(valid)
+        for index in [1, 2]:
+            changed[index] = bytearray(changed[index])
+            changed[index][16 + offset:16 + offset + len(address)] = address
+        with self.assertRaisesRegex(AssertionError, "mismatched TCP peers"):
+            self.read(changed)
+        # Even an extra SYN without any data invalidates the single-session capture.
+        with self.assertRaisesRegex(AssertionError, "exactly one TCP connection"):
+            self.read(valid + [changed[1]])
+
     def test_invalid_address_items_cannot_pass_evidence_checks(self):
         for kind, value in [(8, b"\x02\xc0\x00\x02\x01"), (9, b"\x01"),
                             (10, b"\x01\xc0\x00\x02\x00\x21"),
                             (11, b"\0" + bytes(16) + b"\x81")]:
             with self.subTest(kind=kind, value=value), self.assertRaises((AssertionError, ValueError)):
                 address_items({"items": [(kind, value)]})
+
+
+class IPv6CaptureTests(CaptureTests):
+    ip_version = 6
 
 
 if __name__ == "__main__":

@@ -117,7 +117,7 @@ jobs:
       - run: cargo build -p dlep-daemon --example interop_router --locked
       - name: Build pinned independent modem
         run: docker build -t dlep-interop-ll:184e148 .github/interop/ll-dlep
-      - name: Exercise router against independent modem
+      - name: Exercise router against independent modem over IPv4 and IPv6
         run: bash .github/scripts/interop-ll-dlep.sh
       - name: Return interoperability artifacts to the runner user
         if: always()

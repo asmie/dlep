@@ -92,7 +92,7 @@ For a source checkout, `cargo build --release --workspace --locked` builds all
 three commands. `dlep router` and `dlep modem` run the same implementations as
 the standalone binaries, with identical flags. The published 0.1.0 `dlep`
 command was a placeholder; see [release notes](CHANGELOG.md) and the
-[release validation guide](doc/releasing.md).
+[release validation commands](doc/ci.md#release-validation).
 
 Provision certificates and install the binaries with the capabilities described
 in the [deployment guide](doc/deployment.md) before using the example configs.

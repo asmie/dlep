@@ -368,11 +368,13 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
-The [checkpoint 60 release record](releasing.md#020-checkpoint-validation)
-collects the November 2026 archive, installation, CLI, and dependency checks.
-It distinguishes local protocol regressions from the four qualified external
-peer scenarios completed in checkpoint 59. Coverage percentages below remain
-historical; the release checkpoint does not refresh them or claim certification.
+Checkpoint 60 passed 591 archived Rust tests, validated eight archives, installed
+three commands, and passed 113 CLI/certificate checks plus four local session
+scenarios for both workspace and installed builds. See the
+[release validation commands](ci.md#release-validation) to reproduce these checks.
+The four qualified external peer scenarios in checkpoint 59 were separate runs.
+Coverage percentages below remain historical; the release checkpoint does not
+refresh them or claim certification.
 
 The [CI coverage run for `5ce40a7`](https://github.com/asmie/dlep/actions/runs/37047900385)
 passed **427 tests** and successfully uploaded its reports. It measured
@@ -454,7 +456,9 @@ retained. Strict GTSM stays enabled; the disposable namespace's default TTL is
 set to 255 because the independent router does not configure it itself.
 See [reproduction and limits](ci.md#independent-router-interoperability).
 An additional pinned MIT LL-DLEP job checks our router against an independent
-modem in a networkless container. It covers initialization, destination and
+modem in a networkless container. Four scenarios exercise IPv4 and scoped
+link-local IPv6 TCP, each with termination initiated by either peer.
+They cover initialization, destination and
 session metric updates, link-characteristics replies, heartbeats, and both
 termination directions. It also checks IPv4/IPv6 addresses and subnets during
 initialization, bidirectional session changes, destination changes and removals,
@@ -465,10 +469,13 @@ experimental items and adds the standard Shutting Down status omitted upstream;
 complete link replies are supplied through the peer's documented CLI. TCP
 capture checks require actual termination responses and bidirectional
 heartbeats. See [setup and qualifications](ci.md#independent-modem-interoperability).
-Neither peer check establishes discovery, IPv6 transport, TLS, extension
+Neither peer check establishes discovery, TLS, extension
 negotiation, or stock-configuration compatibility. The pinned dlepard does not
 implement Session Update or Announce handlers and has limited IPv4 address
 state; those gaps are explicit in the harness summary and CI documentation.
+LL-DLEP's IPv6 sessions use a container-local loopback address, requiring a scope
+ID and namespace hop-limit configuration. Global IPv6 and physical interfaces
+remain unverified by these scenarios.
 
 A bounded churn regression now keeps each pair of daemons alive through 100
 IPv4 and 100 IPv6 sessions, alternating termination initiators with strict GTSM
@@ -1208,10 +1215,22 @@ The order of work was:
     reject missing, added, or changed targets; CI explicitly invokes both Python
     test files so omissions fail. The current audit exposed test-only `rustix`
     1.1.4; the lockfile updates it to patched 1.1.6 without extending the audit
-    exception or raising Rust 1.85. The [release record](releasing.md) documents
-    extracted-archive tests, three command installations, workspace/installed
-    smoke checks, and the qualified independent-peer results. Publication and
+    exception or raising Rust 1.85. The [CI guide](ci.md#release-validation)
+    documents extracted-archive tests, three command installations, and
+    workspace/installed smoke checks. Publication and
     the final committed-artifact checks remain maintainer actions.
+
+61. Independent IPv6 transport coverage. **Done** — the pinned LL-DLEP modem
+    scenarios now exercise IPv4 and scoped link-local IPv6 TCP, with termination
+    initiated by each side. Every case retains address replacement/removal,
+    Announce success/denial, link metrics, heartbeats, and exact capture checks.
+    The container configures its own link-local loopback address and hop limit;
+    upstream protocol sources and host network settings are unchanged. Capture
+    parsing validates IP families, lengths, TTL/hop limits, and matching endpoints,
+    with twelve network-free regressions. All four LL-DLEP and both dlepard
+    scenarios pass. Release commands now live in the tracked CI guide.
+    Discovery, TLS, global IPv6, and physical-link
+    interoperability remain outside this evidence.
 
 ---
 

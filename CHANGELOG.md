@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Independent LL-DLEP modem checks now run over IPv4 and scoped link-local IPv6
+  TCP, including both termination directions, address changes, and Announce
+  success/denial. The capture parser verifies both IP families, TTL/hop limits,
+  and matching peer addresses; twelve regression tests cover malformed and
+  incomplete evidence. Discovery and TLS interoperability remain unverified.
 - The lockfile updates the test-only `rustix` dependency to 1.1.6 for
   [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
   Rust 1.85 remains supported; the existing guarded `time` exception is unchanged.

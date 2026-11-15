@@ -12,7 +12,7 @@ targets with the source workspace, compiles their test targets in an isolated
 extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
 under `target/release-install`, then checks every CLI flag and four local
 plaintext/mutual-TLS session scenarios in a disposable network namespace.
-It does not publish packages. See [release checks](releasing.md).
+It does not publish packages. See [release validation](#release-validation).
 Package verification alone does not populate every development dependency;
 the explicit fetch makes subsequent offline checks independent of cache hits.
 The inventory comparison requires matching target names, kinds, relative source
@@ -35,6 +35,49 @@ instead of passing through test discovery with zero tests.
 The macOS job covers `dlep-core`, `dlep-fsm`, and `dlep-ext`. It does **not**
 validate the daemons or advertise macOS transport support. Discovery ancillary
 socket handling and strict TCP GTSM reset monitoring currently require Linux.
+
+## Release validation
+
+Use current stable Cargo for workspace packaging (validated with Cargo 1.100),
+Python 3.12+, OpenSSL, and Linux with `iproute2`/`unshare`. Run these checks from
+the repository root; consumers still need only Rust 1.85+. The commands build
+local archives and install under `target/release-install` without publishing:
+
+```sh
+cargo build --release --workspace --locked
+unshare --user --map-root-user bash .github/scripts/test-network.sh \
+  python3 -B .github/scripts/release-smoke.py
+
+# --allow-dirty permits pre-commit review; omit it for committed artifacts.
+cargo package --workspace --allow-dirty --locked
+cargo fetch --locked
+unshare --user --map-root-user bash .github/scripts/test-network.sh \
+  python3 -B .github/scripts/check-release-packages.py --run-tests
+unshare --user --map-root-user bash .github/scripts/test-network.sh \
+  python3 -B .github/scripts/release-smoke.py --bin-dir target/release-install/bin
+```
+
+Packaging needs network access for Cargo's temporary registry checksum lookup.
+After the explicit fetch, archive tests and installs run offline with the locked
+third-party dependencies. Only the DLEP crates are patched to extracted local
+sources. The checker validates required package files, flattened symlinks, and
+matching Cargo targets before running tests and installing the three commands.
+CI compiles the archived tests; `--run-tests` above also executes them.
+
+Smoke checks cover CLI flags and configuration precedence, certificate errors,
+two static plaintext IPv4 peers, mutual TLS over IPv6, mutual TLS with IPv4
+discovery, and plaintext discovery through the combined launcher. Sessions cross
+heartbeat intervals and must shut down cleanly on SIGINT/SIGTERM. All network
+changes occur in disposable namespaces. Use the sudo alternative in the network
+test instructions when user namespaces are unavailable.
+
+Checkpoint 60 (2026-11-15) passed all eight archives, 591 archived Rust tests
+across 60 suites, three command installations, and 113 CLI/certificate checks
+plus four session scenarios for each build. Formatting, clippy, Rust 1.85,
+actionlint, the six Python checks, and the guarded dependency audit also passed.
+These are local results; clean-commit packaging and pushed CI must be checked
+before a maintainer publishes. The independent-peer scenarios below are separate
+evidence, and coverage percentages were not recollected for that checkpoint.
 
 ## Independent router interoperability
 
@@ -105,15 +148,20 @@ rebuilding in a compatible environment.
 
 The runtime container has no external network, a read-only repository mount,
 and a writable `target/interop-ll-dlep/` artifact mount. It drops capabilities
-except NET_RAW (strict GTSM and capture) and DAC_OVERRIDE (writing the mounted
-artifact directory). It sets TTL 255 only in the container: LL-DLEP configures
-TCP TTL after acceptance, so its SYN-ACK otherwise uses the system default.
+except NET_RAW (strict GTSM and capture), NET_ADMIN (loopback address setup), and
+DAC_OVERRIDE (writing the mounted artifact directory). It adds `fe80::1/64` to
+the container's loopback interface and uses its numeric scope ID in the router
+endpoint. The pinned peer requires a link-local address for IPv6 sessions.
+It sets IPv4 TTL and the IPv6 loopback hop limit to 255 only in the container:
+LL-DLEP configures TCP hops after acceptance, so its SYN-ACK otherwise uses the
+system default. Rebuild an older image to include `iproute2` for address setup.
 The host's network settings are unaffected. Artifacts can be root-owned locally;
 CI returns their ownership before upload.
 
-Two scenarios check initialization, destination Up/Update/Down, session-wide
+Four scenarios check initialization, destination Up/Update/Down, session-wide
 metric updates, complete Link Characteristics Request/Response, bidirectional
-periodic heartbeats, and termination initiated by each peer. They also verify
+periodic heartbeats, and termination initiated by each peer over both IPv4 and
+scoped link-local IPv6 TCP. They also verify
 IPv4/IPv6 addresses and attached subnets in modem initialization, bidirectional
 session address additions/replacements/removals, and destination address
 additions/replacements/removals. After router withdrawal, an Announce with IPv4
@@ -125,9 +173,12 @@ the router's public events and exact metrics, as well as independent modem
 retained peer addresses using `show peer`. Cleared sets must be empty on both
 sides. Each session emits one SessionDown. PCAPs, the generated core profile,
 both peer logs, and `summary.json` are uploaded as `ll-dlep-interoperability`.
+Scenario filenames begin with `ipv4-` or `ipv6-`, followed by the termination
+initiator. Each summary entry identifies its IP version; `wrong_ttl` counts
+incorrect TTL for IPv4 or hop limit for IPv6 and must be zero.
 The Cargo test count excludes these external scenarios.
 
-These are qualified static IPv4 plaintext results. Three upstream example
+These are qualified static IPv4 and link-local IPv6 plaintext results. Three upstream example
 behaviors required explicit configuration, without relaxing our validation:
 
 - The default XML profile includes experimental extensions and emits a Latency
@@ -143,21 +194,26 @@ behaviors required explicit configuration, without relaxing our validation:
   rejects our termination and our router can time out waiting for a response.
   The generated profile adds that standard status with failure mode `terminate`.
   Capture assertions require the actual termination request and response in
-  both scenarios, so a TCP disconnect alone cannot pass the test.
+  all four scenarios, so a TCP disconnect alone cannot pass the test.
 
-Discovery, IPv6 transport, TLS, extension negotiation, and interoperability with arbitrary
+Discovery, TLS, extension negotiation, and interoperability with arbitrary
 peers remain outside these scenarios. This is not a stock-configuration
-deployment test; the TTL setting, corrected core profile, and explicit link
+deployment test; the TTL/hop-limit settings, corrected core profile, and explicit link
 reply matter. The PCAP checks reconstruct each direction's TCP payload, reject
 gaps/conflicting retransmissions and truncated messages/data items, and require
 at least two Heartbeats in each direction. Exact address values, subnet prefixes,
 add/remove flags, Announce hints, and success/denial responses are checked
-independently of either peer's codec. IPv6 address data travels over the IPv4
-TCP session; this is not IPv6 transport coverage.
+independently of either peer's codec. Each capture must contain exactly one
+connection with matching peer IP addresses and ports, using the expected IP
+family and TTL/hop limit 255. The parser handles the unfragmented TCP traffic
+these fixtures generate and rejects IPv4 fragments and IPv6 extension headers.
+The IPv6 scenarios use loopback link-local addresses; global IPv6 addresses and
+operation across physical interfaces remain outside this check.
 
-The shared capture parser has four network-free regression tests for segmented
+The shared capture parser has twelve network-free regression tests for segmented
 and retransmitted TCP data, missing peers/SYNs, gaps, conflicting retransmissions,
-truncation, and invalid address items. CI runs them in the formatting/workflow
+truncation, malformed IP/TCP headers, low TTL/hop limits, mismatched IP endpoints,
+and invalid address items across both IP families. CI runs them in the formatting/workflow
 job. Run them locally with:
 
 ```sh
