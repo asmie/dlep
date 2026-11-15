@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Independent-peer checks now cover address data and Destination Announce.
+  The pinned LL-DLEP modem exercises IPv4/IPv6 address and subnet replacements
+  and removals, bidirectional session updates, withdrawal/re-announcement with
+  address hints, and denied requests. The pinned dlepard router checks supported
+  IPv4 initialization and Destination Up fields; its unsupported address-update
+  and Announce behaviors are explicitly documented. Shared capture checks verify
+  exact address flags/values and reject incomplete evidence. Both peers remain
+  unmodified, with static IPv4 plaintext transport and strict GTSM.
 - Destination Announce can carry IPv4/IPv6 address hints through optional
   `add`/`remove` objects on router adapter commands. Radio `destination_announced`
   notices expose both objects, including empty sets and denied requests. Hints

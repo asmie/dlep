@@ -14,7 +14,7 @@ import pathlib
 import subprocess
 import sys
 
-from interop_common import capture, until
+from interop_common import address_items, capture, until, wire_records
 
 REVISION = "9300773a566290897839b845c4ec9f2feba3e93b"
 
@@ -72,7 +72,8 @@ async def scenario(args, initiator):
         session = DLEPSession({
             "local_ipv4addr": ["127.0.0.1"],
             "discovery": {"disabled": True},
-            "tcp": {"127.0.0.1": {"ipv4addr": host, "port": int(port)}},
+            "tcp": {"127.0.0.1": {"ipv4addr": host, "port": int(port),
+                                  "ipv4subnets": ["198.51.100.0/24"]}},
             "heartbeat_interval_ms": 6000,
             "enable_lid_ext": False,
         }, "127.0.0.1", loop=asyncio.get_running_loop())
@@ -83,12 +84,16 @@ async def scenario(args, initiator):
         assert (peer.max_datarate_rx, peer.max_datarate_tx, peer.curr_datarate_rx,
                 peer.curr_datarate_tx, peer.latency) == (10_000_000, 20_000_000, 5_000_000, 7_000_000, 2500)
         assert session.peer_heartbeat == 1000
+        await until(lambda: "ROUTER_SUBNET 198.51.100.0/24" in lines,
+                    "router initialization subnet retained by our modem")
 
         await command("add")
         await until(lambda: len(session.destination_information_base) == 1, "Destination Up")
         destination = session.destination_information_base[0]
         assert destination.mac_address.lower() == "02:00:00:00:00:01"
         assert (destination.curr_datarate_rx, destination.curr_datarate_tx, destination.latency) == (4_000_000, 6_000_000, 3500)
+        assert str(destination.ipv4_address) == "192.0.2.10"
+        assert [str(net) for net in destination.ipv4_attached_subnets] == ["198.51.10.0/24"]
         # Wait for independent router heartbeats, allowing its Up response to
         # complete the transaction before asking the modem for an update.
         await until(lambda: beats.sent > 0 and beats.received > 0, "bidirectional heartbeats")
@@ -116,7 +121,18 @@ async def scenario(args, initiator):
         assert "STOPPED" in lines, lines
         assert session.state == DlepSessionState.PEER_DISCOVERY_STATE
         assert counts["tcp_packets"] > 0 and counts["wrong_ttl"] == 0, counts
+        capture_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await capture_task
+        records = wire_records(args.output / f"{initiator}.pcap", int(port))
+        initialization = [m for m in records["router"] if m["type"] == 1]
+        destinations = [m for m in records["modem"] if m["type"] == 7]
+        assert len(initialization) == len(destinations) == 1
+        assert address_items(initialization[0]) == [(10, 1, "198.51.100.0/24")]
+        assert address_items(destinations[0]) == [(8, 1, "192.0.2.10"), (10, 1, "198.51.10.0/24")]
         return {"initiator": initiator, "heartbeats_sent": beats.sent,
+                "address_checks": ["router initialization IPv4 subnet",
+                                   "Destination Up IPv4 address and subnet"],
                 "heartbeats_received": beats.received, **counts, "result": "passed"}
     finally:
         logging.getLogger("DLEPard").removeHandler(beats)
@@ -150,7 +166,10 @@ async def run(args):
         results.append(await scenario(args, initiator))
     assert not errors, f"independent peer raised asynchronous errors: {errors}"
     report = {"peer": "Rohde-Schwarz/dlepard", "revision": REVISION,
-              "transport": "static IPv4 TCP, strict GTSM, no TLS", "scenarios": results}
+              "transport": "static IPv4 TCP, strict GTSM, no TLS", "scenarios": results,
+              "limitations": ["no Session Update or Destination Announce handler",
+                              "IPv4-only address information base; removal flags are not applied",
+                              "Destination Update replaces the information-base entry"]}
     (args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
 

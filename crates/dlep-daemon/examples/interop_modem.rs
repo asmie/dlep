@@ -2,7 +2,9 @@
 //! Commands use stdin; lifecycle acknowledgements use stdout. No wire encoding
 //! is implemented here: all traffic goes through the public daemon API.
 use dlep_core::{MacAddress, StatusCode};
-use dlep_daemon::{DaemonEvent, DestinationId, LinkMetrics, ModemConfig, ModemDaemon};
+use dlep_daemon::{
+    DaemonEvent, DestinationAddrs, DestinationId, LinkMetrics, ModemConfig, ModemDaemon,
+};
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
@@ -33,6 +35,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 DaemonEvent::SessionUp { .. } => report("UP"),
                 DaemonEvent::SessionDown { reason, .. } => report(&format!("DOWN {}", reason.0)),
+                DaemonEvent::SessionAddresses { addresses, .. } => {
+                    assert!(
+                        addresses.v4.is_empty()
+                            && addresses.v6.is_empty()
+                            && addresses.v6_subnets.is_empty()
+                    );
+                    assert_eq!(addresses.v4_subnets, ["198.51.100.0/24".parse().unwrap()]);
+                    report("ROUTER_SUBNET 198.51.100.0/24");
+                }
                 DaemonEvent::CommandRejected { rejection, .. } => panic!("{rejection:?}"),
                 _ => {}
             }
@@ -58,7 +69,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     while let Some(command) = commands.recv().await {
         match command.as_str() {
-            "add" => modem.add_destination(destination, metrics).await?,
+            "add" => {
+                modem
+                    .add_destination_with_addresses(
+                        destination,
+                        metrics,
+                        DestinationAddrs {
+                            v4: vec!["192.0.2.10".parse()?],
+                            v4_subnets: vec!["198.51.10.0/24".parse()?],
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+            }
             "update" => {
                 metrics.current_data_rate_rx_bps = 2_000_000;
                 metrics.current_data_rate_tx_bps = 3_000_000;

@@ -42,6 +42,8 @@ jobs:
       - name: Verify audit policy is included in the checkout
         run: git ls-files --error-unmatch .cargo/audit.toml
       - run: cargo fmt --all -- --check
+      - name: Test interoperability capture checks
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_interop_*.py'
 
   clippy:
     name: clippy

@@ -441,7 +441,8 @@ recollected for these checkpoints.
 
 A separate CI job now checks our modem against the pinned, unmodified session
 and codec from Rohde & Schwarz dlepard. Two static IPv4 plaintext scenarios
-cover initialization metrics, Destination Up/Update/Down, heartbeats, and
+cover initialization metrics and router IPv4 subnets, Destination Up IPv4
+addresses/subnets, Destination Up/Update/Down metrics, heartbeats, and
 termination initiated by either side. Loopback PCAPs and both peers' logs are
 retained. Strict GTSM stays enabled; the disposable namespace's default TTL is
 set to 255 because the independent router does not configure it itself.
@@ -449,13 +450,19 @@ See [reproduction and limits](ci.md#independent-router-interoperability).
 An additional pinned MIT LL-DLEP job checks our router against an independent
 modem in a networkless container. It covers initialization, destination and
 session metric updates, link-characteristics replies, heartbeats, and both
-termination directions. Its generated core profile removes unnegotiated
+termination directions. It also checks IPv4/IPv6 addresses and subnets during
+initialization, bidirectional session changes, destination changes and removals,
+and Announce hints with successful re-announcement and denial. Independent
+retained state and exact captured address items must agree with expected values.
+Its generated core profile removes unnegotiated
 experimental items and adds the standard Shutting Down status omitted upstream;
 complete link replies are supplied through the peer's documented CLI. TCP
 capture checks require actual termination responses and bidirectional
 heartbeats. See [setup and qualifications](ci.md#independent-modem-interoperability).
-Neither peer check establishes discovery, IPv6, TLS, extension negotiation, or
-stock-configuration compatibility.
+Neither peer check establishes discovery, IPv6 transport, TLS, extension
+negotiation, or stock-configuration compatibility. The pinned dlepard does not
+implement Session Update or Announce handlers and has limited IPv4 address
+state; those gaps are explicit in the harness summary and CI documentation.
 
 A bounded churn regression now keeps each pair of daemons alive through 100
 IPv4 and 100 IPv6 sessions, alternating termination initiators with strict GTSM
@@ -1177,6 +1184,17 @@ The order of work was:
     physical destination data, or response decisions. Tests cover invalid input,
     request-ID handling, busy scopes, old commands without hints, both MAC
     formats, IPv4/IPv6 transport, per-modem targeting, and later physical reports.
+
+59. Independent-peer address and Announce coverage. **Done** — the pinned
+    dlepard scenarios verify supported IPv4 initialization/destination data and
+    document its missing update/removal/Announce behavior. Pinned LL-DLEP scenarios
+    exercise both address families and subnets, bidirectional session replacements
+    and removals, destination changes, router withdrawal, Announce hints,
+    successful physical replay, and denial. Tests inspect independent retained
+    state and exact packet-capture address items without patching either peer.
+    The shared capture parser rejects gaps, conflicting retransmissions, and
+    truncation, with four network-free regression tests in CI. Four external
+    scenarios retain logs, PCAPs, summaries, and their existing transport limits.
 
 ---
 

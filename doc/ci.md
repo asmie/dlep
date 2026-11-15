@@ -49,18 +49,28 @@ cleanliness before starting either peer.
 
 Two scenarios verify initialization and exact session metrics, Destination
 Up/Update/Down and their metrics, bidirectional heartbeats, and termination
-initiated by each participant. Assertions inspect dlepard's information base
-and our modem's lifecycle notifications. The Rust fixture uses the public
+initiated by each participant. Address checks cover a router-advertised IPv4
+subnet during initialization and a modem-advertised IPv4 address and subnet in
+Destination Up. Assertions inspect dlepard's information base, our modem's
+address/lifecycle events, and the address items in the reassembled capture.
+The Rust fixture uses the public
 daemon API for all traffic; it has no independent wire codec. Bounded waits
 make failures fail the job. Logs, loopback Ethernet PCAP files, and a successful
 run's `summary.json` are saved in `target/interop-dlepard/` and uploaded even if
 the scenario fails (a failed run has no success summary).
 
 This is evidence for static IPv4 TCP sessions with TLS disabled and extensions
-disabled. It does not establish discovery, IPv6, TLS, our router's compatibility
+disabled. It does not establish discovery, IPv6 transport, TLS, our router's compatibility
 with an independent modem, or arbitrary implementations. The namespace TTL
 setting is necessary for this peer; this is not an out-of-box deployment test.
-Session Update and link-characteristics exchanges are outside these scenarios.
+The pinned dlepard session has no Session Update or Destination Announce
+handler. Its information base stores only IPv4 address data, ignores removal
+flags, and replaces the entire destination entry on Destination Update. The
+harness therefore makes no claim about address retention across updates,
+removal semantics, IPv6 address data, or Announce with this peer. These limits
+are recorded in `summary.json`; the upstream source is not patched to fill
+them. Session Update and link-characteristics exchanges remain outside these
+dlepard scenarios.
 
 ## Independent modem interoperability
 
@@ -92,9 +102,17 @@ CI returns their ownership before upload.
 
 Two scenarios check initialization, destination Up/Update/Down, session-wide
 metric updates, complete Link Characteristics Request/Response, bidirectional
-periodic heartbeats, and termination initiated by each peer. Assertions check
+periodic heartbeats, and termination initiated by each peer. They also verify
+IPv4/IPv6 addresses and attached subnets in modem initialization, bidirectional
+session address additions/replacements/removals, and destination address
+additions/replacements/removals. After router withdrawal, an Announce with IPv4
+and IPv6 add/remove hints must restore the modem's actual destination metrics
+and addresses, independently of those hints. A second Announce requests an
+unknown destination and receives Request Denied through the upstream CLI's
+configured response. Assertions check
 the router's public events and exact metrics, as well as independent modem
-logs. Each session emits one SessionDown. PCAPs, the generated core profile,
+retained peer addresses using `show peer`. Cleared sets must be empty on both
+sides. Each session emits one SessionDown. PCAPs, the generated core profile,
 both peer logs, and `summary.json` are uploaded as `ll-dlep-interoperability`.
 The Cargo test count excludes these external scenarios.
 
@@ -116,11 +134,24 @@ behaviors required explicit configuration, without relaxing our validation:
   Capture assertions require the actual termination request and response in
   both scenarios, so a TCP disconnect alone cannot pass the test.
 
-Discovery, IPv6, TLS, extension negotiation, and interoperability with arbitrary
+Discovery, IPv6 transport, TLS, extension negotiation, and interoperability with arbitrary
 peers remain outside these scenarios. This is not a stock-configuration
 deployment test; the TTL setting, corrected core profile, and explicit link
-reply matter. The PCAP checks also reconstruct each direction's TCP payload,
-reject capture gaps, and require at least two Heartbeats in each direction.
+reply matter. The PCAP checks reconstruct each direction's TCP payload, reject
+gaps/conflicting retransmissions and truncated messages/data items, and require
+at least two Heartbeats in each direction. Exact address values, subnet prefixes,
+add/remove flags, Announce hints, and success/denial responses are checked
+independently of either peer's codec. IPv6 address data travels over the IPv4
+TCP session; this is not IPv6 transport coverage.
+
+The shared capture parser has four network-free regression tests for segmented
+and retransmitted TCP data, missing peers/SYNs, gaps, conflicting retransmissions,
+truncation, and invalid address items. CI runs them in the formatting/workflow
+job. Run them locally with:
+
+```sh
+python3 -B -m unittest discover -s .github/scripts -p 'test_interop_*.py'
+```
 
 ## Network tests and coverage
 

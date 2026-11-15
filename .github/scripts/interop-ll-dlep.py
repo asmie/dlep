@@ -6,62 +6,60 @@ import contextlib
 import json
 import pathlib
 import re
-import struct
 import subprocess
 import xml.etree.ElementTree as ET
 
-from interop_common import capture, until
+from interop_common import address_items, capture, until, wire_records
 
 REVISION = "184e148ae4747dee11263a7ccedf952e36861ec0"
 PEER = pathlib.Path("/opt/ll-dlep")
 MAC = "02:00:00:00:00:01"
+UNKNOWN_MAC = "02:00:00:00:00:02"
 INITIAL = ("Maximum_Data_Rate_Receive 10000000 Maximum_Data_Rate_Transmit 20000000 "
            "Current_Data_Rate_Receive 5000000 Current_Data_Rate_Transmit 7000000 Latency 2500")
 
 
-def wire_messages(path):
-    """Read our bounded loopback capture, checking TCP continuity and framing.
+def address_values(n):
+    return [("IPv4_Address", f"192.0.2.{n}"), ("IPv6_Address", f"2001:db8::{n}"),
+            ("IPv4_Attached_Subnet", f"198.51.{n}.0;24"),
+            ("IPv6_Attached_Subnet", f"2001:db8:{n}::;64")]
 
-    This is only for the single IPv4 connection in each scenario. It decodes
-    message headers, never data items, independently of either protocol codec.
-    """
-    data = path.read_bytes()
-    streams, starts = {}, {}
-    offset = 24  # Our capture helper writes a little-endian Ethernet PCAP.
-    while offset < len(data):
-        _, _, length, original = struct.unpack_from("<IIII", data, offset)
-        assert length == original
-        offset += 16
-        frame = data[offset:offset + length]
-        assert len(frame) == length
-        offset += length
-        tcp = 14 + (frame[14] & 15) * 4
-        source, dest, sequence = struct.unpack_from("!HHI", frame, tcp)
-        flow = (source, dest)
-        if frame[tcp + 13] & 2:  # SYN establishes each direction's sequence base.
-            starts[flow] = (sequence + 1) & 0xFFFFFFFF
-        ip_end = 14 + struct.unpack_from("!H", frame, 16)[0]
-        payload = frame[tcp + (frame[tcp + 12] >> 4) * 4:ip_end]
-        if payload:
-            streams.setdefault(flow, []).append(((sequence - starts[flow]) & 0xFFFFFFFF, payload))
-    messages = {}
-    for (source, dest), segments in streams.items():
-        stream = bytearray()
-        for position, payload in sorted(segments):
-            assert position <= len(stream), "capture has a gap in TCP data"
-            overlap = min(len(stream) - position, len(payload))
-            assert stream[position:position + overlap] == payload[:overlap]
-            stream.extend(payload[overlap:])
-        types, offset = [], 0
-        while offset < len(stream):
-            kind, length = struct.unpack_from("!HH", stream, offset)
-            offset += 4 + length
-            assert offset <= len(stream), "truncated DLEP message in capture"
-            types.append(kind)
-        messages["modem" if source == 4854 else "router"] = types
-        assert 4854 in (source, dest)
-    assert set(messages) == {"router", "modem"}
-    return messages
+
+def cli_addresses(n, add=1):
+    return " ".join(f"{name} {add};{value}" for name, value in address_values(n))
+
+
+def expected_addresses(n, add=1, subnets=True):
+    if n is None:
+        return []
+    return [(kind, add, value.replace(";", "/"))
+            for kind, (_, value) in enumerate(address_values(n), 8)
+            if subnets or kind < 10]
+
+
+def state_addresses(n):
+    return " ".join(value for _, _, value in expected_addresses(n)) if n is not None else "- - - -"
+
+
+async def state(router, peer, local, destination):
+    after = len(router.text())
+    await router.command("state")
+    await router.expect("OK state\n", after)
+    await router.expect(f"STATE_PEER {state_addresses(peer)}\n", after)
+    await router.expect(f"STATE_LOCAL {state_addresses(local)}\n", after)
+    await router.expect(f"STATE_DEST {state_addresses(destination)}\n", after)
+
+
+async def retained_router_addresses(modem, peer_id, expected):
+    after = len(modem.text())
+    await modem.command(f"show peer {peer_id}")
+    await modem.expect("DlepService returns: ok", after)
+    # The CLI omits "default metrics:" when the retained set is empty.
+    # Start at the queried peer metadata so an earlier callback cannot match.
+    output = modem.text()[after:].split("type = dlep-router", 1)[1]
+    actual = re.findall(r"^(IPv[46]_(?:Address|Attached_Subnet)) ([^\r\n]+)", output, re.M)
+    wanted = [] if expected is None else [(name, f"1;{value}") for name, value in address_values(expected)]
+    assert sorted(actual) == sorted(wanted), output
 
 
 class Process:
@@ -91,8 +89,8 @@ class Process:
         self.child.stdin.write((line + "\n").encode())
         await self.child.stdin.drain()
 
-    async def expect(self, text):
-        await until(lambda: text in self.text(), text)
+    async def expect(self, text, after=0):
+        await until(lambda: text in self.text()[after:], text)
 
     async def finished(self):
         await asyncio.wait_for(self.child.wait(), 10)
@@ -126,7 +124,7 @@ async def scenario(output, initiator):
         ], output / f"{initiator}-modem.log")
         await modem.expect("DlepInit succeeded")
         # A show command after peer update forms a CLI processing barrier.
-        await modem.command("peer update " + INITIAL)
+        await modem.command("peer update " + INITIAL + " " + cli_addresses(10))
         await modem.command("show peer")
         await until(lambda: modem.text().count("DlepService returns: ok") >= 2,
                     "LL-DLEP accepting initial peer metrics")
@@ -135,15 +133,28 @@ async def scenario(output, initiator):
         await router.expect("UP\n")
         await router.expect("METRICS 10000000 20000000 5000000 7000000 2500\n")
         await modem.expect("Peer up,")
-        await modem.command(f"dest up {MAC} " + INITIAL)
+        peer_id = re.search(r"Peer up, .*?peer id = ([^\r\n]+)", modem.text()).group(1)
+        await modem.command(f"dest up {MAC} " + INITIAL + " " + cli_addresses(20))
         await router.expect("DEST_UP 10000000 20000000 5000000 7000000 2500\n")
+        await state(router, 10, None, 20)
         await modem.command(f"dest update {MAC} Current_Data_Rate_Receive 4000000 Latency 3500")
         await router.expect("DEST_UPDATE 10000000 20000000 4000000 7000000 3500\n")
         await modem.command("peer update Current_Data_Rate_Transmit 6000000")
         await router.expect("METRICS 10000000 20000000 5000000 6000000 2500\n")
+        await modem.command("peer update " + cli_addresses(10, 0) + " " + cli_addresses(11))
+        await router.expect(f"PEER_ADDR {state_addresses(11)}\n")
+        await modem.command(f"dest update {MAC} " + cli_addresses(20, 0) + " " + cli_addresses(21))
+        await router.expect(f"DEST_ADDR {state_addresses(21)}\n")
+        for command, expected in [("session-add", 40), ("session-replace", 41), ("session-clear", None)]:
+            after = len(router.text())
+            await router.command(command)
+            await router.expect(f"OK {command}\n", after)
+            await router.expect("SESSION_STATUS 0\n", after)
+            await retained_router_addresses(modem, peer_id, expected)
+            await state(router, 11, expected, 21)
         await router.command("link")
         await modem.expect("Linkchar request, peer = ")
-        peer_id = re.search(r"Linkchar request, peer = ([^,]+),", modem.text()).group(1)
+        assert re.search(r"Linkchar request, peer = ([^,]+),", modem.text()).group(1) == peer_id
         # Upstream's convenience autoreply echoes only requested items. Supply
         # all supported metrics through its CLI, as RFC 8175 section 12.19 needs.
         await modem.command(
@@ -155,8 +166,34 @@ async def scenario(output, initiator):
         )
         await router.expect("LINK_STATUS 0\n")
         await router.expect("LINK_METRICS 10000000 20000000 2000000 3000000 4500\n")
+        await router.command("withdraw")
+        await router.expect(f"WITHDRAW {MAC} 0\n")
+        # Update the independent modem's retained physical data while withdrawn.
+        after = len(modem.text())
+        await modem.command(f"dest update {MAC} " + INITIAL.replace("Latency 2500", "Latency 5500"))
+        await modem.expect("DlepService returns: ok", after)
+        await router.command("announce")
+        await router.expect(f"ANNOUNCE {MAC} 0\n")
+        await state(router, 11, None, 21)
+        # This comes from the modem's stored data, not the requested hints.
+        await router.expect("STATE_METRICS 10000000 20000000 5000000 7000000 5500\n")
+        await modem.command(f"dest response {UNKNOWN_MAC} Request_Denied")
+        # This command has no acknowledgement; a show forms a processing barrier.
+        after = len(modem.text())
+        await modem.command("show peer")
+        await modem.expect("DlepService returns: ok", after)
+        await router.command("announce-denied")
+        await router.expect(f"ANNOUNCE {UNKNOWN_MAC} 2\n")
+        await modem.expect(f"mac = {UNKNOWN_MAC}")
+        await state(router, 11, None, 21)
+        await modem.command(f"dest update {MAC} " + cli_addresses(21, 0))
+        await router.expect("DEST_ADDR - - - -\n")
+        await modem.command("peer update " + cli_addresses(11, 0))
+        await router.expect("PEER_ADDR - - - -\n")
+        await state(router, None, None, None)
+        after = len(router.text())
         await modem.command(f"dest down {MAC}")
-        await router.expect("DEST_DOWN\n")
+        await router.expect("DEST_DOWN\n", after)
         # Assert the independent modem both sends and processes heartbeats;
         # merely waiting with an open TCP connection is insufficient evidence.
         await until(lambda: log_path.read_text().count("Send Heartbeat to peer ID=") >= 2
@@ -182,7 +219,23 @@ async def scenario(output, initiator):
         packet_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await packet_task
-        messages = wire_messages(output / f"{initiator}.pcap")
+        records = wire_records(output / f"{initiator}.pcap", 4854)
+        messages = {role: [m["type"] for m in values] for role, values in records.items()}
+        def payloads(role, kind):
+            return [address_items(m) for m in records[role] if m["type"] == kind]
+        assert payloads("modem", 2) == [expected_addresses(10)]
+        assert payloads("modem", 7) == [expected_addresses(20)]
+        assert payloads("router", 3) == [expected_addresses(40),
+            sorted(expected_addresses(40, 0) + expected_addresses(41)), expected_addresses(41, 0)]
+        assert [p for p in payloads("modem", 3) if p] == [
+            sorted(expected_addresses(10, 0) + expected_addresses(11)), expected_addresses(11, 0)]
+        assert [p for p in payloads("modem", 13) if p] == [
+            sorted(expected_addresses(20, 0) + expected_addresses(21)), expected_addresses(21, 0)]
+        hints = sorted(expected_addresses(30, subnets=False) + expected_addresses(31, 0, subnets=False))
+        assert payloads("router", 9) == [hints, hints]
+        assert payloads("modem", 10) == [expected_addresses(21), []]
+        responses = [m for m in records["modem"] if m["type"] == 10]
+        assert [next(v[0] for k, v in m["items"] if k == 1) for m in responses] == [0, 2]
         # Verify the wire exchange, not just a TCP close retaining the shutdown
         # reason. Type 5 is Termination; type 6 is its required Response.
         responder = "modem" if initiator == "router" else "router"
@@ -194,6 +247,10 @@ async def scenario(output, initiator):
                 "heartbeats_sent": peer_log.count("Send Heartbeat to peer ID="),
                 "heartbeats_received": peer_log.count("handle_heartbeat(): from peer="),
                 "wire_messages": messages,
+                "address_checks": ["modem initialization IPv4/IPv6 addresses and subnets",
+                                   "bidirectional session add/replace/remove",
+                                   "destination add/replace/remove",
+                                   "Announce hints, successful physical replay and denial"],
                 "result": "passed"}
     finally:
         for peer in [router, modem]:
