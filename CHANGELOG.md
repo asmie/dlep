@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Discovery offers now remove equivalent endpoints even when another candidate
+  separates them, preserving TLS/IPv6 preference and within-class order.
+  Omitted port 854 and explicit port 854 no longer cause duplicate connection
+  attempts. Different TLS requirements remain distinct. A new discovery FSM fuzz
+  target checks endpoint uniqueness, filtering, scope, and request/offer behavior.
 - Added separate cargo-fuzz targets for message/signal/Data Item decoding and
   bounded router/modem session event sequences. Deterministic seeds, nightly
   AddressSanitizer CI smoke runs, and corpus/failure artifacts support longer

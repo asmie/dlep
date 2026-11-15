@@ -490,7 +490,7 @@ which is already ignored by Git.
 
 ## Fuzzing
 
-`.github/workflows/fuzz.yml` runs two cargo-fuzz 0.13.2 targets on changes to the
+`.github/workflows/fuzz.yml` runs three cargo-fuzz 0.13.2 targets on changes to the
 codec, FSM, fuzz workspace, or workspace manifests, and on manual dispatch.
 Each nightly AddressSanitizer job fuzzes for 30 seconds, with a five-second input
 deadline, 2 GiB RSS limit, and a 15-minute job deadline. Generated corpora and
@@ -504,11 +504,15 @@ commands, timers, and teardown under both MAC formats. Every emitted message
 must encode/decode before delivery to the other FSM; operation and response
 budgets bound each input. The independent unpublished workspace keeps fuzzing
 dependencies and nightly requirements outside release packages.
+`discovery_sequence` adds raw-signal injection and real request/offer exchanges
+through both discovery FSMs, including timers and restarts. It checks emitted
+signal serialization, reply targets, usable and unique endpoints, TLS/IPv6
+preference, and IPv6 link-local scope propagation.
 
 See [fuzzing instructions](../fuzz/README.md) for seed generation, longer runs,
 input formats, failure replay/minimization, and the local LeakSanitizer sandbox
-limitation. Short runs are smoke evidence; network transports, TLS, discovery
-FSMs, extensions, and adapters are outside these targets.
+limitation. Short runs are smoke evidence; network transports, TLS, extensions,
+and adapters are outside these targets.
 
 ## Dependency audit
 

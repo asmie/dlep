@@ -1262,8 +1262,20 @@ The order of work was:
     timers, and teardown explore failure paths. Deterministic seeds include
     maximum-length wire bodies. Nightly CI runs each target with AddressSanitizer
     for 30 seconds and retains corpora/failure artifacts. Release dependencies
-    and Rust 1.85 remain unchanged. Network/TLS and discovery FSM fuzzing remain
-    future work; short runs do not establish complete semantic correctness.
+    and Rust 1.85 remain unchanged. Network/TLS fuzzing remains future work;
+    short runs do not establish complete semantic correctness. Discovery FSM
+    fuzzing is added in the next checkpoint.
+
+64. Discovery fuzzing and endpoint deduplication. **Done** — a third libFuzzer
+    target drives both discovery FSMs with raw signals, real request/offer
+    exchanges, timers, shutdown, and restart. It checks serialization, reply
+    targets, endpoint usability and uniqueness, TLS/IPv6 order, and link-local
+    scope propagation. Seeds exposed interleaved equivalent connection points
+    surviving adjacent-only deduplication. The fix removes all normalized
+    duplicates while retaining preference and within-class order; distinct TLS
+    requirements remain separate. Regressions cover IPv4/scoped IPv6 and both
+    TLS settings. CI includes the new target and 184 discovery seeds. Interface
+    metadata, UDP sockets, and TLS remain outside these pure-logic fuzz targets.
 
 ---
 

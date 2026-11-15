@@ -26,6 +26,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "discovery_sequence"
+path = "fuzz_targets/discovery_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "session_sequence"
 path = "fuzz_targets/session_sequence.rs"
 test = false

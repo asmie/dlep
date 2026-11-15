@@ -13,6 +13,7 @@ cargo fetch --manifest-path fuzz/Cargo.toml --locked
 python3 -B .github/scripts/seed-fuzz.py
 cargo +nightly fuzz run wire_decode -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
 cargo +nightly fuzz run session_sequence -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+cargo +nightly fuzz run discovery_sequence -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
 ```
 
 `wire_decode` tries message, signal, and individual Data Item decoding on every
@@ -38,11 +39,32 @@ them to the other FSM. A 128-batch budget detects response loops. Inputs stop at
 64 operations, including after closure; application metrics/addresses currently
 use defaults. This checks panic freedom, message serialization, and bounded
 responses. It does not assert complete protocol semantics or fuzz transports,
-TLS, discovery FSMs, plug-ins, or adapter processes.
+TLS, plug-ins, or adapter processes.
 
-The seed generator writes 19 codec and 100 session starting inputs, covering
+`discovery_sequence` drives the router and modem discovery FSMs without sockets.
+The mode byte selects IPv4/IPv6 source (bit 0), IPv4/IPv6 advertised endpoint
+(bit 1), and TLS advertisement (bit 2). IPv6 sources carry a mode-derived scope
+ID. Up to 64 operations use bits 0–1 for:
+
+| Code | Event |
+| --- | --- |
+| 0 | Inject a length-prefixed signal, using the session target's two-byte length format; bit 7 selects modem instead of router |
+| 1 | Generate a valid discovery request, deliver the modem's encoded/decoded offer to the router |
+| 2 | Expire the router discovery timer |
+| 3 | Shut down both discovery FSMs; bit 2 restarts router probing |
+
+Malformed signals rejected by the codec are skipped. Outbound signals must
+encode/decode and use the expected multicast/unicast target. Emitted endpoints
+must be nonempty, usable unicast addresses with nonzero ports, unique by address
+and TLS requirement, and ordered by TLS then IPv6 preference. IPv6 link-local
+endpoints must preserve the source scope. This target checks pure discovery
+logic; interface selection and UDP packet metadata remain runtime-test coverage.
+
+The seed generator writes 19 codec, 100 session, and 184 discovery starting inputs, covering
 initialization, destination lifecycle, unknown items, duplicates, truncation,
 invalid prefixes/UTF-8, maximum body lengths, both MAC formats, and teardown.
+Discovery seeds include default ports, interleaved equivalent connection points,
+TLS preferences, unusable endpoints, duplicate peer items, and invalid flags.
 Generated corpora, artifacts, and builds are ignored. Rerunning the generator
 restores starting seeds and preserves newly discovered corpus entries.
 

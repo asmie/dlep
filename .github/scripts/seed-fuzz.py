@@ -45,6 +45,32 @@ def main():
         for name, payload in messages.items():
             for side in (0, 128):
                 seeds["session_sequence"][f"{mode}-{side}-{name}"] = bytes([mode, side]) + struct.pack("!H", len(payload)) + payload
+    signals = {
+        "discovery": b"DLEP" + message(1, peer),
+        "fallback": b"DLEP" + message(2),
+        "offer-v4": seeds["wire_decode"]["offer-v4"],
+        "offer-v6": seeds["wire_decode"]["offer-v6"],
+        "duplicate-peer": b"DLEP" + message(2, peer * 2),
+        "unknown-item": b"DLEP" + message(2, item(65535, b"x")),
+        "truncated": b"DLEP\0\2\0\x08\0",
+    }
+    cp = item(2, bytes.fromhex("00c00002020356"))
+    other = item(2, bytes.fromhex("00c00002030356"))
+    signals["interleaved-duplicates"] = b"DLEP" + message(2, cp + other + item(2, bytes.fromhex("00c0000202")))
+    signals["tls-order"] = b"DLEP" + message(2, cp + item(2, bytes.fromhex("01c00002020356"))
+        + item(3, b"\1" + bytes.fromhex("fe800000000000000000000000000001") + b"\3\x56"))
+    signals["unusable-endpoints"] = b"DLEP" + message(2,
+        item(2, bytes.fromhex("00000000000356"))
+        + item(2, bytes.fromhex("00e00000750356"))
+        + item(2, bytes.fromhex("00c00002020000"))
+        + item(3, b"\0" + bytes(16) + b"\3\x56"))
+    signals["invalid-flags"] = b"DLEP" + message(2, item(2, bytes.fromhex("80c00002020356")))
+    seeds["discovery_sequence"] = {}
+    for mode in range(8):
+        seeds["discovery_sequence"][f"lifecycle-{mode}"] = bytes([mode, 1, 2, 3, 1, 7, 1])
+        for name, payload in signals.items():
+            for side in (0, 128):
+                seeds["discovery_sequence"][f"{mode}-{side}-{name}"] = bytes([mode, side]) + struct.pack("!H", len(payload)) + payload
     for target, inputs in seeds.items():
         root = Path("fuzz/corpus") / target
         root.mkdir(parents=True, exist_ok=True)

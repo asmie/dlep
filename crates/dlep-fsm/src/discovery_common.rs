@@ -100,7 +100,11 @@ pub fn offer_endpoints(sig: &Signal, from: SocketAddr) -> Vec<OfferEndpoint> {
         !e.addr.ip().is_unspecified() && !e.addr.ip().is_multicast() && e.addr.port() != 0
     });
     endpoints.sort_by_key(|e| (!e.use_tls, !e.addr.is_ipv6()));
-    endpoints.dedup();
+    // Different wire items (absent/default port) can resolve to the same
+    // endpoint with other candidates between them. Preserve preference and
+    // within-class order while deduplicating the complete normalized set.
+    let mut seen = std::collections::HashSet::new();
+    endpoints.retain(|e| seen.insert((e.addr, e.use_tls)));
     endpoints
 }
 

@@ -224,6 +224,77 @@ fn connection_points_prefer_tls_then_ipv6() {
 }
 
 #[test]
+fn equivalent_connection_points_are_deduplicated_across_other_endpoints() {
+    use dlep_core::{DataItem, Signal, data_item::ConnectionPointFlags};
+    for ipv6 in [false, true] {
+        for use_tls in [false, true] {
+            let point = |index: u8, port| {
+                let flags = ConnectionPointFlags { use_tls };
+                if ipv6 {
+                    DataItem::Ipv6ConnectionPoint {
+                        flags,
+                        addr: format!("fe80::{index}").parse().unwrap(),
+                        port,
+                    }
+                } else {
+                    DataItem::Ipv4ConnectionPoint {
+                        flags,
+                        addr: format!("192.0.2.{index}").parse().unwrap(),
+                        port,
+                    }
+                }
+            };
+            let signal = Signal::new(SignalType::PEER_OFFER)
+                .with_item(point(1, None))
+                .with_item(point(2, Some(854)))
+                .with_item(point(1, Some(854)));
+            let from = "[fe80::10%7]:49854".parse().unwrap();
+            let mut fsm = RouterDiscoveryFsm::new();
+            fsm.step(FsmEvent::AppStartDiscovery);
+            let actions = fsm.step(FsmEvent::RecvSignal { signal, from });
+            let endpoints = actions
+                .into_iter()
+                .find_map(|a| match a {
+                    FsmAction::Emit(EmittedEvent::PeerDiscovered { endpoints, .. }) => {
+                        Some(endpoints)
+                    }
+                    _ => None,
+                })
+                .expect("valid offer must be emitted");
+            assert_eq!(endpoints.len(), 2, "IPv6={ipv6}, TLS={use_tls}");
+            for (index, endpoint) in endpoints.iter().enumerate() {
+                let expected: std::net::SocketAddr = if ipv6 {
+                    format!("[fe80::{}%7]:854", index + 1).parse().unwrap()
+                } else {
+                    format!("192.0.2.{}:854", index + 1).parse().unwrap()
+                };
+                assert_eq!(endpoint.addr, expected);
+                assert_eq!(endpoint.use_tls, use_tls);
+            }
+        }
+    }
+}
+
+#[test]
+fn same_address_with_distinct_tls_requirements_remains_distinct() {
+    use dlep_core::{DataItem, Signal, data_item::ConnectionPointFlags};
+    let point = |use_tls, port| DataItem::Ipv4ConnectionPoint {
+        flags: ConnectionPointFlags { use_tls },
+        addr: "192.0.2.1".parse().unwrap(),
+        port,
+    };
+    let signal = Signal::new(SignalType::PEER_OFFER)
+        .with_item(point(false, None))
+        .with_item(point(true, Some(854)))
+        .with_item(point(false, Some(854)));
+    let endpoints = dlep_fsm::discovery_common::offer_endpoints(&signal, peer_addr());
+    assert_eq!(endpoints.len(), 2);
+    assert!(endpoints[0].use_tls);
+    assert!(!endpoints[1].use_tls);
+    assert_eq!(endpoints[0].addr, endpoints[1].addr);
+}
+
+#[test]
 fn signals_with_unknown_or_duplicate_items_are_ignored() {
     let mut fsm = RouterDiscoveryFsm::new();
     fsm.step(FsmEvent::AppStartDiscovery);
