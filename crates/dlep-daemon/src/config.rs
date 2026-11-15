@@ -230,6 +230,9 @@ pub enum DiscoveryMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(from = "RouterConfigFile")]
 pub struct RouterConfig {
+    /// Used by the router binary; library embedders integrate directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<RouterAdapterConfig>,
     #[serde(default)]
     pub limits: RouterLimits,
     #[serde(flatten)]
@@ -245,12 +248,38 @@ pub struct RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
+            adapter: None,
             limits: RouterLimits::default(),
             shared: SharedConfig::default(),
             mode: DiscoveryMode::default(),
             static_peers: Vec::new(),
             peer_description: default_router_peer_description(),
         }
+    }
+}
+
+/// External router integration process. See `doc/router-adapter.md`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterAdapterConfig {
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl RouterAdapterConfig {
+    pub fn new(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.command.is_absolute() {
+            return Err("command must be an absolute path".into());
+        }
+        Ok(())
     }
 }
 
@@ -404,6 +433,8 @@ impl Default for ModemConfig {
 #[serde(deny_unknown_fields)]
 struct RouterConfigFile {
     #[serde(default)]
+    adapter: Option<RouterAdapterConfig>,
+    #[serde(default)]
     limits: RouterLimits,
     #[serde(default)]
     network: NetworkConfig,
@@ -422,6 +453,7 @@ struct RouterConfigFile {
 impl From<RouterConfigFile> for RouterConfig {
     fn from(file: RouterConfigFile) -> Self {
         Self {
+            adapter: file.adapter,
             limits: file.limits,
             shared: SharedConfig {
                 network: file.network,

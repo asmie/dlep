@@ -868,6 +868,28 @@ The order of work was:
     Bridge regressions also cover missed SessionUp, busy initialization, preserving
     existing overrides, and cleanup of requests and retries for ended sessions.
 
+33. Router integration adapter. **Done** — `[adapter]` runs an external JSON
+    Lines process ([protocol](router-adapter.md)). A dedicated writer streams
+    complete retained snapshots between begin/end records, with separate session,
+    destination, and address records. Initial state, changed state, and explicit
+    resync use the same replacement semantics. Slow output coalesces state; input
+    and notice queues are bounded. The discovery/reconnect driver stays independent.
+
+    Commands target a session/MAC and support destination announce, withdrawal,
+    and link-characteristic requests. Increasing request IDs prevent accidental
+    re-execution without an unbounded result cache. Results distinguish local
+    acceptance, rejection, and unknown acceptance after a local deadline; no
+    peer transaction deadline or automatic retry is added. Link responses and
+    down reasons are transient notices; event loss produces an explicit gap
+    notice and current snapshot. Snapshot state does not reconstruct lost replies.
+
+    Adapter failure terminates sessions and exits for supervisor restart. Normal
+    shutdown sends empty state and closes input, with a bounded adapter exit.
+    Ambient capabilities are cleared before exec. Tests cover snapshot framing,
+    coalescing, resync, input bounds, stalled output, targeted commands across
+    two modems, and real IPv4/IPv6 CLI sessions with a scripted adapter, plus
+    failure cleanup, configuration checks, capability dropping, and ignored EOF.
+
 ---
 
 ## 10. Open questions / risks

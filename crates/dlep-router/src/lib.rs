@@ -1,3 +1,4 @@
+mod adapter;
 mod connect;
 
 use connect::ConnectAttempts;
@@ -101,6 +102,12 @@ where
 
     let mode = config.mode.clone();
     let static_peers = config.static_peers.clone();
+    // Fail a bad adapter command before opening DLEP connections.
+    let mut adapter = config
+        .adapter
+        .as_ref()
+        .map(adapter::Adapter::spawn)
+        .transpose()?;
 
     let mut builder = RouterDaemon::builder().config(config);
     if let Some(tls) = tls {
@@ -118,14 +125,26 @@ where
         biased;
         _ = shutdown.recv() => Ok(()),
         result = run(&daemon, &mut events, mode, &static_peers) => result,
+        result = async {
+            match &mut adapter {
+                Some(adapter) => adapter.run(&daemon).await,
+                None => std::future::pending().await,
+            }
+        } => result.context("router adapter failed"),
     };
 
-    tracing::info!("shutdown requested");
-    daemon
+    match &result {
+        Ok(()) => tracing::info!("shutdown requested"),
+        Err(error) => tracing::error!(%error, "router failed; shutting down"),
+    }
+    let shutdown_result = daemon
         .shutdown()
         .await
-        .context("shutting down router daemon")?;
-    result
+        .context("shutting down router daemon");
+    if let Some(adapter) = adapter {
+        adapter.stop().await;
+    }
+    result.and(shutdown_result)
 }
 
 async fn run(

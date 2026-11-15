@@ -4,6 +4,11 @@ Linux router daemon for DLEP (RFC 8175), with discovery, TLS, and reconnect supp
 
 Requires Rust 1.85 or newer.
 
+Configure `[adapter]` to run an external routing integration process. It receives
+complete session/destination snapshots over JSON Lines and can submit targeted
+destination and link-characteristic commands. See the
+[router adapter protocol](https://github.com/asmie/dlep/blob/master/doc/router-adapter.md).
+
 ```sh
 cargo install dlep-router --version 0.2.0 --locked
 dlep-router --help

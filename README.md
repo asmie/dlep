@@ -26,6 +26,10 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > [adapter process](doc/radio-adapter.md) that reports destinations and answers
 > Link Characteristics Requests; embedders can register a link-control backend
 > directly. Busy commands return explicit acceptance errors.
+>
+> The router binary can run a [router adapter](doc/router-adapter.md) to consume
+> retained session/destination snapshots and submit targeted announce, withdrawal,
+> and link-characteristic commands. Routing policy belongs to the adapter.
 
 ## Goals
 

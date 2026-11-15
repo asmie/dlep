@@ -14,6 +14,11 @@ mode = "discovery"
 # Free-text description sent in the Peer Type data item.
 peer_description = "dlep-router"
 
+# Optional integration process. See doc/router-adapter.md for JSON Lines I/O.
+# [adapter]
+# command = "/usr/local/libexec/dlep-routing-adapter"
+# args = ["--interface", "radio0"]
+
 [limits]
 # Includes TCP/TLS attempts, initialization, established sessions, and shutdown.
 max_sessions = 64

@@ -95,6 +95,16 @@ typos and settings for the wrong role (such as `[metrics]` on the router).
 Finish each edit with `--check-config` to validate timer values, interfaces,
 metrics, and TLS material as well.
 
+An optional router `[adapter]` section runs an external integration process;
+`command` is an absolute executable path and `args` defaults to `[]`.
+`--check-config` checks the section and command file without running it. The
+adapter receives complete session/destination snapshots and can issue targeted
+announce, withdrawal, and link-characteristic commands. See the
+[router adapter protocol](router-adapter.md) and
+[example consumer](../examples/router-adapter.py). Routing policy stays in the
+adapter. It shares the service sandbox and user, with ambient capabilities
+cleared; provision access to your routing service explicitly.
+
 | Section | Field | Default | Meaning |
 |---|---|---|---|
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |

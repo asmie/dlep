@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Router integration adapter: `[adapter]` starts an external JSON Lines process
+  that receives complete, replaceable snapshots and can submit targeted announce,
+  withdrawal, and link-characteristic commands. Explicit resync, bounded queues,
+  write/acceptance deadlines, local command results, and event-gap notices support
+  slow consumers and recovery. Adapter failure terminates router sessions; shutdown
+  closes adapter input and bounds its exit. Ambient capabilities are cleared.
+- `RouterConfig` gains `adapter: Option<RouterAdapterConfig>`; exhaustive struct
+  literals need updating. `--check-config` validates the section without execution.
+
 - Both daemon handles expose retained `state()` snapshots with a generation,
   session/peer identity, negotiated extensions, effective metrics, addresses,
   and destination phases. Late or lagged consumers can reconcile current state

@@ -56,6 +56,8 @@ pub enum ConfigCheckError {
     Metrics(String),
     #[error("invalid [radio] adapter: {0}")]
     Radio(String),
+    #[error("invalid [adapter] router integration: {0}")]
+    RouterAdapter(String),
     #[error(transparent)]
     Tls(#[from] TlsSetupError),
     #[error("mode = \"static\" requires at least one entry in static_peers")]
@@ -65,6 +67,17 @@ pub enum ConfigCheckError {
 /// Validate a router configuration without starting the daemon: TLS
 /// material must load when `use_tls` is on, and static mode needs peers.
 pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
+    if let Some(adapter) = &cfg.adapter {
+        adapter
+            .validate()
+            .map_err(ConfigCheckError::RouterAdapter)?;
+        if !adapter.command.is_file() {
+            return Err(ConfigCheckError::RouterAdapter(format!(
+                "command is not a file: {}",
+                adapter.command.display()
+            )));
+        }
+    }
     cfg.limits.validate().map_err(ConfigCheckError::Limits)?;
     cfg.shared
         .timers
