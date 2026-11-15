@@ -686,6 +686,15 @@ impl ModemSessionFsm {
                     self.send_session_metrics(metrics)
                 }
             }
+            (ModemSessionState::InSession, FsmEvent::AppSessionDefaults { metrics }) => {
+                // Preserve live per-destination values inside this step, so
+                // callers never have to restore a potentially stale snapshot.
+                crate::session_common::merge_link_metrics(
+                    &build_session_update(&metrics),
+                    &mut self.session_metrics,
+                );
+                self.send_session_metrics(metrics)
+            }
             (ModemSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
                 self.termination_reason = reason;
                 self.state = ModemSessionState::Terminating;
@@ -884,6 +893,7 @@ impl ModemSessionFsm {
                     .map_err(|_| E::InvalidInput)?;
             }
             FsmEvent::AppSessionUpdate { metrics }
+            | FsmEvent::AppSessionDefaults { metrics }
             | FsmEvent::AppQueueSessionUpdate { metrics } => {
                 if !self.valid_metrics(metrics) {
                     return Err(E::InvalidInput);

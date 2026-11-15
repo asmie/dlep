@@ -929,11 +929,13 @@ impl Bridge<'_> {
         session: &dlep_daemon::SessionSnapshot,
     ) {
         if self.session_metrics != session.metrics {
+            // Preserve live destination values in the session task; this
+            // membership snapshot may predate a completed link-control grant.
             let result = self
                 .daemon
                 .send_command_to(
                     session_id,
-                    SessionCommand::SessionUpdate {
+                    SessionCommand::SessionDefaults {
                         metrics: self.session_metrics,
                     },
                 )
@@ -942,22 +944,6 @@ impl Bridge<'_> {
             self.update_retries(&result, Retry::InitializeSession, Some(session_id));
             if result.is_err() {
                 return;
-            }
-            // A report or a link-control grant may have reached this session
-            // before we observed it. Session Update overwrites every existing
-            // destination, so restore those effective per-session values.
-            for (id, destination) in &session.destinations {
-                let result = self
-                    .daemon
-                    .send_command_to(
-                        session_id,
-                        SessionCommand::UpdateDestination {
-                            mac: id.0,
-                            metrics: destination.metrics,
-                        },
-                    )
-                    .await;
-                self.accepted("destination metrics replay", &result);
             }
         }
         let commands: Vec<_> = self
@@ -1622,6 +1608,115 @@ mod tests {
         );
         drop(peer);
         drop(bridge);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_replay_snapshot_cannot_overwrite_a_completed_link_grant() {
+        let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
+        let daemon = modem_with(Some(Arc::new(RadioLink {
+            asks,
+            timeout: Duration::from_secs(30),
+        })))
+        .await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(42),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let mut peer = session(&daemon, &mut events).await;
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(99),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        // The backend can complete while replay still holds an older snapshot.
+        let stale = daemon.state().borrow().clone();
+        let sid = *stale.sessions.keys().next().unwrap();
+        send(
+            &mut peer,
+            build_link_characteristics_request(
+                mac(),
+                &dlep_daemon::LinkCharacteristics {
+                    latency: Some(Duration::from_micros(999)),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        let ask = tokio::time::timeout(WAIT, queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = bridge.next_request;
+        bridge.ask(ask).await.unwrap();
+        bridge
+            .inbound(Inbound::LinkResponse {
+                request,
+                status: Status::Success,
+                text: String::new(),
+                metrics: Some(Metrics {
+                    latency_us: Some(999),
+                    ..Default::default()
+                }),
+            })
+            .await;
+        let response = read(&mut peer).await;
+        assert_eq!(
+            response.message_type,
+            MessageType::LINK_CHARACTERISTICS_RESPONSE
+        );
+        let granted = extract_link_metrics(&response).unwrap();
+        assert_eq!(granted.latency, Duration::from_micros(999));
+        flush_peer(&mut peer).await;
+        bridge.reconcile(&stale).await.unwrap();
+        assert_eq!(
+            daemon.state().borrow().sessions[&sid].destinations[&mac().into()].metrics,
+            granted,
+            "replay must preserve the accepted grant, not restore its old snapshot"
+        );
+        let defaults = read(&mut peer).await;
+        assert_eq!(defaults.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&defaults).unwrap().latency,
+            Duration::from_micros(42)
+        );
+        let correction = read(&mut peer).await;
+        assert_eq!(correction.message_type, MessageType::DESTINATION_UPDATE);
+        assert_eq!(extract_link_metrics(&correction), Some(granted));
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        let mut late = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        assert_eq!(
+            read(&mut late).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        let replay = read(&mut late).await;
+        assert_eq!(replay.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(extract_link_metrics(&replay), Some(granted));
+        drop((peer, late));
         daemon.shutdown().await.unwrap();
     }
 

@@ -116,6 +116,131 @@ async fn ack_up(peer: &mut TcpStream) {
 }
 
 #[tokio::test]
+async fn session_defaults_preserve_destination_phases_and_other_sessions() {
+    use dlep_daemon::DestinationPhase as P;
+    use dlep_fsm::session_common::{
+        build_destination_announce, build_destination_down, build_session_update_response,
+        extract_link_metrics,
+    };
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        for ip in ["127.0.0.1", "::1"] {
+            let destination = DestinationId::from(match format {
+                MacAddressFormat::Eui48 => id().0,
+                MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+            });
+            let m = modem_on(ip, format).await;
+            let mut events = m.subscribe();
+            let (mut a, aid) = peer(&m, &mut events).await;
+            let (mut b, bid) = peer(&m, &mut events).await;
+            let expected = LinkMetrics {
+                latency: Duration::from_micros(999),
+                ..Default::default()
+            };
+            m.add_destination(destination, expected).await.unwrap();
+            for stream in [&mut a, &mut b] {
+                assert_eq!(read(stream).await.message_type, M::DESTINATION_UP);
+            }
+            // A remains pending Up; B acknowledges and must stay unaffected.
+            send(
+                &mut b,
+                build_destination_up_response(destination.0, S::SUCCESS),
+            )
+            .await;
+            send(&mut b, Message::new(M::SESSION_UPDATE)).await;
+            assert_eq!(read(&mut b).await.message_type, M::SESSION_UPDATE_RESPONSE);
+            for (phase, latency) in [
+                (P::PendingUp, 42),
+                (P::Up, 84),
+                (P::Withdrawn, 126),
+                (P::PendingDown, 168),
+            ] {
+                if phase == P::Withdrawn {
+                    send(&mut a, build_destination_down(destination.0, S::SUCCESS)).await;
+                    assert_eq!(
+                        read(&mut a).await.message_type,
+                        M::DESTINATION_DOWN_RESPONSE
+                    );
+                    send(&mut a, Message::new(M::SESSION_UPDATE)).await;
+                    assert_eq!(read(&mut a).await.message_type, M::SESSION_UPDATE_RESPONSE);
+                } else if phase == P::PendingDown {
+                    send(&mut a, build_destination_announce(destination.0)).await;
+                    let announced = read(&mut a).await;
+                    assert_eq!(announced.message_type, M::DESTINATION_ANNOUNCE_RESPONSE);
+                    assert_eq!(extract_link_metrics(&announced), Some(expected));
+                    m.send_command_to(
+                        aid,
+                        SessionCommand::DropDestination {
+                            mac: destination.0,
+                            reason: S::SUCCESS,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(read(&mut a).await.message_type, M::DESTINATION_DOWN);
+                }
+                let defaults = LinkMetrics {
+                    latency: Duration::from_micros(latency),
+                    ..Default::default()
+                };
+                let generation = m.state().borrow().generation;
+                m.send_command_to(aid, SessionCommand::SessionDefaults { metrics: defaults })
+                    .await
+                    .unwrap();
+                let state = m.state().borrow().clone();
+                // Default and destination changes form one retained-state update.
+                assert_eq!(state.generation, generation + 1);
+                assert_eq!(state.sessions[&aid].metrics, defaults);
+                assert_eq!(
+                    state.sessions[&aid].destinations[&destination].metrics,
+                    expected
+                );
+                assert_eq!(state.sessions[&aid].destinations[&destination].phase, phase);
+                assert_eq!(state.sessions[&bid].metrics, LinkMetrics::default());
+                assert_eq!(
+                    state.sessions[&bid].destinations[&destination].metrics,
+                    expected
+                );
+                let update = read(&mut a).await;
+                assert_eq!(update.message_type, M::SESSION_UPDATE);
+                assert_eq!(extract_link_metrics(&update), Some(defaults));
+                if phase == P::PendingUp {
+                    send(
+                        &mut a,
+                        build_destination_up_response(destination.0, S::SUCCESS),
+                    )
+                    .await;
+                }
+                if matches!(phase, P::PendingUp | P::Up) {
+                    let correction = read(&mut a).await;
+                    assert_eq!(correction.message_type, M::DESTINATION_UPDATE);
+                    assert_eq!(extract_link_metrics(&correction), Some(expected));
+                }
+                send(&mut a, build_session_update_response(S::SUCCESS)).await;
+                // Stream barriers prove no extra updates or announcements were sent.
+                for stream in [&mut a, &mut b] {
+                    send(stream, Message::new(M::SESSION_UPDATE)).await;
+                    assert_eq!(read(stream).await.message_type, M::SESSION_UPDATE_RESPONSE);
+                }
+            }
+            send(
+                &mut a,
+                build_destination_down_response(destination.0, S::SUCCESS),
+            )
+            .await;
+            send(&mut a, Message::new(M::SESSION_UPDATE)).await;
+            assert_eq!(read(&mut a).await.message_type, M::SESSION_UPDATE_RESPONSE);
+            assert!(
+                !m.state().borrow().sessions[&aid]
+                    .destinations
+                    .contains_key(&destination)
+            );
+            drop((a, b));
+            m.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn queued_session_metrics_preserve_later_reports_on_the_original_session() {
     use dlep_fsm::session_common::{build_session_update_response, extract_link_metrics};
     for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {

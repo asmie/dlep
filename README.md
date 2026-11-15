@@ -240,6 +240,13 @@ reports or link answers. Routers may observe the defaults before those correctio
 The radio adapter uses this path; `update_session_metrics` still returns Busy
 when a session transaction is pending.
 
+To change a session's defaults while preserving its existing destination
+metrics, use `send_command_to(session_id, SessionCommand::SessionDefaults { metrics })`
+on the modem. The session reads its current destination values and sends the
+Session Update plus any needed corrections in one command. It returns Busy
+while a session transaction is pending. Initial radio replay uses this operation
+so an older membership snapshot cannot overwrite newer destination values.
+
 Layer 3 changes use `AddressChanges { added, removed }`; each side contains a
 `DestinationAddrs` set with IPv4/IPv6 addresses and attached subnets.
 `ModemDaemon::add_destination_with_addresses` supplies the initial destination

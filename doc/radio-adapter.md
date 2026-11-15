@@ -105,6 +105,11 @@ Replay uses retained daemon session state and recovers even if the internal
 event subscriber falls behind. It retries busy session initialization, preserves
 existing per-session destination metrics, and respects a router's withdrawal.
 Closed sessions release pending adapter requests and command retries.
+Default replay preserves the session's live destination values within one
+command; it does not restore metrics from the earlier membership snapshot.
+A link grant completed after that snapshot therefore remains in effect.
+Session defaults precede any needed destination corrections on the wire, so
+routers may briefly observe the defaults before the corrections arrive.
 
 Busy destination operations and initial session replay share one retry per
 session and operation (and MAC for a destination operation), using the latest

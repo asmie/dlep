@@ -1024,6 +1024,17 @@ The order of work was:
     optional omissions, grants, lifecycle ordering, separate router progress,
     replay, and both MAC formats over IPv4/IPv6.
 
+45. Atomic preservation of destination metrics during initial replay. **Done** —
+    `SessionCommand::SessionDefaults` changes session defaults while preserving
+    the session's live destination metrics. Initial radio replay uses this
+    command instead of restoring destinations from its membership snapshot,
+    which could overwrite a grant completed after the snapshot was taken.
+    The session emits defaults and required corrections in one action batch,
+    retaining pending Up/Down and withdrawn destination behavior. Tests reproduce
+    the stale-snapshot grant loss, check later replay, optional inheritance,
+    validation and Busy handling, and verify a single retained-state change with
+    isolated router sessions across both MAC formats and IP families.
+
 ---
 
 ## 10. Open questions / risks

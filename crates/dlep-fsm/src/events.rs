@@ -69,6 +69,12 @@ pub enum FsmEvent {
     AppSessionUpdate {
         metrics: LinkMetrics,
     },
+    /// Change session defaults while preserving existing destination metrics.
+    /// Sends Session Update followed by any needed destination corrections.
+    /// Returns Busy while a session transaction is pending.
+    AppSessionDefaults {
+        metrics: LinkMetrics,
+    },
     /// Like AppSessionUpdate, but retain/coalesce changes while the session
     /// transaction is busy. Later destination changes keep their ordering.
     AppQueueSessionUpdate {

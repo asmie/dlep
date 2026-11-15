@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Initial radio replay preserves live destination metrics in a single session
+  command. A stale membership snapshot can no longer restore old values over a
+  completed link grant. `SessionCommand::SessionDefaults` changes defaults while
+  preserving existing destinations, including pending and withdrawn entries;
+  it returns Busy if a session transaction is pending. This and the new
+  `FsmEvent::AppSessionDefaults` variant require exhaustive matches to be updated.
 - Radio session metrics coalesce inside each session while its transaction is
   busy. Later destination reports and link answers survive delivery of the queued
   defaults, preventing deferred updates from restoring stale values. Retained

@@ -168,6 +168,11 @@ Runtime tests check effective retained values before delivery and ordered wire
 corrections over IPv4/IPv6 with both MAC formats. Further bridge cases cover
 independent progress across routers, replay to a later router, and repeated
 destination flaps during withdrawal acknowledgement.
+Initial-replay regressions retain an old membership snapshot, complete a link
+grant, then replay the defaults. The current session and later routers must keep
+the granted values. FSM cases check default inheritance and command validation;
+IPv4/IPv6 runtime cases cover both MAC formats, pending Up/Down, withdrawn
+destinations, a single retained-state update, and isolation from other sessions.
 Replacement regressions hold a link request across physical Down/Up and then
 grant it: the old transaction must complete without changing the replacement's
 cache. Bridge tests cover requests already delivered and requests still queued;

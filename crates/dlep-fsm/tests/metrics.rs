@@ -288,6 +288,102 @@ fn invalid_app_metrics_do_not_mutate_state_or_open_transactions() {
 }
 
 #[test]
+fn session_defaults_preserve_destinations_and_set_future_inheritance() {
+    let (mut r, mut m, _) = sessions(configured());
+    let first = configured();
+    let second = LinkMetrics {
+        latency: Duration::from_micros(999),
+        resources: Some(25),
+        mtu: Some(1200),
+        ..first
+    };
+    add(&mut r, &mut m, 1, first);
+    add(&mut r, &mut m, 2, second);
+    let changed = LinkMetrics {
+        latency: Duration::from_micros(42),
+        resources: Some(80),
+        ..Default::default()
+    };
+    common::assert_rejected(
+        r.step(E::AppSessionDefaults { metrics: changed }),
+        dlep_fsm::CommandError::Unsupported,
+    );
+    common::assert_rejected(
+        m.step(E::AppSessionDefaults {
+            metrics: LinkMetrics {
+                rlq_rx: Some(10),
+                ..changed
+            },
+        }),
+        dlep_fsm::CommandError::InvalidInput,
+    );
+    assert_eq!(m.session_metrics(), first);
+    assert_eq!(m.destinations[&mac(1)].metrics, first);
+    assert!(!m.tx.session_busy());
+    let actions = m.step(E::AppSessionDefaults { metrics: changed });
+    let mut responses = Vec::new();
+    let mut kinds = Vec::new();
+    for action in actions {
+        if let A::SendMessage(message) = action {
+            kinds.push(message.message_type);
+            let decoded = Message::decode(message.encode().unwrap().freeze()).unwrap();
+            responses.extend(r.step(E::RecvMessage(decoded)));
+        }
+    }
+    assert_eq!(
+        kinds,
+        [
+            M::SESSION_UPDATE,
+            M::DESTINATION_UPDATE,
+            M::DESTINATION_UPDATE
+        ]
+    );
+    let defaults = LinkMetrics {
+        rlq_tx: first.rlq_tx,
+        mtu: first.mtu,
+        ..changed
+    };
+    assert_eq!(m.session_metrics(), defaults);
+    assert_eq!(r.session_metrics, defaults);
+    for (n, expected) in [(1, first), (2, second)] {
+        assert_eq!(m.destinations[&mac(n)].metrics, expected);
+        assert_eq!(r.destinations[&mac(n)].metrics, expected);
+    }
+    common::assert_rejected(
+        m.step(E::AppSessionDefaults { metrics: first }),
+        dlep_fsm::CommandError::Busy,
+    );
+    assert_eq!(m.session_metrics(), defaults);
+    m.step(E::RecvMessage(sent(&responses, M::SESSION_UPDATE_RESPONSE)));
+    add(&mut r, &mut m, 3, LinkMetrics::default());
+    let inherited = LinkMetrics {
+        resources: defaults.resources,
+        rlq_tx: defaults.rlq_tx,
+        mtu: defaults.mtu,
+        ..Default::default()
+    };
+    assert_eq!(m.destinations[&mac(3)].metrics, inherited);
+    assert_eq!(r.destinations[&mac(3)].metrics, inherited);
+    // Ordinary updates still apply the supplied values to existing destinations.
+    let update = sent(
+        &m.step(E::AppSessionUpdate { metrics: defaults }),
+        M::SESSION_UPDATE,
+    );
+    r.step(E::RecvMessage(update));
+    for n in [1, 2, 3] {
+        assert_eq!(m.destinations[&mac(n)].metrics, defaults);
+        assert_eq!(r.destinations[&mac(n)].metrics, defaults);
+    }
+    m.step(E::AppShutdown {
+        reason: StatusCode::SHUTTING_DOWN,
+    });
+    common::assert_rejected(
+        m.step(E::AppSessionDefaults { metrics: first }),
+        dlep_fsm::CommandError::NotReady,
+    );
+}
+
+#[test]
 fn queued_session_metrics_coalesce_behind_addresses_and_preserve_later_overrides() {
     let (mut r, mut m, _) = sessions(configured());
     add(&mut r, &mut m, 1, configured());

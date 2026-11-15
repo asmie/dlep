@@ -611,6 +611,9 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     Some(SessionCommand::SessionUpdate { metrics }) => {
                         FsmEvent::AppSessionUpdate { metrics }
                     }
+                    Some(SessionCommand::SessionDefaults { metrics }) => {
+                        FsmEvent::AppSessionDefaults { metrics }
+                    }
                     Some(SessionCommand::QueueSessionUpdate { metrics }) => {
                         FsmEvent::AppQueueSessionUpdate { metrics }
                     }

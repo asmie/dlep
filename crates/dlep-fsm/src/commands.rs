@@ -59,9 +59,9 @@ impl FsmEvent {
             Self::AppUpdateMetrics { mac, .. } => (K::UpdateMetrics, Some(*mac)),
             Self::AppUpdateAddresses { mac, .. } => (K::UpdateAddresses, Some(*mac)),
             Self::AppSessionAddresses { .. } => (K::SessionAddresses, None),
-            Self::AppSessionUpdate { .. } | Self::AppQueueSessionUpdate { .. } => {
-                (K::SessionMetrics, None)
-            }
+            Self::AppSessionUpdate { .. }
+            | Self::AppSessionDefaults { .. }
+            | Self::AppQueueSessionUpdate { .. } => (K::SessionMetrics, None),
             Self::AppAnnounceDestination { mac } => (K::AnnounceDestination, Some(*mac)),
             Self::AppRequestLinkCharacteristics { mac, .. } => (K::LinkCharacteristics, Some(*mac)),
             Self::AppLinkCharacteristicsResponse { mac, .. } => {
