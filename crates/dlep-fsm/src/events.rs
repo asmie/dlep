@@ -69,6 +69,12 @@ pub enum FsmEvent {
     AppAnnounceDestination {
         mac: MacAddress,
     },
+    /// Router only: Announce with address hints, without changing local or
+    /// destination address state. The modem decides which addresses to report.
+    AppAnnounceDestinationWithAddresses {
+        mac: MacAddress,
+        changes: AddressChanges,
+    },
     /// Push session-wide metric changes to the peer via a Session Update
     /// Message (RFC 8175 §12.7). Metrics may only originate at the modem.
     AppSessionUpdate {

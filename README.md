@@ -226,6 +226,15 @@ status and text, including denials. Success publishes the destination and emits
 `DestinationEvent::Up` before this completion event. Both events carry the peer
 and session identity in their enclosing `DaemonEvent::Destination`.
 
+`RouterDaemon::announce_destination_with_addresses(session_id, destination,
+changes)` targets one modem with IPv4/IPv6 address hints in `AddressChanges`.
+Attached subnets, duplicate/conflicting entries, and oversized Announce messages
+are rejected locally. Hints do not change retained addresses; the modem responds
+with its actual destination data. Router adapters expose these hints as optional
+`add`/`remove` objects on `destination_announce`, and radio adapters receive them
+on `destination_announced`, including denied requests. Empty hints still request
+a response. The existing MAC-only Announce API remains available.
+
 Set `ModemConfig.metrics` (the TOML `[metrics]` section) to the initial
 session-wide values. Rates use bits/second and `latency_us` uses microseconds.
 The mandatory rates and latency default to zero; configure them for the actual

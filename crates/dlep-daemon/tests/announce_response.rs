@@ -3,7 +3,10 @@ use std::time::Duration;
 use dlep_core::{
     DataItem, MacAddress, MacAddressFormat, Message, MessageType as M, StatusCode as S,
 };
-use dlep_daemon::{DaemonEvent, DestinationEvent, RouterConfig, RouterDaemon, SessionCommand};
+use dlep_daemon::{
+    AddressChanges, DaemonEvent, DestinationAddrs, DestinationEvent, RouterConfig, RouterDaemon,
+    SessionCommand,
+};
 use dlep_fsm::session_modem::ModemSessionFsm;
 use dlep_fsm::{FsmAction, FsmEvent, LinkMetrics, SessionConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -102,12 +105,48 @@ async fn announce_outcomes_preserve_peer_text_and_publish_state_before_completio
             };
             let latency = Duration::from_micros(if addr.is_ipv6() { 666 } else { 444 });
             for status in [S::REQUEST_DENIED, S(42), S::SUCCESS] {
-                router
-                    .send_command_to(session_id, SessionCommand::AnnounceDestination { mac })
-                    .await
-                    .unwrap();
+                let hints = if status == S::REQUEST_DENIED {
+                    router
+                        .send_command_to(session_id, SessionCommand::AnnounceDestination { mac })
+                        .await
+                        .unwrap();
+                    AddressChanges::default()
+                } else {
+                    let hints = AddressChanges {
+                        added: DestinationAddrs {
+                            v4: vec!["224.0.0.5".parse().unwrap()],
+                            v6: vec!["ff02::5".parse().unwrap()],
+                            ..Default::default()
+                        },
+                        removed: DestinationAddrs {
+                            v4: vec!["224.0.0.6".parse().unwrap()],
+                            v6: vec!["ff02::6".parse().unwrap()],
+                            ..Default::default()
+                        },
+                    };
+                    router
+                        .announce_destination_with_addresses(session_id, mac.into(), hints.clone())
+                        .await
+                        .unwrap();
+                    hints
+                };
                 let request = read(&mut peer).await;
                 assert_eq!(request.message_type, M::DESTINATION_ANNOUNCE);
+                assert_eq!(AddressChanges::from_message(&request), hints);
+                let error = router
+                    .send_command_to(
+                        session_id,
+                        SessionCommand::AnnounceDestinationWithAddresses {
+                            mac,
+                            changes: hints,
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, dlep_daemon::DaemonError::CommandRejected(report)
+                    if report.rejected.len() == 1 && report.rejected[0].1.reason == dlep_daemon::CommandError::Busy)
+                );
                 assert_eq!(
                     dlep_fsm::session_common::extract_destination_mac(&request),
                     Some(mac)
@@ -142,7 +181,14 @@ async fn announce_outcomes_preserve_peer_text_and_publish_state_before_completio
                 } if sid == session_id && peer.addr == addr && id.0 == mac && got == status && got_text == text));
                 // No watch wait: the response event must follow state publication.
                 let state = router.state().borrow().clone();
+                assert!(state.sessions[&session_id].local_addresses.is_empty());
+                assert!(state.sessions[&session_id].peer_addresses.is_empty());
                 if status == S::SUCCESS {
+                    assert!(
+                        state.sessions[&session_id].destinations[&mac.into()]
+                            .addresses
+                            .is_empty()
+                    );
                     assert_eq!(
                         state.sessions[&session_id].destinations[&mac.into()].metrics,
                         LinkMetrics { latency, ..initial }

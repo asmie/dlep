@@ -64,7 +64,10 @@ impl FsmEvent {
             Self::AppSessionUpdate { .. }
             | Self::AppSessionDefaults { .. }
             | Self::AppQueueSessionUpdate { .. } => (K::SessionMetrics, None),
-            Self::AppAnnounceDestination { mac } => (K::AnnounceDestination, Some(*mac)),
+            Self::AppAnnounceDestination { mac }
+            | Self::AppAnnounceDestinationWithAddresses { mac, .. } => {
+                (K::AnnounceDestination, Some(*mac))
+            }
             Self::AppRequestLinkCharacteristics { mac, .. } => (K::LinkCharacteristics, Some(*mac)),
             Self::AppLinkCharacteristicsResponse { mac, .. } => {
                 (K::LinkCharacteristicsResponse, Some(*mac))

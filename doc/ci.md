@@ -272,6 +272,14 @@ metric/address updates must preserve later destination changes and publish
 completion before the next send. IPv4/IPv6 runtime tests check immediate desired
 state in snapshots, independent router sessions, stale IDs, raw-command
 validation, no-op delivery, large-set convergence, and cleanup on reconnect.
+Destination Announce hint tests check duplicate/conflicting addresses, forbidden
+attached subnets, the MAC-inclusive wire budget, role/phase/MAC validation, and
+transaction release after refusal. Controlled runtime peers verify address
+payloads, busy rejection, session isolation, and unchanged retained addresses.
+Router adapter checks include strict fields, semantic rejection without peers,
+and shared request-ID handling. IPv4/IPv6 adapter pipelines with both MAC formats
+verify targeted radio notices, denied requests, empty hints from older commands,
+rejection before transmission, and preservation of physical destination data.
 Destination Down completion tests require removal before completion and preserve
 status text on both roles. Router `Down` events precede completion; modem replies
 must not masquerade as router withdrawals. Invalid replies emit no completion.

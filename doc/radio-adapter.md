@@ -197,7 +197,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `destination_up_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to Destination Up. Zero means accepted; other status codes mean it declined reports for this destination. |
 | `destination_down_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to a modem-originated Destination Down. Zero means success. |
 | `destination_withdrawn` | `session`, `mac` | The router withdrew interest in this destination on this session. Physical destination knowledge remains cached. |
-| `destination_announced` | `session`, `mac` | The router asked about a destination it has not been told about (§12.13). The modem has already answered; send `destination_up` if the radio can reach it. |
+| `destination_announced` | `session`, `mac`, `add`, `remove` | The router expressed interest in a destination (§12.13), optionally supplying IP address hints. The modem has already answered. |
 | `link_request` | `request`, `session`, `peer`, `mac`, `requested`, `current` | A router asks to change a destination's link. |
 
 Each `session_sync` entry contains the numeric session ID, the peer's socket
@@ -247,6 +247,26 @@ metrics, session addresses, and destination reports intact; later replay uses
 those latest values. Membership snapshots cannot recover lost responses.
 Invalid, unsolicited, duplicate, or fatal replies terminate the
 session instead of producing this notice.
+
+`destination_announced` includes the requested address additions and removals
+as `add` and `remove` objects. Both contain the usual four address arrays,
+including empty arrays. Only `ipv4` and `ipv6` can be nonempty: Destination
+Announce permits IP addresses but not attached subnets
+([RFC 8175 §12.13](https://www.rfc-editor.org/rfc/rfc8175.html#section-12.13)).
+Older modem versions omit these objects; treat absent fields as unavailable
+request metadata.
+
+These hints do not change the physical destination cache, session addresses,
+or the addresses reported to routers. The modem has already sent its response
+using known destination data, or Request Denied if the destination is unknown.
+The notice includes hints in either case. If the radio can subsequently reach
+an unknown destination, send `destination_up` with its actual metrics and
+addresses. This notice is not a deferred response request. It is transient:
+`resync`, event-gap recovery, and new sessions cannot reconstruct lost hints.
+
+```json
+{"type":"destination_announced","session":1,"mac":"01:00:5e:00:00:05","add":{"ipv4":["224.0.0.5"],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]},"remove":{"ipv4":[],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]}}
+```
 
 `destination_up_response` reports that router's outcome, including any status
 text. A refusal stops reports on that session but preserves the modem's cached

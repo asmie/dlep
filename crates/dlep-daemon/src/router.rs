@@ -230,6 +230,31 @@ impl RouterDaemon {
             .await
     }
 
+    /// Declare interest on one session with address additions/removals as hints.
+    /// Hints may contain IPv4/IPv6 addresses, not attached subnets (§12.13).
+    /// Hints do not update local addresses or destination state. The modem's
+    /// response reports its actual destination data. Invalid or oversized hints
+    /// are rejected before dispatch; busy destinations must be retried after
+    /// completion. An empty hint set still sends a Destination Announce.
+    pub async fn announce_destination_with_addresses(
+        &self,
+        session_id: dlep_ext::SessionId,
+        id: DestinationId,
+        changes: dlep_fsm::AddressChanges,
+    ) -> Result<(), DaemonError> {
+        dlep_fsm::session_common::validate_announce_addresses(id.0, &changes).map_err(|_| {
+            DaemonError::Config("invalid or oversized Announce address hints".into())
+        })?;
+        self.send_command_to(
+            session_id,
+            SessionCommand::AnnounceDestinationWithAddresses {
+                mac: id.0,
+                changes: changes.canonical(),
+            },
+        )
+        .await
+    }
+
     /// Withdraw interest in a destination on one modem session (§12.15).
     /// Completion emits DestinationEvent::Down with the response status as
     /// its reason. The MAC stays known until the matching response arrives;

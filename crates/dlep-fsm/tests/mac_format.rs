@@ -80,6 +80,10 @@ fn matching_formats_work_and_local_mismatches_never_reach_wire() {
         let wrong = mac(other(format));
         // Policy applies before the first destination, not only after learning one.
         rejected(r.step(E::AppAnnounceDestination { mac: wrong }));
+        rejected(r.step(E::AppAnnounceDestinationWithAddresses {
+            mac: wrong,
+            changes: Default::default(),
+        }));
         rejected(m.step(E::AppAddDestination {
             mac: wrong,
             metrics: Default::default(),

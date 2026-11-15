@@ -235,6 +235,27 @@ pub fn build_link_characteristics_reply(
     )
 }
 
+/// Announce permits IP addresses, but not attached subnets (RFC 8175 §12.13).
+/// Check the complete message budget before opening a destination transaction.
+pub fn validate_announce_addresses(
+    mac: MacAddress,
+    changes: &crate::AddressChanges,
+) -> Result<(), crate::CommandError> {
+    use crate::CommandError::InvalidInput;
+    changes.validate().map_err(|_| InvalidInput)?;
+    if [&changes.added, &changes.removed]
+        .iter()
+        .any(|addresses| !addresses.v4_subnets.is_empty() || !addresses.v6_subnets.is_empty())
+    {
+        return Err(InvalidInput);
+    }
+    changes
+        .append_to(build_destination_announce(mac))
+        .encode()
+        .map_err(|_| InvalidInput)?;
+    Ok(())
+}
+
 /// Build a `Destination_Announce` (RFC 8175 §12.13). Router → modem only:
 /// "Destination Announce Messages MAY be sent by a router to announce such
 /// an interest" in a destination the modem has not reported.

@@ -1168,6 +1168,16 @@ The order of work was:
     independent local and remote address sets, removal, reconnect replay, and
     preservation of withdrawals and link grants.
 
+58. Destination Announce address metadata. **Done** — router adapters accept
+    optional IPv4/IPv6 `add`/`remove` hints; radio `destination_announced` notices
+    preserve them for successful and denied requests. A targeted daemon API and
+    new command/FSM variants validate hints and the full MAC-inclusive wire
+    budget before starting a transaction. Attached subnets are rejected as
+    required by the Announce grammar. Hints do not alter retained addresses,
+    physical destination data, or response decisions. Tests cover invalid input,
+    request-ID handling, busy scopes, old commands without hints, both MAC
+    formats, IPv4/IPv6 transport, per-modem targeting, and later physical reports.
+
 ---
 
 ## 10. Open questions / risks

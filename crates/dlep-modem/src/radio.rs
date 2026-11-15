@@ -322,6 +322,8 @@ enum Outbound {
     DestinationAnnounced {
         session: u64,
         mac: Mac,
+        add: Addresses,
+        remove: Addresses,
     },
     DestinationWithdrawn {
         session: u64,
@@ -1188,12 +1190,18 @@ impl Bridge<'_> {
             }
             DaemonEvent::Destination {
                 session_id,
-                event: DestinationEvent::Announced { id, .. },
+                event:
+                    DestinationEvent::Announced {
+                        id,
+                        requested_addresses,
+                    },
                 ..
             } => {
                 self.send(&Outbound::DestinationAnnounced {
                     session: session_id.0,
                     mac: Mac(id.0),
+                    add: (&requested_addresses.added).into(),
+                    remove: (&requested_addresses.removed).into(),
                 })
                 .await?
             }

@@ -32,6 +32,14 @@ fn replace(old: u8, new: u8) -> AddressChanges {
         removed: addresses(old),
     }
 }
+fn hints(old: u8, new: u8) -> AddressChanges {
+    let mut changes = replace(old, new);
+    for addresses in [&mut changes.added, &mut changes.removed] {
+        addresses.v4_subnets.clear();
+        addresses.v6_subnets.clear();
+    }
+    changes
+}
 fn sent(actions: &[A], kind: M) -> Message {
     actions
         .iter()
@@ -52,8 +60,15 @@ fn status(message: &Message) -> S {
         .unwrap()
 }
 fn sessions() -> (RouterSessionFsm, ModemSessionFsm) {
-    let mut r = RouterSessionFsm::new();
-    let mut m = ModemSessionFsm::new();
+    sessions_with_format(MacAddressFormat::Eui48)
+}
+fn sessions_with_format(format: MacAddressFormat) -> (RouterSessionFsm, ModemSessionFsm) {
+    let config = dlep_fsm::SessionConfig {
+        mac_address_format: format,
+        ..Default::default()
+    };
+    let mut r = RouterSessionFsm::with_config(config.clone());
+    let mut m = ModemSessionFsm::with_config(config);
     m.step(E::TcpAccepted);
     let init = sent(&r.step(E::TcpConnected), M::SESSION_INITIALIZATION);
     let response = sent(
@@ -626,21 +641,130 @@ fn withdrawn_destinations_reannounce_current_addresses_and_preserve_request_hint
         })
         .is_empty()
     );
+    let hints = hints(2, 5);
     let request = sent(
-        &r.step(E::AppAnnounceDestination { mac: mac(1) }),
+        &r.step(E::AppAnnounceDestinationWithAddresses {
+            mac: mac(1),
+            changes: hints.clone(),
+        }),
         M::DESTINATION_ANNOUNCE,
     );
-    let hints = AddressChanges {
-        removed: DestinationAddrs {
-            v6: addresses(5).v6,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let actions = m.step(E::RecvMessage(hints.append_to(request)));
+    let actions = m.step(E::RecvMessage(request));
     assert!(actions.iter().any(|a| matches!(a, A::Emit(EmittedEvent::DestinationAnnounced { requested_addresses, .. }) if *requested_addresses == hints)));
     let response = sent(&actions, M::DESTINATION_ANNOUNCE_RESPONSE);
     r.step(E::RecvMessage(response));
     assert_eq!(r.destinations[&mac(1)].addrs, addresses(2));
+    assert_eq!(m.destinations[&mac(1)].addrs, addresses(2));
     assert_eq!(m.state(), ModemSessionState::InSession);
+}
+
+#[test]
+fn announce_address_hints_validate_without_mutating_addresses_or_transactions() {
+    use dlep_fsm::CommandError as C;
+    let command = |changes| E::AppAnnounceDestinationWithAddresses {
+        mac: mac(2),
+        changes,
+    };
+    let (mut r, mut m) = sessions();
+    common::assert_rejected(RouterSessionFsm::new().step(command(add(1))), C::NotReady);
+    common::assert_rejected(m.step(command(add(1))), C::Unsupported);
+    let mut duplicates = add(1);
+    duplicates.added.v4.push(duplicates.added.v4[0]);
+    let mut subnet_duplicates = add(1);
+    subnet_duplicates
+        .added
+        .v6_subnets
+        .push("2001:db8:1::7/64".parse().unwrap());
+    let mut duplicate_ips = hints(1, 2);
+    duplicate_ips.added.v4.push(duplicate_ips.added.v4[0]);
+    for invalid in [
+        duplicates,
+        subnet_duplicates,
+        replace(1, 1),
+        duplicate_ips,
+        hints(1, 1),
+    ] {
+        common::assert_rejected(r.step(command(invalid)), C::InvalidInput);
+        assert!(r.tx.per_destination.is_empty());
+        assert!(r.local_addresses().is_empty());
+        assert!(r.destinations.is_empty());
+    }
+    let hints = hints(1, 2);
+    let request = sent(&r.step(command(hints.clone())), M::DESTINATION_ANNOUNCE);
+    assert_eq!(AddressChanges::from_message(&request), hints.canonical());
+    common::assert_rejected(r.step(command(add(3))), C::Busy);
+    assert!(r.local_addresses().is_empty());
+    assert!(r.destinations.is_empty());
+    let actions = m.step(E::RecvMessage(request));
+    assert!(actions.iter().any(|a| matches!(a,
+        A::Emit(EmittedEvent::DestinationAnnounced { requested_addresses, .. })
+        if *requested_addresses == hints.canonical())));
+    assert!(m.destinations.is_empty());
+    assert!(m.local_addresses().is_empty());
+    let denied = sent(&actions, M::DESTINATION_ANNOUNCE_RESPONSE);
+    assert_eq!(status(&denied), S::REQUEST_DENIED);
+    r.step(E::RecvMessage(denied));
+    // Unlike a session-address no-op, empty hints still request a response.
+    let request = sent(
+        &r.step(command(AddressChanges::default())),
+        M::DESTINATION_ANNOUNCE,
+    );
+    let denied = sent(
+        &m.step(E::RecvMessage(request)),
+        M::DESTINATION_ANNOUNCE_RESPONSE,
+    );
+    r.step(E::RecvMessage(denied));
+    announce_up(&mut r, &mut m, 2, addresses(4));
+    common::assert_rejected(r.step(command(add(3))), C::AlreadyExists);
+    r.step(E::AppShutdown {
+        reason: S::SHUTTING_DOWN,
+    });
+    common::assert_rejected(r.step(command(add(3))), C::NotReady);
+}
+
+#[test]
+fn announce_address_budget_includes_the_mac_in_both_formats() {
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        let (mut r, mut m) = sessions_with_format(format);
+        let destination = match format {
+            MacAddressFormat::Eui48 => mac(1),
+            MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+        };
+        let changes = AddressChanges {
+            added: DestinationAddrs {
+                v6: (1..=3120u128).map(std::net::Ipv6Addr::from).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut oversized = changes.clone();
+        oversized.added.v4.push("192.0.2.1".parse().unwrap());
+        assert!(
+            oversized
+                .append_to(Message::new(M::SESSION_UPDATE))
+                .encode()
+                .is_ok()
+        );
+        common::assert_rejected(
+            r.step(E::AppAnnounceDestinationWithAddresses {
+                mac: destination,
+                changes: oversized,
+            }),
+            dlep_fsm::CommandError::InvalidInput,
+        );
+        assert!(r.tx.per_destination.is_empty());
+        let request = sent(
+            &r.step(E::AppAnnounceDestinationWithAddresses {
+                mac: destination,
+                changes: changes.clone(),
+            }),
+            M::DESTINATION_ANNOUNCE,
+        );
+        let decoded = Message::decode(request.encode().unwrap().freeze()).unwrap();
+        let actions = m.step(E::RecvMessage(decoded));
+        assert!(actions.iter().any(|a| matches!(a,
+            A::Emit(EmittedEvent::DestinationAnnounced { requested_addresses, .. })
+            if *requested_addresses == changes)));
+        assert!(m.destinations.is_empty());
+    }
 }

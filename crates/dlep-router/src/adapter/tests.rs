@@ -57,6 +57,10 @@ fn parses_commands_strictly_and_leaves_unknown_messages_forward_compatible() {
         r#"{"type":"session_addresses","request":1,"session":1,"add":{"ipv4":[7]}}"#,
         r#"{"type":"session_addresses","request":1,"session":1,"add":null}"#,
         r#"{"type":"session_addresses","request":1}"#,
+        r#"{"type":"destination_announce","request":1,"session":1,"mac":"02:00:00:00:00:01","addresses":{}}"#,
+        r#"{"type":"destination_announce","request":1,"session":1,"mac":"02:00:00:00:00:01","add":{"ipv4_subnet":[]}}"#,
+        r#"{"type":"destination_announce","request":1,"session":1,"mac":"02:00:00:00:00:01","remove":{"ipv6":42}}"#,
+        r#"{"type":"destination_announce","request":1,"session":1,"mac":"02:00:00:00:00:01","add":null}"#,
         r#"{"type":3}"#,
         "[]",
         "bad json",
@@ -72,6 +76,13 @@ fn parses_commands_strictly_and_leaves_unknown_messages_forward_compatible() {
         parse(r#"{"type":"session_addresses","request":1,"session":1}"#).unwrap(),
         Inbound::SessionAddresses { .. }
     ));
+    let Inbound::DestinationAnnounce { add, remove, .. } = parse(
+        r#"{"type":"destination_announce","request":1,"session":1,"mac":"02:00:00:00:00:01"}"#,
+    )
+    .unwrap() else {
+        panic!("expected Announce")
+    };
+    assert!(add.parse().unwrap().is_empty() && remove.parse().unwrap().is_empty());
     assert_eq!(
         mac("02:00:00:00:00:01").unwrap().to_string(),
         "02:00:00:00:00:01"
@@ -456,7 +467,9 @@ async fn commands_target_one_session_and_distinguish_acceptance_busy_and_stale_i
             Inbound::DestinationAnnounce {
                 request: 6,
                 session: aid.0,
-                mac: address.into()
+                mac: address.into(),
+                add: Addresses::default(),
+                remove: Addresses::default(),
             },
             &mut last
         )
@@ -473,6 +486,53 @@ async fn commands_target_one_session_and_distinguish_acceptance_busy_and_stale_i
     router.shutdown().await.unwrap();
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn announce_address_validation_consumes_ids_without_a_peer() {
+    let router = RouterDaemon::builder()
+        .config(dlep_daemon::RouterConfig::default())
+        .spawn()
+        .await
+        .unwrap();
+    let mut last = 0;
+    for mut invalid in [
+        json!({"add":{"ipv4":["::1"]}}),
+        json!({"remove":{"ipv6":["192.0.2.1"]}}),
+        json!({"add":{"ipv4":["192.0.2.1","192.0.2.1"]}}),
+        json!({"remove":{"ipv6":["::1","::1"]}}),
+        json!({"add":{"ipv4":["192.0.2.1"]},"remove":{"ipv4":["192.0.2.1"]}}),
+        json!({"add":{"ipv4_subnets":["192.0.2.0/24"]}}),
+        json!({"remove":{"ipv6_subnets":["2001:db8::/32"]}}),
+        json!({"add":{"ipv6":(1..=3120).map(|n| format!("::{n:x}")).collect::<Vec<_>>(),"ipv4":["192.0.2.1"]}}),
+    ] {
+        invalid["type"] = json!("destination_announce");
+        invalid["session"] = json!(1);
+        invalid["request"] = json!(last + 1);
+        invalid["mac"] = json!("02:00:00:00:00:01");
+        let line = invalid.to_string();
+        assert!(line.len() <= MAX_LINE);
+        let result = execute(&router, parse(&line).unwrap(), &mut last).await;
+        assert_eq!(result, command_result(last, "rejected", "invalid_input"));
+        let duplicate =
+            parse(&json!({"type":"session_addresses","request":last,"session":1}).to_string())
+                .unwrap();
+        assert_eq!(
+            execute(&router, duplicate, &mut last).await["code"],
+            "request_id_not_increasing"
+        );
+    }
+    let command = parse(
+        &json!({"type":"destination_announce","request":last + 1,
+        "session":1,"mac":"02:00:00:00:00:01","add":{"ipv4":["224.0.0.5"]}})
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        execute(&router, command, &mut last).await["code"],
+        "stale_session"
+    );
+    router.shutdown().await.unwrap();
 }
 
 #[tokio::test]

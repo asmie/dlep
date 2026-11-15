@@ -644,12 +644,12 @@ impl RouterSessionFsm {
             // InSession: app declares interest in a destination the modem
             // has not reported (RFC 8175 §12.13). Router-originated only.
             (RouterSessionState::InSession, FsmEvent::AppAnnounceDestination { mac }) => {
-                use crate::transaction::RequestKind;
-                self.tx
-                    .open_destination(mac, RequestKind::DestinationAnnounce)
-                    .expect("checked idle destination");
-                vec![FsmAction::SendMessage(build_destination_announce(mac))]
+                self.announce_destination(mac, AddressChanges::default())
             }
+            (
+                RouterSessionState::InSession,
+                FsmEvent::AppAnnounceDestinationWithAddresses { mac, changes },
+            ) => self.announce_destination(mac, changes),
             (RouterSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
                 self.termination_reason = reason;
                 self.state = RouterSessionState::Terminating;
@@ -764,6 +764,15 @@ impl RouterSessionFsm {
         changes
     }
 
+    fn announce_destination(&mut self, mac: MacAddress, changes: AddressChanges) -> Vec<FsmAction> {
+        self.tx
+            .open_destination(mac, crate::transaction::RequestKind::DestinationAnnounce)
+            .expect("checked idle destination");
+        vec![FsmAction::SendMessage(
+            changes.append_to(build_destination_announce(mac)),
+        )]
+    }
+
     fn check_command(&self, event: &FsmEvent) -> Result<(), crate::CommandError> {
         use crate::CommandError as E;
         if self.state != RouterSessionState::InSession {
@@ -773,6 +782,7 @@ impl RouterSessionFsm {
             event,
             FsmEvent::AppDropDestination { .. }
                 | FsmEvent::AppAnnounceDestination { .. }
+                | FsmEvent::AppAnnounceDestinationWithAddresses { .. }
                 | FsmEvent::AppRequestLinkCharacteristics { .. }
                 | FsmEvent::AppSessionAddresses { .. }
         ) {
@@ -804,9 +814,13 @@ impl RouterSessionFsm {
                         .map_err(|_| E::InvalidInput)?;
                 }
             }
-            FsmEvent::AppAnnounceDestination { mac } => {
+            FsmEvent::AppAnnounceDestination { mac }
+            | FsmEvent::AppAnnounceDestinationWithAddresses { mac, .. } => {
                 if self.destinations.get(mac).is_some_and(|d| d.up) {
                     return Err(E::AlreadyExists);
+                }
+                if let FsmEvent::AppAnnounceDestinationWithAddresses { changes, .. } = event {
+                    crate::session_common::validate_announce_addresses(*mac, changes)?;
                 }
             }
             FsmEvent::AppSessionAddresses { changes } => {

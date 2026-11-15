@@ -666,6 +666,174 @@ async fn radio_withdrawal_notices_preserve_other_routers_and_replay() {
 }
 
 #[tokio::test]
+async fn announce_address_hints_reach_only_the_target_radio_and_preserve_physical_state() {
+    fn hints(n: u8) -> Value {
+        json!({"ipv4":[format!("192.0.2.{n}")],"ipv6":[format!("2001:db8::{n}")],
+            "ipv4_subnets":[],"ipv6_subnets":[]})
+    }
+    let empty = json!({"ipv4":[],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]});
+    for (format, mac, unknown) in [
+        ("eui48", MAC, OTHER_MAC),
+        ("eui64", MAC64, "02:00:00:00:00:00:00:02"),
+    ] {
+        for ip in ["127.0.0.1", "::1"] {
+            let (mut a, aa) = Node::modem_with_format("modem-a", ip, 0, format).await;
+            let (mut b, ba) = Node::modem_with_format("modem-b", ip, 0, format).await;
+            report(&mut a, mac, 700, 1).await;
+            report(&mut b, mac, 800, 2).await;
+            let mut router = Node::router_with_format(&[aa, ba], format).await;
+            let initial = router
+                .wait(|s| {
+                    destination(s, "modem-a", mac).is_some()
+                        && destination(s, "modem-b", mac).is_some()
+                })
+                .await;
+            let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+            let other = session(&initial, "modem-b").unwrap().clone();
+            router
+                .control
+                .send(json!({"type":"destination_down","request":1,"session":sid,"mac":mac}))
+                .await;
+            router.result(1, "accepted").await;
+            router
+                .wait(|s| destination(s, "modem-a", mac).is_none())
+                .await;
+
+            // Unsupported subnets and oversized hints must never reach the peer.
+            for (i, invalid) in [
+                json!({"ipv4":["192.0.2.7","192.0.2.7"]}),
+                json!({"ipv4_subnets":["198.51.7.0/24"]}),
+                json!({"ipv6":(1..=3120).map(|n| format!("::{n:x}")).collect::<Vec<_>>(),"ipv4":["192.0.2.7"]}),
+            ].into_iter().enumerate() {
+                let request = i as u64 + 2;
+                router.control.send(json!({"type":"destination_announce","request":request,
+                    "session":sid,"mac":mac,"add":invalid})).await;
+                assert_eq!(router.result(request, "rejected").await["code"], "invalid_input");
+            }
+            router
+                .control
+                .send(json!({"type":"destination_announce","request":5,
+                "session":sid,"mac":mac,"add":hints(4),"remove":hints(1)}))
+                .await;
+            router.result(5, "accepted").await;
+            let state = router
+                .wait(|s| destination(s, "modem-a", mac).is_some())
+                .await;
+            assert_eq!(
+                destination(&state, "modem-a", mac).unwrap()["addresses"],
+                expected_addresses(1)
+            );
+            assert_eq!(
+                destination(&state, "modem-a", mac).unwrap()["metrics"]["current_data_rate_tx_bps"],
+                700
+            );
+            assert_eq!(session(&state, "modem-b").unwrap(), &other);
+            assert_eq!(session(&state, "modem-a").unwrap()["addresses"], json!([]));
+            let announced = a
+                .wait(|s| notice(s, "destination_announced", |n| n["mac"] == mac).is_some())
+                .await;
+            let radio_sid = notice(&announced, "session_up", |_| true).unwrap()["session"].clone();
+            assert_eq!(
+                notice(&announced, "destination_announced", |_| true).unwrap(),
+                &json!({"type":"destination_announced","session":radio_sid,"mac":mac,"add":hints(4),"remove":hints(1)})
+            );
+            assert_eq!(
+                announced["notices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|n| n["type"] == "destination_announced")
+                    .count(),
+                1
+            );
+            router
+                .wait(|s| {
+                    notice(s, "announce_response", |n| {
+                        n["mac"] == mac && n["status"] == 0
+                    })
+                    .is_some()
+                })
+                .await;
+
+            // An unreachable destination still carries the request hints to the
+            // radio, but only a later physical report can create the destination.
+            router
+                .control
+                .send(json!({"type":"destination_announce","request":6,
+                "session":sid,"mac":unknown,"add":hints(5),"remove":hints(6)}))
+                .await;
+            router.result(6, "accepted").await;
+            let denied = router
+                .wait(|s| {
+                    notice(s, "announce_response", |n| {
+                        n["mac"] == unknown && n["status"] == 2
+                    })
+                    .is_some()
+                })
+                .await;
+            assert!(destination(&denied, "modem-a", unknown).is_none());
+            let announced = a
+                .wait(|s| notice(s, "destination_announced", |n| n["mac"] == unknown).is_some())
+                .await;
+            assert_eq!(
+                notice(&announced, "destination_announced", |n| n["mac"] == unknown).unwrap(),
+                &json!({"type":"destination_announced","session":radio_sid,"mac":unknown,"add":hints(5),"remove":hints(6)})
+            );
+            report(&mut a, unknown, 900, 7).await;
+            router
+                .wait(|s| {
+                    destination(s, "modem-a", unknown)
+                        .is_some_and(|d| d["addresses"] == expected_addresses(7))
+                })
+                .await;
+
+            // Existing adapters may omit hints entirely; notices contain empty sets.
+            router
+                .control
+                .send(json!({"type":"destination_down","request":7,"session":sid,"mac":mac}))
+                .await;
+            router.result(7, "accepted").await;
+            router
+                .wait(|s| destination(s, "modem-a", mac).is_none())
+                .await;
+            router
+                .control
+                .send(json!({"type":"destination_announce","request":8,"session":sid,"mac":mac}))
+                .await;
+            router.result(8, "accepted").await;
+            let announced = a
+                .wait(|s| {
+                    notice(s, "destination_announced", |n| {
+                        n["mac"] == mac && n["add"] == empty
+                    })
+                    .is_some()
+                })
+                .await;
+            assert_eq!(
+                notice(&announced, "destination_announced", |_| true).unwrap(),
+                &json!({"type":"destination_announced","session":radio_sid,"mac":mac,"add":empty,"remove":empty})
+            );
+            let final_state = router
+                .wait(|s| destination(s, "modem-a", mac).is_some())
+                .await;
+            assert_eq!(
+                destination(&final_state, "modem-a", mac).unwrap()["addresses"],
+                expected_addresses(1)
+            );
+            assert_eq!(session(&final_state, "modem-b").unwrap(), &other);
+            let other_radio = b.control.call(json!({"op":"status"})).await;
+            assert!(notice(&other_radio, "destination_announced", |_| true).is_none());
+            let remote = notice(&announced, "session_sync", |_| true).unwrap();
+            assert_eq!(remote["sessions"][0]["addresses"], empty);
+            router.stop().await;
+            router.assert_final_empty();
+            a.stop().await;
+            b.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn two_modems_with_the_same_mac_keep_commands_metrics_and_withdrawals_isolated() {
     let (mut a, aa) = Node::modem("modem-a", "127.0.0.1", 0).await;
     let (mut b, ba) = Node::modem("modem-b", "127.0.0.1", 0).await;

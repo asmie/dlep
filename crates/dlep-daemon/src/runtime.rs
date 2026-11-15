@@ -63,6 +63,12 @@ pub enum SessionCommand {
     /// Router-side: declare interest in a destination the modem has not
     /// reported, via Destination Announce (RFC 8175 §12.13).
     AnnounceDestination { mac: MacAddress },
+    /// Router-side Announce with address hints; does not change retained
+    /// local addresses or the modem's authoritative destination addresses.
+    AnnounceDestinationWithAddresses {
+        mac: MacAddress,
+        changes: dlep_fsm::AddressChanges,
+    },
     /// Router-side request, addressed to one session because a MAC can be
     /// present at several modems with different link characteristics.
     RequestLinkCharacteristics {

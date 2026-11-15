@@ -625,6 +625,9 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     Some(SessionCommand::AnnounceDestination { mac }) => {
                         FsmEvent::AppAnnounceDestination { mac }
                     }
+                    Some(SessionCommand::AnnounceDestinationWithAddresses { mac, changes }) => {
+                        FsmEvent::AppAnnounceDestinationWithAddresses { mac, changes }
+                    }
                     Some(SessionCommand::RequestLinkCharacteristics { session_id: _, mac, requested }) => {
                         FsmEvent::AppRequestLinkCharacteristics { mac, requested }
                     }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Destination Announce can carry IPv4/IPv6 address hints through optional
+  `add`/`remove` objects on router adapter commands. Radio `destination_announced`
+  notices expose both objects, including empty sets and denied requests. Hints
+  preserve physical destination and session addresses; invalid, duplicate,
+  conflicting, oversized, or attached-subnet hints are rejected before sending.
+  `RouterDaemon::announce_destination_with_addresses` exposes the targeted
+  library API. Existing MAC-only commands still work; exhaustive matches must
+  handle the new `SessionCommand::AnnounceDestinationWithAddresses` and
+  `FsmEvent::AppAnnounceDestinationWithAddresses` variants.
 - Radio adapters can report modem `session_addresses` using optional `add` and
   `remove` objects. The bridge retains a validated complete set without routers,
   updates every connected router, coalesces busy updates, and replays addresses

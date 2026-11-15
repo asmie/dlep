@@ -901,6 +901,7 @@ impl ModemSessionFsm {
         let info = event.command().expect("application command");
         match event {
             FsmEvent::AppAnnounceDestination { .. }
+            | FsmEvent::AppAnnounceDestinationWithAddresses { .. }
             | FsmEvent::AppRequestLinkCharacteristics { .. } => return Err(E::Unsupported),
             _ => {}
         }

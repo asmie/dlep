@@ -9,7 +9,7 @@ use dlep_core::MacAddress;
 use dlep_daemon::{
     AddressChanges, CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs,
     DestinationEvent, DestinationPhase, LinkCharacteristics, LinkMetrics, RouterAdapterConfig,
-    RouterDaemon, SessionCommand, SessionPhase,
+    RouterDaemon, SessionPhase,
 };
 use dlep_ext::SessionId;
 use serde::Deserialize;
@@ -41,6 +41,10 @@ enum Inbound {
         request: u64,
         session: u64,
         mac: String,
+        #[serde(default)]
+        add: Addresses,
+        #[serde(default)]
+        remove: Addresses,
     },
     DestinationDown {
         request: u64,
@@ -111,7 +115,8 @@ fn parse(line: &str) -> Result<Inbound> {
     let fields: &[&str] = match kind {
         "resync" => &["type"],
         "session_addresses" => &["type", "request", "session", "add", "remove"],
-        "destination_announce" | "destination_down" => &["type", "request", "session", "mac"],
+        "destination_announce" => &["type", "request", "session", "mac", "add", "remove"],
+        "destination_down" => &["type", "request", "session", "mac"],
         "link_request" => &["type", "request", "session", "mac", "requested"],
         _ => return Ok(Inbound::Unknown),
     };
@@ -335,11 +340,32 @@ async fn execute(daemon: &RouterDaemon, message: Inbound, last_request: &mut u64
             )
             .await
         }
+        Inbound::DestinationAnnounce {
+            mac: address,
+            add,
+            remove,
+            ..
+        } => {
+            let Ok(mac) = mac(&address) else {
+                return command_result(request, "rejected", "invalid_mac");
+            };
+            let (Ok(added), Ok(removed)) = (add.parse(), remove.parse()) else {
+                return command_result(request, "rejected", "invalid_input");
+            };
+            tokio::time::timeout(
+                ACCEPT_TIMEOUT,
+                daemon.announce_destination_with_addresses(
+                    session,
+                    mac.into(),
+                    AddressChanges { added, removed },
+                ),
+            )
+            .await
+        }
         command => {
-            let (address, requested, announce) = match command {
-                Inbound::DestinationAnnounce { mac, .. } => (mac, None, true),
-                Inbound::DestinationDown { mac, .. } => (mac, None, false),
-                Inbound::LinkRequest { mac, requested, .. } => (mac, Some(requested), false),
+            let (address, requested) = match command {
+                Inbound::DestinationDown { mac, .. } => (mac, None),
+                Inbound::LinkRequest { mac, requested, .. } => (mac, Some(requested)),
                 _ => unreachable!("only destination commands remain"),
             };
             let Ok(mac) = mac(&address) else {
@@ -357,10 +383,6 @@ async fn execute(daemon: &RouterDaemon, message: Inbound, last_request: &mut u64
                                 latency: requested.latency_us.map(Duration::from_micros),
                             },
                         )
-                        .await
-                } else if announce {
-                    daemon
-                        .send_command_to(session, SessionCommand::AnnounceDestination { mac })
                         .await
                 } else {
                     daemon.drop_destination(session, mac.into()).await

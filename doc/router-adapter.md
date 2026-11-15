@@ -96,7 +96,7 @@ Do not apply older transient notices over snapshot state.
 | --- | --- | --- |
 | `resync` | none | Sends another complete current snapshot; no command-result notice. |
 | `session_addresses` | `request`, `session`, optional `add`, `remove` | Advertises changes to the router's own addresses on one modem session. |
-| `destination_announce` | `request`, `session`, `mac` | Requests information about a destination on one modem. |
+| `destination_announce` | `request`, `session`, `mac`, optional `add`, `remove` | Requests information about a destination on one modem, optionally supplying IP address hints. |
 | `destination_down` | `request`, `session`, `mac` | Withdraws interest from one modem. |
 | `link_request` | `request`, `session`, `mac`, `requested` | Requests rate or latency changes for one destination. |
 
@@ -113,13 +113,29 @@ in one command receive `invalid_input`. Batches that cannot fit one DLEP Session
 Update also receive `invalid_input`, even if their JSON fits the input limit.
 Unknown nested fields and incorrect JSON types remain fatal framing errors.
 
-Address commands are deltas: adding an already advertised address or removing
+Session address commands are deltas: adding an already advertised address or removing
 an absent address has no effect. Empty or unchanged deltas are accepted without
 a wire update or completion notice, unless the session is busy. Changed deltas
 use address-only Session Update messages and preserve metrics. These locally
 advertised router addresses are not included in snapshots, whose session
 addresses belong to the remote modem. Address state is scoped to the session;
 the adapter must advertise it again on a new session after reconnecting.
+
+For `destination_announce`, optional `add`/`remove` objects use the same address
+array names, but only `ipv4` and `ipv6` may be nonempty. Destination Announce
+does not permit attached subnets ([RFC 8175 §12.13](https://www.rfc-editor.org/rfc/rfc8175.html#section-12.13));
+nonempty subnet arrays receive `invalid_input`. Invalid IP addresses, duplicate
+or conflicting entries, and hints that exceed the complete Announce wire budget
+(including the MAC) also receive `invalid_input`, without sending a request.
+Unknown nested fields and incorrect JSON types remain fatal framing errors.
+
+Announce hints express requested IP address additions/removals; they do not
+change router session addresses or create destination state. The modem's reply
+reports its actual destination data, and its radio adapter receives the hints
+in a `destination_announced` notice even when the request was denied. Omitting
+both objects preserves the original Announce behavior. Empty hints still send
+a request and produce a peer response; they are not an address-update no-op.
+Hints are scoped to this request and are not replayed after reconnection.
 
 `request` must be positive and strictly increase for every new command during
 this adapter process lifetime. Even rejected commands consume their ID. Repeated
@@ -132,6 +148,7 @@ retry with a new ID after the preceding transaction completes.
 {"type":"link_request","request":1,"session":1,"mac":"02:00:00:00:00:01","requested":{"current_data_rate_tx_bps":2000000}}
 {"type":"destination_down","request":2,"session":1,"mac":"02:00:00:00:00:01"}
 {"type":"session_addresses","request":3,"session":1,"add":{"ipv4":["192.0.2.10"],"ipv6_subnets":["2001:db8:1::/64"]}}
+{"type":"destination_announce","request":4,"session":1,"mac":"01:00:5e:00:00:05","add":{"ipv4":["224.0.0.5"]}}
 ```
 
 ## Command results and transient notices
