@@ -1010,6 +1010,17 @@ fn translate_emitted(
                 reason: *reason,
             },
         }),
+        EmittedEvent::DestinationDownResponse { mac, status, text } => {
+            Some(DaemonEvent::Destination {
+                session_id,
+                peer: peer.clone(),
+                event: DestinationEvent::DownResponse {
+                    id: DestinationId(*mac),
+                    status: *status,
+                    text: text.clone(),
+                },
+            })
+        }
         EmittedEvent::LinkCharacteristicsResponse {
             mac,
             status,

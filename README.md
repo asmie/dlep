@@ -310,6 +310,15 @@ active; a later Destination Announce can restore reports using the modem's
 latest local metrics and addresses. Busy/unknown destinations and stale session
 IDs return explicit errors as described below.
 
+Both roles expose replies to locally sent Destination Down messages through
+`DestinationEvent::DownResponse`, with peer status and text. Removal is published
+first for every validated, nonfatal reply, including a nonzero status. Routers
+emit their existing `Down` event before completion; modems emit completion only.
+A modem can remove an already withdrawn destination locally without sending
+Down, so that operation has no reply event. Invalid or fatal replies terminate
+the session instead. A delayed completion may describe an earlier incarnation
+of a MAC; use retained state for its current presence and metrics.
+
 `RouterDaemon::request_link_characteristics(session_id, destination, requested)`
 requests rate or latency changes from one modem. `LinkCharacteristics` has
 optional receive rate, transmit rate, and latency fields; supply at least one.

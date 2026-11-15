@@ -524,6 +524,13 @@ async fn radio_withdrawal_notices_preserve_other_routers_and_replay() {
                 .await;
             a.result(1, "accepted").await;
             a.wait(|s| destination(s, "modem-a", mac).is_none()).await;
+            let response = a
+                .wait(|s| notice(s, "down_response", |_| true).is_some())
+                .await;
+            assert_eq!(
+                notice(&response, "down_response", |_| true).unwrap(),
+                &json!({"type":"down_response", "session":aid, "mac":mac, "status":0, "text":""})
+            );
             let withdrawn = radio
                 .wait(|s| notice(s, "destination_withdrawn", |_| true).is_some())
                 .await;
@@ -629,6 +636,26 @@ async fn radio_withdrawal_notices_preserve_other_routers_and_replay() {
                 .filter(|n| n["type"] == "destination_withdrawn")
                 .collect();
             assert_eq!(withdrawals, vec![&expected_notice]);
+            let responses: Vec<_> = completed["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["type"] == "destination_down_response")
+                .collect();
+            assert_eq!(
+                responses.len(),
+                3,
+                "one reply per physical Down on each router"
+            );
+            let mut sessions = std::collections::HashSet::new();
+            for response in responses {
+                assert!(sessions.insert(response["session"].as_u64().unwrap()));
+                assert_eq!(
+                    response,
+                    &json!({"type":"destination_down_response", "session":response["session"],
+                    "mac":mac, "status":0, "text":""})
+                );
+            }
             for consumer in [&mut a, &mut b, &mut late] {
                 consumer.stop().await;
                 consumer.assert_final_empty();

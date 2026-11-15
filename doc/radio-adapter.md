@@ -157,6 +157,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `session_down` | `session`, `peer`, `status` (numeric RFC 8175 status code) | A router session ended. |
 | `session_update_response` | `session`, `status`, `text` | The router's validated, nonfatal reply to a Session Update, including initial replay of changed defaults. Zero means success. |
 | `destination_up_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to Destination Up. Zero means accepted; other status codes mean it declined reports for this destination. |
+| `destination_down_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to a modem-originated Destination Down. Zero means success. |
 | `destination_withdrawn` | `session`, `mac` | The router withdrew interest in this destination on this session. Physical destination knowledge remains cached. |
 | `destination_announced` | `session`, `mac` | The router asked about a destination it has not been told about (§12.13). The modem has already answered; send `destination_up` if the radio can reach it. |
 | `link_request` | `request`, `session`, `peer`, `mac`, `requested`, `current` | A router asks to change a destination's link. |
@@ -188,6 +189,15 @@ or affect other routers; later routers still receive normal replay. Do not send
 membership snapshots cannot recover a lost response or its explanation.
 Invalid, unsolicited, duplicate, or fatal replies follow session termination
 instead of producing an Up-response notice.
+
+`destination_down_response` preserves the router's status and explanation after
+removing the old destination from that session, even for a nonzero status. It
+does not alter the physical cache: a replacement reported under the same MAC
+can already exist when this notice arrives. Do not remove that replacement in
+response to the notice. If the router had already declined or withdrawn
+interest, physical removal can be local-only and produces no reply notice.
+Invalid, unsolicited, duplicate, or fatal replies terminate the session instead.
+Membership snapshots cannot recover lost completion notices.
 
 `destination_withdrawn` reports a router's later withdrawal of interest. The
 modem has acknowledged it and stopped reports on that session. Keep reporting

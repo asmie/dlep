@@ -91,6 +91,15 @@ pub enum DestinationEvent {
         id: DestinationId,
         reason: StatusCode,
     },
+    /// Validated, nonfatal reply to a locally sent Destination Down. Removal
+    /// is published before completion, even for a nonzero status.
+    /// Routers emit Down first; modems emit only this completion. A local-only
+    /// removal of an already withdrawn destination has no wire reply or event.
+    DownResponse {
+        id: DestinationId,
+        status: StatusCode,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug)]

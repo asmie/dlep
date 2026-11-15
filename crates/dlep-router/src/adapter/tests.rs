@@ -135,9 +135,9 @@ async fn snapshot_frames_export_complete_values_and_empty_replacement() {
 }
 
 #[tokio::test]
-async fn session_update_notices_preserve_status_text_between_complete_snapshots() {
+async fn completion_notices_preserve_status_text_between_complete_snapshots() {
     let (_state_tx, state) = watch::channel(fixture(1));
-    let (out, input) = mpsc::channel(2);
+    let (out, input) = mpsc::channel(4);
     let (writer, reader) = tokio::io::duplex(128);
     let task = tokio::spawn(write_output(writer, state, input));
     let text = "peer: dostęp ✓\n\"status\"";
@@ -150,6 +150,17 @@ async fn session_update_notices_preserve_status_text_between_complete_snapshots(
             peer: fixture(1).sessions[&SessionId(1)].peer.clone(),
             status,
             text: text.into(),
+        })
+        .unwrap();
+        out.send(Output::Notice(value)).await.unwrap();
+        let value = notice(DaemonEvent::Destination {
+            session_id: SessionId(1),
+            peer: fixture(1).sessions[&SessionId(1)].peer.clone(),
+            event: DestinationEvent::DownResponse {
+                id: mac("02:00:00:00:00:01").unwrap().into(),
+                status,
+                text: text.into(),
+            },
         })
         .unwrap();
         out.send(Output::Notice(value)).await.unwrap();
@@ -169,7 +180,7 @@ async fn session_update_notices_preserve_status_text_between_complete_snapshots(
                 assert!(snapshot_open);
                 snapshot_open = false;
             }
-            "session_update_response" => {
+            "session_update_response" | "down_response" => {
                 assert!(!snapshot_open);
                 replies.push(value);
             }
@@ -182,7 +193,9 @@ async fn session_update_notices_preserve_status_text_between_complete_snapshots(
         replies,
         vec![
             json!({"type":"session_update_response", "session":1, "status":2, "text":text}),
+            json!({"type":"down_response", "session":1, "mac":"02:00:00:00:00:01", "status":2, "text":text}),
             json!({"type":"session_update_response", "session":1, "status":42, "text":text}),
+            json!({"type":"down_response", "session":1, "mac":"02:00:00:00:00:01", "status":42, "text":text}),
         ]
     );
 }

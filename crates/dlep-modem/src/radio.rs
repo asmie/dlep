@@ -302,6 +302,12 @@ enum Outbound {
         status: u8,
         text: String,
     },
+    DestinationDownResponse {
+        session: u64,
+        mac: Mac,
+        status: u8,
+        text: String,
+    },
     LinkRequest {
         request: u64,
         session: u64,
@@ -1022,6 +1028,21 @@ impl Bridge<'_> {
 
     async fn event(&mut self, event: DaemonEvent) -> Result<()> {
         match event {
+            DaemonEvent::Destination {
+                session_id,
+                event: DestinationEvent::DownResponse { id, status, text },
+                ..
+            } => {
+                // A delayed completion can refer to an earlier incarnation.
+                // Its removal is already reflected in retained session state.
+                self.send(&Outbound::DestinationDownResponse {
+                    session: session_id.0,
+                    mac: Mac(id.0),
+                    status: status.0,
+                    text,
+                })
+                .await?
+            }
             DaemonEvent::SessionUpdateResponse {
                 session_id,
                 status,
@@ -2172,6 +2193,8 @@ mod tests {
         let daemon = modem().await;
         let mut events = daemon.subscribe();
         let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::channel(QUEUE_SIZE);
+        bridge.out = out;
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         dlep_net::gtsm::configure_tcp(&socket, false, true).unwrap();
         let mut peer = socket.connect(daemon.local_addr()).await.unwrap();
@@ -2238,12 +2261,38 @@ mod tests {
         bridge.retry().await;
         assert_eq!(bridge.retries.len(), 1);
 
+        let text = format!("router: dostęp ✓\"{}", "\n".repeat(MAX_LINE / 2));
         send(
             &mut peer,
-            build_destination_down_response(mac(), StatusCode::SUCCESS),
+            Message::new(MessageType::DESTINATION_DOWN_RESPONSE)
+                .with_item(dlep_core::DataItem::MacAddress(mac()))
+                .with_item(dlep_core::DataItem::Status {
+                    code: StatusCode::REQUEST_DENIED,
+                    text: text.clone(),
+                }),
         )
         .await;
         flush_peer(&mut peer).await;
+        let completion = tokio::time::timeout(WAIT, async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if matches!(
+                    event,
+                    DaemonEvent::Destination {
+                        event: DestinationEvent::DownResponse { .. },
+                        ..
+                    }
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let DaemonEvent::Destination { session_id, .. } = &completion else {
+            unreachable!()
+        };
+        let sid = *session_id;
         for deadline in bridge.retries.values_mut() {
             *deadline = Instant::now();
         }
@@ -2255,7 +2304,32 @@ mod tests {
             Duration::from_micros(1234)
         );
         assert!(bridge.retries.is_empty());
-        drop(peer);
+        // Deliver the earlier incarnation's completion after the replacement
+        // is already on the wire. It must not erase or change the new cache.
+        bridge.event(completion).await.unwrap();
+        let line = notices.recv().await.unwrap();
+        assert!(line.len() > MAX_LINE);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({
+                "type":"destination_down_response", "session":sid.0, "mac":mac().to_string(),
+                "status":StatusCode::REQUEST_DENIED.0, "text":text,
+            })
+        );
+        assert_eq!(
+            bridge.destinations[&mac()].metrics.latency,
+            Duration::from_micros(1234)
+        );
+        let mut late = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let replay = read(&mut late).await;
+        assert_eq!(replay.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&replay).unwrap().latency,
+            Duration::from_micros(1234)
+        );
+        drop((peer, late));
         daemon.shutdown().await.unwrap();
     }
 

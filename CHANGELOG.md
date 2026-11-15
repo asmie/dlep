@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Both daemon roles expose validated, nonfatal Destination Down replies through
+  `DestinationEvent::DownResponse`, including peer status text. Routers retain
+  their preceding `Down` event and forward `down_response` adapter notices;
+  modems emit completion without a withdrawal event and forward
+  `destination_down_response` to radio adapters. Delayed notices preserve a
+  replacement destination and its replay cache. Exhaustive matches must handle
+  the new daemon event and FSM `EmittedEvent::DestinationDownResponse` variant.
 - Both daemon roles expose validated, nonfatal Session Update replies through
   `DaemonEvent::SessionUpdateResponse`, preserving peer status and text. Both
   adapters forward `session_update_response` notices. Completion precedes any

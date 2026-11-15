@@ -234,6 +234,13 @@ replies must not emit completion. IPv4/IPv6 runtime tests check peer attribution
 and independent sessions; adapter tests preserve replay after refusal, escape
 long text, and keep notices outside complete snapshots. The real subprocess
 pipeline requires a radio notice after a session metric update.
+Destination Down completion tests require removal before completion and preserve
+status text on both roles. Router `Down` events precede completion; modem replies
+must not masquerade as router withdrawals. Invalid replies emit no completion.
+Runtime and real adapter cases cover both MAC formats and IP families with
+multiple peers. The radio regression delays notice delivery until after a
+replacement is sent and requires unchanged replay, including escaped peer text
+beyond the input-line limit. Churn verifies every modem Down response.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

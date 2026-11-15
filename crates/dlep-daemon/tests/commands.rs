@@ -217,6 +217,100 @@ async fn destination_up_outcomes_publish_current_state_and_keep_routers_isolated
 }
 
 #[tokio::test]
+async fn down_responses_publish_removal_and_preserve_other_router_sessions() {
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        let mac = match format {
+            MacAddressFormat::Eui48 => id().0,
+            MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+        };
+        for ip in ["127.0.0.1", "::1"] {
+            let m = modem_on(ip, format).await;
+            let mut events = m.subscribe();
+            let (a, aid) = peer(&m, &mut events).await;
+            let (b, bid) = peer(&m, &mut events).await;
+            let mut peers = [(a, aid), (b, bid)];
+            m.add_destination(mac.into(), LinkMetrics::default())
+                .await
+                .unwrap();
+            for (stream, sid) in &mut peers {
+                assert_eq!(read(stream).await.message_type, M::DESTINATION_UP);
+                send(stream, build_destination_up_response(mac, S::SUCCESS)).await;
+                let got = event(&mut events, |e| {
+                    matches!(e, DaemonEvent::Destination { .. })
+                })
+                .await;
+                assert!(
+                    matches!(got, DaemonEvent::Destination { session_id, event: DestinationEvent::UpResponse { .. }, .. } if session_id == *sid)
+                );
+            }
+            for status in [S::SUCCESS, S::REQUEST_DENIED, S(42)] {
+                m.drop_destination(mac.into(), S::SUCCESS).await.unwrap();
+                for (stream, _) in &mut peers {
+                    assert_eq!(read(stream).await.message_type, M::DESTINATION_DOWN);
+                }
+                for (stream, sid) in &mut peers {
+                    let text = format!("router {sid:?}: dostęp ✓\n\"removed\"");
+                    let addr = stream.local_addr().unwrap();
+                    send(
+                        stream,
+                        Message::new(M::DESTINATION_DOWN_RESPONSE)
+                            .with_item(DataItem::MacAddress(mac))
+                            .with_item(DataItem::Status {
+                                code: status,
+                                text: text.clone(),
+                            }),
+                    )
+                    .await;
+                    let got = event(&mut events, |e| {
+                        matches!(e, DaemonEvent::Destination { .. })
+                    })
+                    .await;
+                    assert!(matches!(got, DaemonEvent::Destination {
+                        session_id, peer, event: DestinationEvent::DownResponse { id, status: code, text: explanation }
+                    } if session_id == *sid && peer.addr == addr && id.0 == mac && code == status && explanation == text));
+                    let snapshot = m.state().borrow().clone();
+                    assert!(
+                        !snapshot.sessions[sid]
+                            .destinations
+                            .contains_key(&mac.into())
+                    );
+                    let other = if *sid == aid { bid } else { aid };
+                    assert_eq!(
+                        snapshot.sessions[&other].destinations[&mac.into()].phase,
+                        if *sid == aid {
+                            dlep_daemon::DestinationPhase::PendingDown
+                        } else {
+                            dlep_daemon::DestinationPhase::Up
+                        }
+                    );
+                    m.send_command_to(
+                        *sid,
+                        SessionCommand::AddDestination {
+                            mac,
+                            metrics: LinkMetrics::default(),
+                            addrs: Default::default(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(read(stream).await.message_type, M::DESTINATION_UP);
+                    send(stream, build_destination_up_response(mac, S::SUCCESS)).await;
+                    let got = event(&mut events, |e| {
+                        matches!(e, DaemonEvent::Destination { .. })
+                    })
+                    .await;
+                    assert!(
+                        matches!(got, DaemonEvent::Destination { session_id, event: DestinationEvent::UpResponse { .. }, .. } if session_id == *sid)
+                    );
+                }
+            }
+            drop(peers);
+            m.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn session_defaults_preserve_destination_phases_and_other_sessions() {
     use dlep_daemon::DestinationPhase as P;
     use dlep_fsm::session_common::{

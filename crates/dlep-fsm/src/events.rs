@@ -172,6 +172,13 @@ pub enum EmittedEvent {
         mac: MacAddress,
         reason: StatusCode,
     },
+    /// Validated, nonfatal reply to a locally sent Destination Down. Both
+    /// roles remove the destination first; routers also emit DestinationDown.
+    DestinationDownResponse {
+        mac: MacAddress,
+        status: StatusCode,
+        text: String,
+    },
     DestinationUpdate {
         mac: MacAddress,
         metrics: LinkMetrics,

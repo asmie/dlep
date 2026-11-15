@@ -418,13 +418,23 @@ impl RouterSessionFsm {
                 if msg.message_type == MessageType::DESTINATION_DOWN_RESPONSE =>
             {
                 let mac = extract_destination_mac(&msg).expect("validated MAC");
-                let reason = extract_status(&msg).expect("validated status");
+                let (status, text) = msg
+                    .data_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DataItem::Status { code, text } => Some((*code, text.clone())),
+                        _ => None,
+                    })
+                    .expect("validated status");
                 self.tx.close_destination(&mac);
                 self.destinations.remove(&mac);
-                let mut actions = vec![FsmAction::Emit(EmittedEvent::DestinationDown {
-                    mac,
-                    reason,
-                })];
+                let mut actions = vec![
+                    FsmAction::Emit(EmittedEvent::DestinationDown {
+                        mac,
+                        reason: status,
+                    }),
+                    FsmAction::Emit(EmittedEvent::DestinationDownResponse { mac, status, text }),
+                ];
                 actions.extend(heartbeat_reset_action(
                     TIMER_HEARTBEAT_MISSED,
                     self.peer_heartbeat_interval,

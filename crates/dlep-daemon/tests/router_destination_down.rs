@@ -195,3 +195,124 @@ async fn router_can_reannounce_after_withdrawing_and_receive_latest_metrics() {
     router.shutdown().await.unwrap();
     modem.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn down_responses_follow_removal_and_preserve_peer_status_text() {
+    use dlep_core::{DataItem, MacAddressFormat, Message, MessageType as M, StatusCode as S};
+    use dlep_fsm::{FsmAction as A, FsmEvent as E, SessionConfig, session_modem::ModemSessionFsm};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    async fn read(peer: &mut TcpStream) -> Message {
+        timeout(WAIT, async {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).await.unwrap();
+            let mut bytes = header.to_vec();
+            bytes.resize(
+                4 + usize::from(u16::from_be_bytes([header[2], header[3]])),
+                0,
+            );
+            peer.read_exact(&mut bytes[4..]).await.unwrap();
+            Message::decode(bytes.into()).unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        let mac = match format {
+            MacAddressFormat::Eui48 => id().0,
+            MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+        };
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        config.shared.network.mac_address_format = format;
+        let router = RouterDaemon::builder()
+            .config(config)
+            .spawn()
+            .await
+            .unwrap();
+        let mut events = router.subscribe();
+        let mut peers = Vec::new();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let listener = TcpListener::bind(bind).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            dlep_net::gtsm::configure_tcp(&listener, addr.is_ipv6(), true).unwrap();
+            router.connect_static(addr).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut modem = ModemSessionFsm::with_config(SessionConfig {
+                mac_address_format: format,
+                ..Default::default()
+            });
+            modem.step(E::TcpAccepted);
+            let init = read(&mut stream).await;
+            for action in modem.step(E::RecvMessage(init)) {
+                if let A::SendMessage(message) = action {
+                    stream.write_all(&message.encode().unwrap()).await.unwrap();
+                }
+            }
+            let sid = up(&mut events).await;
+            let message = dlep_fsm::session_common::build_destination_up(
+                mac,
+                &LinkMetrics::default(),
+                &Default::default(),
+            );
+            stream.write_all(&message.encode().unwrap()).await.unwrap();
+            destination_up(&mut events).await;
+            assert_eq!(
+                read(&mut stream).await.message_type,
+                M::DESTINATION_UP_RESPONSE
+            );
+            peers.push((stream, sid, addr));
+        }
+        for (stream, sid, addr) in &mut peers {
+            for status in [S::SUCCESS, S::REQUEST_DENIED, S(42)] {
+                router.drop_destination(*sid, mac.into()).await.unwrap();
+                assert_eq!(read(stream).await.message_type, M::DESTINATION_DOWN);
+                let text = format!("modem {addr}: dostęp ✓\n\"removed\"");
+                let response = Message::new(M::DESTINATION_DOWN_RESPONSE)
+                    .with_item(DataItem::MacAddress(mac))
+                    .with_item(DataItem::Status {
+                        code: status,
+                        text: text.clone(),
+                    });
+                stream.write_all(&response.encode().unwrap()).await.unwrap();
+                let removed = event(&mut events, |e| {
+                    matches!(e, DaemonEvent::Destination { .. })
+                })
+                .await;
+                assert!(matches!(removed, DaemonEvent::Destination {
+                    session_id, peer, event: DestinationEvent::Down { id, reason }
+                } if session_id == *sid && peer.addr == *addr && id.0 == mac && reason == status));
+                let completed = event(&mut events, |e| {
+                    matches!(e, DaemonEvent::Destination { .. })
+                })
+                .await;
+                assert!(matches!(completed, DaemonEvent::Destination {
+                    session_id, peer, event: DestinationEvent::DownResponse { id, status: code, text: explanation }
+                } if session_id == *sid && peer.addr == *addr && id.0 == mac && code == status && explanation == text));
+                let state = router.state().borrow().clone();
+                assert!(!state.sessions[sid].destinations.contains_key(&mac.into()));
+                assert!(
+                    state
+                        .sessions
+                        .iter()
+                        .filter(|(other, _)| **other != *sid)
+                        .all(|(_, s)| s.destinations.contains_key(&mac.into()))
+                );
+                let message = dlep_fsm::session_common::build_destination_up(
+                    mac,
+                    &LinkMetrics::default(),
+                    &Default::default(),
+                );
+                stream.write_all(&message.encode().unwrap()).await.unwrap();
+                destination_up(&mut events).await;
+                assert_eq!(read(stream).await.message_type, M::DESTINATION_UP_RESPONSE);
+            }
+        }
+        drop(peers);
+        router.shutdown().await.unwrap();
+    }
+}

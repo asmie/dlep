@@ -1093,6 +1093,16 @@ The order of work was:
     per-peer isolation, IPv4/IPv6 runtime and adapter delivery, replay after
     refusal, and notices between complete router snapshots.
 
+51. Destination Down completion events. **Done** — both roles emit
+    `DestinationEvent::DownResponse` after removing the destination for a
+    validated, nonfatal reply. Routers retain their earlier `Down` event;
+    modems emit completion without suggesting a router withdrew interest.
+    Router adapters receive `down_response`, and radio adapters receive
+    `destination_down_response`, with session, MAC, status, and text. Tests
+    cover statuses and text, invalid replies, publication ordering, peer
+    isolation, both MAC formats and IP families, and delayed completion after
+    replacement with preserved replay. Churn now checks every Down response.
+
 ---
 
 ## 10. Open questions / risks

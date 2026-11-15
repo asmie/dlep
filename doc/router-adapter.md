@@ -138,6 +138,7 @@ Additional notices are best effort and can appear between complete snapshots:
 | `announce_response` | `session`, `mac`, `status`, `text` | A validated, nonfatal Destination Announce Response, including denial; status is the numeric DLEP code. |
 | `link_response` | `session`, `mac`, `status`, `text`, `metrics` | A peer Link Characteristics Response; status is the numeric DLEP code. |
 | `destination_down` | `session`, `mac`, `status` | Destination withdrawal/removal outcome. |
+| `down_response` | `session`, `mac`, `status`, `text` | A validated, nonfatal reply to a router-originated Destination Down, preserving the peer's status text. |
 | `session_down` | `session`, `peer`, `status` | Session termination reason. |
 | `session_update_response` | `session`, `status`, `text` | A validated, nonfatal reply to a locally originated Session Update. Zero means success. |
 | `event_gap` | `skipped` | Public events were lost; a current snapshot follows. |
@@ -157,6 +158,13 @@ Success also creates the destination in retained state. Read its metrics and
 addresses from snapshots; large address sets can continue arriving in subsequent
 updates after the response. Invalid, unsolicited, duplicate, or fatal replies
 follow session termination instead of producing an announce-response notice.
+
+`down_response` follows the existing `destination_down` removal notice when the
+modem replies to a withdrawal command. Removal occurs for every validated,
+nonfatal reply, including a nonzero status. Modem-originated destination loss
+produces only `destination_down`. Invalid, unsolicited, duplicate, or fatal
+replies terminate the session instead of producing a completion notice. A later
+Announce or Up can recreate the same MAC; use snapshots for its current state.
 
 `session_update_response` exposes replies to address updates originated through
 the daemon API; this adapter does not currently submit session address commands.

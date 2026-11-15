@@ -486,13 +486,27 @@ impl ModemSessionFsm {
             (ModemSessionState::InSession, FsmEvent::RecvMessage(msg))
                 if msg.message_type == MessageType::DESTINATION_DOWN_RESPONSE =>
             {
-                if let Some(mac) = extract_destination_mac(&msg) {
-                    self.tx.close_destination(&mac);
-                    self.destinations.remove(&mac);
-                }
-                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
-                    .into_iter()
-                    .collect()
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let (status, text) = msg
+                    .data_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DataItem::Status { code, text } => Some((*code, text.clone())),
+                        _ => None,
+                    })
+                    .expect("validated status");
+                self.tx.close_destination(&mac);
+                self.destinations.remove(&mac);
+                let mut actions = vec![FsmAction::Emit(EmittedEvent::DestinationDownResponse {
+                    mac,
+                    status,
+                    text,
+                })];
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
             }
             // Session_Update: RFC 8175 §12.7 / §12.8 — the response is
             // MANDATORY, so answer unconditionally. See the router-side twin
