@@ -47,7 +47,10 @@ a file. It does not run the adapter.
 
 - `mac`: colon-separated hexadecimal octets, six for EUI-48 or eight for EUI-64,
   for example `"02:00:00:00:00:01"`. The format must match
-  `[network].mac_address_format`.
+  `[network].mac_address_format`. An incompatible `destination_up` is logged
+  and ignored before it enters the replay cache, even with no connected routers.
+  The configured format remains fixed after all destinations are removed; it
+  is never inferred from radio reports.
 - `metrics`: an object using the `[metrics]` names: `max_data_rate_rx_bps`,
   `max_data_rate_tx_bps`, `current_data_rate_rx_bps`,
   `current_data_rate_tx_bps`, `latency_us`, and the optional `resources`,

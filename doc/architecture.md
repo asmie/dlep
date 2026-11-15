@@ -971,6 +971,13 @@ The order of work was:
     offline and connected accumulation, unchanged current and replayed state,
     recovery by freeing space, and real IPv4/IPv6 adapter pipelines.
 
+40. Radio MAC-format admission. **Done** — the bridge receives the modem's
+    configured link-layer format and rejects incompatible destination reports
+    before caching or broadcasting them. Offline reports cannot populate a
+    replay table that every session would reject. Tests cover EUI-48 and EUI-64,
+    with and without active sessions, policy retention after the final withdrawal,
+    and valid reports, link grants, and replay through real adapters over IPv4/IPv6.
+
 ---
 
 ## 10. Open questions / risks

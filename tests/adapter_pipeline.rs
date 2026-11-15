@@ -18,6 +18,7 @@ use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(12);
 const MAC: &str = "02:00:00:00:00:01";
+const MAC64: &str = "02:00:00:00:00:00:00:01";
 const OTHER_MAC: &str = "02:00:00:00:00:02";
 
 struct Control {
@@ -145,8 +146,17 @@ impl Node {
     }
 
     async fn modem(name: &str, ip: &str, port: u16) -> (Self, SocketAddr) {
+        Self::modem_with_format(name, ip, port, "eui48").await
+    }
+
+    async fn modem_with_format(
+        name: &str,
+        ip: &str,
+        port: u16,
+        format: &str,
+    ) -> (Self, SocketAddr) {
         let node = Self::start("modem", &format!(
-            "peer_description = {name:?}\n[network]\nbind_addr = {ip:?}\ntcp_port = {port}\ndiscovery_port = 0\nuse_tls = false\n\
+            "peer_description = {name:?}\n[network]\nbind_addr = {ip:?}\ntcp_port = {port}\ndiscovery_port = 0\nuse_tls = false\nmac_address_format = {format:?}\n\
              [timers]\nheartbeat_interval_ms = 1000\ntermination_timeout_ms = 200\n\
              [metrics]\nmax_data_rate_rx_bps = 1000000\nmax_data_rate_tx_bps = 1000000\ncurrent_data_rate_rx_bps = 100\ncurrent_data_rate_tx_bps = 200\n\
              latency_us = 2500\nresources = 80\nrlq_rx = 60\nrlq_tx = 70\nmtu = 1500\n"
@@ -171,9 +181,13 @@ impl Node {
     }
 
     async fn router(peers: &[SocketAddr]) -> Self {
+        Self::router_with_format(peers, "eui48").await
+    }
+
+    async fn router_with_format(peers: &[SocketAddr], format: &str) -> Self {
         let peers: Vec<_> = peers.iter().map(ToString::to_string).collect();
         Self::start("router", &format!(
-            "mode = 'static'\nstatic_peers = {}\n[network]\nuse_tls = false\n[timers]\nheartbeat_interval_ms = 1000\ntermination_timeout_ms = 200\n",
+            "mode = 'static'\nstatic_peers = {}\n[network]\nuse_tls = false\nmac_address_format = {format:?}\n[timers]\nheartbeat_interval_ms = 1000\ntermination_timeout_ms = 200\n",
             json!(peers)
         )).await
     }
@@ -653,6 +667,82 @@ fn announcements(session: &Value, count: u64) -> Vec<Value> {
         .map(|request| json!({"type":"destination_announce", "request":request,
             "session":session, "mac":format!("02:00:00:01:{:02x}:{:02x}", request >> 8, request & 255)}))
         .collect()
+}
+
+#[tokio::test]
+async fn radio_mac_policy_preserves_valid_reports_commands_and_replay() {
+    for (format, valid, invalid) in [("eui48", MAC, MAC64), ("eui64", MAC64, MAC)] {
+        for ip in ["127.0.0.1", "::1"] {
+            let (mut radio, addr) = Node::modem_with_format("modem-a", ip, 0, format).await;
+            report(&mut radio, invalid, 999, 2).await;
+            report(&mut radio, valid, 700, 1).await;
+            let mut router = Node::router_with_format(&[addr], format).await;
+            let initial = router
+                .wait(|s| destination(s, "modem-a", valid).is_some())
+                .await;
+            assert_eq!(
+                session(&initial, "modem-a").unwrap()["destinations"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+            radio.control.batch(vec![
+                json!({"type":"destination_up", "mac":invalid, "metrics":{"latency_us":999}}),
+                json!({"type":"destination_update", "mac":valid, "metrics":{"current_data_rate_rx_bps":444}}),
+            ]).await;
+            router
+                .wait(|s| {
+                    destination(s, "modem-a", valid)
+                        .is_some_and(|d| d["metrics"]["current_data_rate_rx_bps"] == 444)
+                })
+                .await;
+            router
+                .control
+                .send(json!({"type":"link_request", "request":1,
+                "session":sid, "mac":valid, "requested":{"current_data_rate_tx_bps":321}}))
+                .await;
+            router.result(1, "accepted").await;
+            let request = respond(&mut radio, json!({"current_data_rate_tx_bps":321}), true).await;
+            assert_eq!(request["mac"], valid);
+            let granted = router
+                .wait(|s| notice(s, "link_response", |n| n["mac"] == valid).is_some())
+                .await;
+            let mut expected = defaults();
+            expected["current_data_rate_rx_bps"] = json!(444);
+            expected["current_data_rate_tx_bps"] = json!(321);
+            expected["rlq_tx"] = json!(0);
+            assert_eq!(
+                destination(&granted, "modem-a", valid).unwrap()["metrics"],
+                expected
+            );
+            let mut late = Node::router_with_format(&[addr], format).await;
+            let replay = late
+                .wait(|s| destination(s, "modem-a", valid).is_some())
+                .await;
+            assert_eq!(
+                session(&replay, "modem-a").unwrap()["destinations"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                destination(&replay, "modem-a", valid).unwrap()["metrics"],
+                expected
+            );
+            assert_eq!(
+                destination(&replay, "modem-a", valid).unwrap()["addresses"],
+                expected_addresses(1)
+            );
+            for consumer in [&mut router, &mut late] {
+                consumer.stop().await;
+                consumer.assert_final_empty();
+            }
+            radio.stop().await;
+        }
+    }
 }
 
 #[tokio::test]

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use dlep_core::{MacAddress, StatusCode};
+use dlep_core::{MacAddress, MacAddressFormat, StatusCode};
 use dlep_daemon::link_control::LinkControlFuture;
 use dlep_daemon::{
     AddressChanges, CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs,
@@ -397,9 +397,11 @@ impl Adapter {
         daemon: &ModemDaemon,
         mut events: broadcast::Receiver<DaemonEvent>,
         initial: LinkMetrics,
+        mac_address_format: MacAddressFormat,
     ) -> Result<Infallible> {
         let mut bridge = Bridge {
             daemon,
+            mac_address_format,
             out: self.out.as_ref().expect("adapter active").clone(),
             destinations: BTreeMap::new(),
             session_metrics: initial,
@@ -602,6 +604,7 @@ struct Pending {
 
 struct Bridge<'a> {
     daemon: &'a ModemDaemon,
+    mac_address_format: MacAddressFormat,
     out: mpsc::Sender<String>,
     destinations: BTreeMap<MacAddress, Known>,
     session_metrics: LinkMetrics,
@@ -629,6 +632,11 @@ impl Bridge<'_> {
                 metrics,
                 addresses,
             } => {
+                if !self.mac_address_format.accepts(mac) {
+                    warn!(%mac, expected = ?self.mac_address_format,
+                        "radio adapter destination uses incompatible MAC format; ignored");
+                    return;
+                }
                 if self.destinations.contains_key(&mac) {
                     warn!(%mac, "radio adapter reported an existing destination up; ignored");
                     return;
@@ -1163,7 +1171,15 @@ mod tests {
     }
 
     async fn modem_with(backend: Option<Arc<dyn LinkControl>>) -> ModemDaemon {
+        modem_with_format(backend, MacAddressFormat::Eui48).await
+    }
+
+    async fn modem_with_format(
+        backend: Option<Arc<dyn LinkControl>>,
+        format: MacAddressFormat,
+    ) -> ModemDaemon {
         let mut config = ModemConfig::default();
+        config.shared.network.mac_address_format = format;
         config.shared.network.use_tls = false;
         config.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
         config.shared.network.tcp_port = 0;
@@ -1219,6 +1235,7 @@ mod tests {
         tokio::spawn(async move { while messages.recv().await.is_some() {} });
         Bridge {
             daemon,
+            mac_address_format: MacAddressFormat::Eui48,
             out,
             destinations: BTreeMap::new(),
             session_metrics: ModemConfig::default().metrics.link_metrics(),
@@ -2565,6 +2582,94 @@ mod tests {
         );
         drop(peer);
         daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incompatible_radio_macs_never_enter_the_cache_or_replay() {
+        let mac48 = mac();
+        let mac64 = MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]);
+        for (format, valid, invalid) in [
+            (MacAddressFormat::Eui48, mac48, mac64),
+            (MacAddressFormat::Eui64, mac64, mac48),
+        ] {
+            for connected in [false, true] {
+                let daemon = modem_with_format(None, format).await;
+                let mut events = daemon.subscribe();
+                let mut bridge = bridge(&daemon);
+                bridge.mac_address_format = format;
+                let mut peer = if connected {
+                    let peer = session(&daemon, &mut events).await;
+                    let snapshot = daemon.state().borrow().clone();
+                    bridge.reconcile(&snapshot).await.unwrap();
+                    Some(peer)
+                } else {
+                    None
+                };
+                let report = |mac| Inbound::DestinationUp {
+                    mac: Mac(mac),
+                    metrics: Metrics {
+                        latency_us: Some(123),
+                        ..Default::default()
+                    },
+                    addresses: Addresses::default(),
+                };
+                bridge.inbound(report(invalid)).await;
+                assert!(
+                    bridge.destinations.is_empty(),
+                    "incompatible MAC cached for {format:?} (connected: {connected})"
+                );
+                assert!(bridge.retries.is_empty());
+                if let Some(peer) = &mut peer {
+                    flush_peer(peer).await;
+                }
+                bridge.inbound(report(valid)).await;
+                let mut peer = match peer {
+                    Some(peer) => peer,
+                    None => {
+                        let peer = session(&daemon, &mut events).await;
+                        let snapshot = daemon.state().borrow().clone();
+                        bridge.reconcile(&snapshot).await.unwrap();
+                        peer
+                    }
+                };
+                let up = read(&mut peer).await;
+                assert_eq!(up.message_type, MessageType::DESTINATION_UP);
+                assert_eq!(
+                    dlep_fsm::session_common::extract_destination_mac(&up),
+                    Some(valid)
+                );
+                assert_eq!(
+                    extract_link_metrics(&up).unwrap().latency,
+                    Duration::from_micros(123)
+                );
+                send(
+                    &mut peer,
+                    build_destination_up_response(valid, StatusCode::SUCCESS),
+                )
+                .await;
+                flush_peer(&mut peer).await;
+                bridge
+                    .inbound(Inbound::DestinationDown { mac: Mac(valid) })
+                    .await;
+                assert_eq!(
+                    read(&mut peer).await.message_type,
+                    MessageType::DESTINATION_DOWN
+                );
+                send(
+                    &mut peer,
+                    build_destination_down_response(valid, StatusCode::SUCCESS),
+                )
+                .await;
+                flush_peer(&mut peer).await;
+                // Removing the final valid destination must not reset the policy.
+                bridge.inbound(report(invalid)).await;
+                assert!(bridge.destinations.is_empty());
+                assert!(bridge.retries.is_empty());
+                flush_peer(&mut peer).await;
+                drop(peer);
+                daemon.shutdown().await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

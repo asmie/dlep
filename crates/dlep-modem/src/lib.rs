@@ -89,6 +89,7 @@ where
 
     // Start the adapter before opening sockets so a bad command fails early.
     let initial_metrics = config.metrics.link_metrics();
+    let mac_address_format = config.shared.network.mac_address_format;
     let mut adapter = match &config.radio {
         Some(radio) => Some(radio::Adapter::spawn(radio)?),
         None => None,
@@ -113,7 +114,7 @@ where
     let outcome = match &mut adapter {
         Some(adapter) => tokio::select! {
             () = shutdown.recv() => Ok(()),
-            result = adapter.run(&daemon, events, initial_metrics) => {
+            result = adapter.run(&daemon, events, initial_metrics, mac_address_format) => {
                 result.map(|never| match never {}).context("radio adapter failed")
             }
         },

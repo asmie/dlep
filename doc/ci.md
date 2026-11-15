@@ -176,6 +176,10 @@ Address-cache regressions accumulate individually valid batches beyond the
 Destination Up wire limit, with and without a connected router. Rejected batches
 must preserve all addresses, later replay must work, and a batch that frees space
 must recover. The real adapter pipeline covers this over both IPv4 and IPv6.
+Radio MAC-format cases check EUI-48 and EUI-64 admission before and after a router
+connects and after the last destination is removed. Real adapter pipelines verify
+valid reports, targeted link grants, and later replay under both format settings
+over IPv4 and IPv6 while incompatible reports are ignored.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

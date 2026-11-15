@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Radio destination reports with a MAC format incompatible with
+  `[network].mac_address_format` are logged and ignored before entering the
+  replay cache, including before any router connects.
 - Radio address updates validate the complete resulting destination before
   sending or caching changes. A batch that would exceed the Destination Up wire
   limit is rejected atomically, preserving replay for later routers; a subsequent
