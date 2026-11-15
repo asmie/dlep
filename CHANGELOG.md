@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `ModemDaemon::set_session_addresses` retains a complete desired address set
+  per session, coalesces replacements while busy, and sends fitting changes
+  after each response. Large replacements remove addresses before adding new
+  ones across acknowledged Session Updates; queued metrics share the next
+  update while preserving later destination values. Invalid or oversized sets
+  leave accepted state intact. `validate_session_addresses` validates replay
+  state without requiring a connected peer.
+- Library `SessionSnapshot` adds `local_addresses`, including queued desired
+  modem addresses; existing adapter address fields still describe remote peers.
+  Exhaustive snapshot literals and matches on the new
+  `SessionCommand::SetSessionAddresses` / `FsmEvent::AppSetSessionAddresses`
+  variants need updating. Existing delta-based address methods still return
+  Busy; nonfatal refusals do not roll back local addresses.
 - Radio `session_sync` entries include each router's complete IPv4/IPv6 address
   and subnet sets. Address changes refresh the snapshot even when membership
   is unchanged. Retained state restores addresses after event loss and on

@@ -212,6 +212,7 @@ impl SessionFsm for dlep_fsm::session_router::RouterSessionFsm {
             phase,
             metrics: self.session_metrics,
             peer_addresses: self.peer_addresses.clone(),
+            local_addresses: self.local_addresses().clone(),
             destinations: self
                 .destinations
                 .iter()
@@ -268,6 +269,7 @@ impl SessionFsm for dlep_fsm::session_modem::ModemSessionFsm {
             phase,
             metrics: self.session_metrics(),
             peer_addresses: self.peer_addresses.clone(),
+            local_addresses: self.local_addresses().clone(),
             destinations: self
                 .destinations
                 .iter()
@@ -601,6 +603,9 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     }
                     Some(SessionCommand::UpdateSessionAddresses { session_id: _, changes }) => {
                         FsmEvent::AppSessionAddresses { changes }
+                    }
+                    Some(SessionCommand::SetSessionAddresses { session_id: _, addresses }) => {
+                        FsmEvent::AppSetSessionAddresses { addresses }
                     }
                     Some(SessionCommand::DropDestination { mac, reason }) => {
                         FsmEvent::AppDropDestination { mac, reason }

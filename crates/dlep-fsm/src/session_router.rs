@@ -108,6 +108,11 @@ impl RouterSessionFsm {
         self.config.mac_address_format
     }
 
+    /// Locally advertised addresses; nonfatal refusals do not roll them back.
+    pub fn local_addresses(&self) -> &DestinationAddrs {
+        &self.local_addresses
+    }
+
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
         if let Some(command) = event.command() {
             if let Err(reason) = self.check_command(&event) {

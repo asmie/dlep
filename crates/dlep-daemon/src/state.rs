@@ -59,6 +59,9 @@ pub struct SessionSnapshot {
     pub metrics: LinkMetrics,
     /// Addresses advertised by the remote peer, not this daemon's addresses.
     pub peer_addresses: DestinationAddrs,
+    /// Effective desired local addresses. Modem replacements can be queued
+    /// or partly sent; this is not confirmation that the peer accepted them.
+    pub local_addresses: DestinationAddrs,
     pub destinations: HashMap<DestinationId, DestinationSnapshot>,
 }
 

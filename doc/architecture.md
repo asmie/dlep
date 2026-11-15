@@ -1144,6 +1144,18 @@ The order of work was:
     behind output backpressure, and IPv4/IPv6 pipelines with multiple routers,
     complete removals, refreshed snapshots, and clean address state on reconnect.
 
+56. Desired modem session addresses. **Done** — `set_session_addresses` retains
+    a complete, validated address set per session and coalesces replacements
+    while busy. Session Update replies advance fitting prefixes of effective
+    changes, removing before adding and recomputing from the latest desired set.
+    Pending metrics share the next update without resetting later destination
+    values. Library snapshots expose desired `local_addresses`; existing peer
+    address fields retain their meaning. Replay validation works without peers,
+    and each desired set must fit one address-only update from empty. Tests
+    cover canonicalization, invalid sets, cancellation of unsent changes, large
+    replacements and combined wire budgets, completion before subsequent writes,
+    refusals, termination, IPv4/IPv6 session isolation, and reconnect cleanup.
+
 ---
 
 ## 10. Open questions / risks

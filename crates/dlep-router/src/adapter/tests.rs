@@ -21,6 +21,7 @@ fn fixture(generation: u64) -> DaemonSnapshot {
             v4: vec!["192.0.2.1".parse().unwrap()],
             ..Default::default()
         },
+        local_addresses: DestinationAddrs::default(),
         destinations: HashMap::from([(
             mac("02:00:00:00:00:01").unwrap().into(),
             DestinationSnapshot {

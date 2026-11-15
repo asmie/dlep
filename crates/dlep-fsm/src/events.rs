@@ -61,6 +61,11 @@ pub enum FsmEvent {
     AppSessionAddresses {
         changes: AddressChanges,
     },
+    /// Modem only: replace the desired local address set, coalescing while
+    /// a session transaction is busy. Delivery may require several responses.
+    AppSetSessionAddresses {
+        addresses: DestinationAddrs,
+    },
     AppAnnounceDestination {
         mac: MacAddress,
     },

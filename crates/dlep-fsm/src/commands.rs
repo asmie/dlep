@@ -58,7 +58,9 @@ impl FsmEvent {
             Self::AppDropDestination { mac, .. } => (K::DropDestination, Some(*mac)),
             Self::AppUpdateMetrics { mac, .. } => (K::UpdateMetrics, Some(*mac)),
             Self::AppUpdateAddresses { mac, .. } => (K::UpdateAddresses, Some(*mac)),
-            Self::AppSessionAddresses { .. } => (K::SessionAddresses, None),
+            Self::AppSessionAddresses { .. } | Self::AppSetSessionAddresses { .. } => {
+                (K::SessionAddresses, None)
+            }
             Self::AppSessionUpdate { .. }
             | Self::AppSessionDefaults { .. }
             | Self::AppQueueSessionUpdate { .. } => (K::SessionMetrics, None),

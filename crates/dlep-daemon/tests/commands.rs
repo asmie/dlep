@@ -436,6 +436,266 @@ async fn session_defaults_preserve_destination_phases_and_other_sessions() {
 }
 
 #[tokio::test]
+async fn desired_session_addresses_coalesce_per_router_and_disappear_on_disconnect() {
+    use dlep_fsm::session_common::{build_session_update_response, extract_link_metrics};
+    let addresses = |n| DestinationAddrs {
+        v4: vec![format!("192.0.2.{n}").parse().unwrap()],
+        v6: vec![format!("2001:db8::{n}").parse().unwrap()],
+        v4_subnets: vec![format!("198.51.{n}.7/24").parse().unwrap()],
+        v6_subnets: vec![format!("2001:db8:{n}::7/64").parse().unwrap()],
+    };
+    for ip in ["127.0.0.1", "::1"] {
+        let m = modem_on(ip, MacAddressFormat::Eui48).await;
+        m.validate_session_addresses(&addresses(1)).unwrap();
+        assert!(matches!(
+            m.set_session_addresses(SessionId(u64::MAX), addresses(1))
+                .await,
+            Err(DaemonError::NoMatchingSession)
+        ));
+        let mut events = m.subscribe();
+        let (mut a, aid) = peer(&m, &mut events).await;
+        let (mut b, bid) = peer(&m, &mut events).await;
+        for (stream, sid, n) in [(&mut a, aid, 1), (&mut b, bid, 2)] {
+            m.set_session_addresses(sid, addresses(n)).await.unwrap();
+            let message = read(stream).await;
+            assert_eq!(message.message_type, M::SESSION_UPDATE);
+            assert_eq!(
+                AddressChanges::from_message(&message).added,
+                addresses(n).canonical()
+            );
+        }
+        for n in 3..=5 {
+            m.set_session_addresses(aid, addresses(n)).await.unwrap();
+        }
+        let defaults = LinkMetrics {
+            latency: Duration::from_micros(333),
+            ..Default::default()
+        };
+        m.send_command_to(
+            aid,
+            SessionCommand::QueueSessionUpdate { metrics: defaults },
+        )
+        .await
+        .unwrap();
+        let snapshot = m.state().borrow().clone();
+        assert_eq!(
+            snapshot.sessions[&aid].local_addresses,
+            addresses(5).canonical()
+        );
+        assert_eq!(
+            snapshot.sessions[&bid].local_addresses,
+            addresses(2).canonical()
+        );
+        assert!(
+            snapshot
+                .sessions
+                .values()
+                .all(|s| s.peer_addresses.is_empty())
+        );
+        let invalid = DestinationAddrs {
+            v4: vec!["192.0.2.1".parse().unwrap(); 2],
+            ..Default::default()
+        };
+        assert!(matches!(
+            m.set_session_addresses(aid, invalid.clone()).await,
+            Err(DaemonError::Config(_))
+        ));
+        rejected(
+            m.send_command_to(
+                aid,
+                SessionCommand::SetSessionAddresses {
+                    session_id: aid,
+                    addresses: invalid,
+                },
+            )
+            .await
+            .unwrap_err(),
+            aid,
+            C::InvalidInput,
+        );
+        assert_eq!(
+            m.state().borrow().sessions[&aid].local_addresses,
+            addresses(5).canonical()
+        );
+        assert!(matches!(
+            m.send_command_to(
+                bid,
+                SessionCommand::SetSessionAddresses {
+                    session_id: aid,
+                    addresses: addresses(6)
+                }
+            )
+            .await,
+            Err(DaemonError::Config(_))
+        ));
+        rejected(
+            m.update_session_addresses(bid, AddressChanges::default())
+                .await
+                .unwrap_err(),
+            bid,
+            C::Busy,
+        );
+
+        send(&mut a, build_session_update_response(S::REQUEST_DENIED)).await;
+        let outcome = event(&mut events, |e| {
+            matches!(e, DaemonEvent::SessionUpdateResponse { .. })
+        })
+        .await;
+        assert!(
+            matches!(outcome, DaemonEvent::SessionUpdateResponse { session_id, status, .. } if session_id == aid && status == S::REQUEST_DENIED)
+        );
+        assert_eq!(
+            m.state().borrow().sessions[&aid].local_addresses,
+            addresses(5).canonical()
+        );
+        let message = read(&mut a).await;
+        assert_eq!(message.message_type, M::SESSION_UPDATE);
+        assert_eq!(
+            AddressChanges::from_message(&message),
+            AddressChanges {
+                added: addresses(5).canonical(),
+                removed: addresses(1).canonical()
+            }
+        );
+        assert_eq!(extract_link_metrics(&message), Some(defaults));
+        m.set_session_addresses(aid, DestinationAddrs::default())
+            .await
+            .unwrap();
+        send(&mut a, build_session_update_response(S(42))).await;
+        let message = read(&mut a).await;
+        assert_eq!(message.message_type, M::SESSION_UPDATE);
+        assert_eq!(
+            AddressChanges::from_message(&message),
+            AddressChanges {
+                added: Default::default(),
+                removed: addresses(5).canonical()
+            }
+        );
+        for stream in [&mut a, &mut b] {
+            send(stream, build_session_update_response(S::SUCCESS)).await;
+            send(stream, Message::new(M::SESSION_UPDATE)).await;
+            assert_eq!(read(stream).await.message_type, M::SESSION_UPDATE_RESPONSE);
+        }
+        assert!(m.state().borrow().sessions[&aid].local_addresses.is_empty());
+        assert_eq!(
+            m.state().borrow().sessions[&bid].local_addresses,
+            addresses(2).canonical()
+        );
+        m.set_session_addresses(aid, DestinationAddrs::default())
+            .await
+            .unwrap();
+        send(&mut a, Message::new(M::SESSION_UPDATE)).await;
+        assert_eq!(
+            read(&mut a).await.message_type,
+            M::SESSION_UPDATE_RESPONSE,
+            "unchanged set must not send an update"
+        );
+
+        // Disconnect with unsent desired state, then establish a fresh session.
+        m.set_session_addresses(aid, addresses(6)).await.unwrap();
+        assert_eq!(read(&mut a).await.message_type, M::SESSION_UPDATE);
+        m.set_session_addresses(aid, addresses(7)).await.unwrap();
+        drop(a);
+        event(
+            &mut events,
+            |e| matches!(e, DaemonEvent::SessionDown { session_id, .. } if *session_id == aid),
+        )
+        .await;
+        assert!(!m.state().borrow().sessions.contains_key(&aid));
+        assert!(matches!(
+            m.set_session_addresses(aid, addresses(8)).await,
+            Err(DaemonError::NoMatchingSession)
+        ));
+        let (mut fresh, fresh_id) = peer(&m, &mut events).await;
+        assert_ne!(fresh_id, aid);
+        assert!(
+            m.state().borrow().sessions[&fresh_id]
+                .local_addresses
+                .is_empty()
+        );
+        send(&mut fresh, Message::new(M::SESSION_UPDATE)).await;
+        assert_eq!(
+            read(&mut fresh).await.message_type,
+            M::SESSION_UPDATE_RESPONSE
+        );
+        drop((fresh, b));
+        m.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn large_desired_session_addresses_converge_through_acknowledged_updates() {
+    use dlep_daemon::{RouterConfig, RouterDaemon};
+    let addresses = |prefix, count| DestinationAddrs {
+        v6: (1..=count)
+            .map(|n| format!("2001:db8:{prefix:x}::{n:x}").parse().unwrap())
+            .collect(),
+        ..Default::default()
+    };
+    for ip in ["127.0.0.1", "::1"] {
+        let m = modem_on(ip, MacAddressFormat::Eui48).await;
+        let mut config = RouterConfig::default();
+        config.shared.network.use_tls = false;
+        let r = RouterDaemon::builder()
+            .config(config)
+            .spawn()
+            .await
+            .unwrap();
+        let mut events = m.subscribe();
+        r.connect_static(m.local_addr()).await.unwrap();
+        let DaemonEvent::SessionUp { session_id, .. } =
+            event(&mut events, |e| matches!(e, DaemonEvent::SessionUp { .. })).await
+        else {
+            unreachable!()
+        };
+        let mut state = r.state();
+        for desired in [
+            addresses(1, 3120),
+            addresses(2, 3120),
+            DestinationAddrs::default(),
+        ] {
+            m.set_session_addresses(session_id, desired.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                m.state().borrow().sessions[&session_id].local_addresses,
+                desired
+            );
+            timeout(WAIT, async {
+                loop {
+                    if state
+                        .borrow_and_update()
+                        .sessions
+                        .values()
+                        .any(|s| s.peer_addresses == desired)
+                    {
+                        break;
+                    }
+                    state.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                m.set_session_addresses(session_id, addresses(3, 3121))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                m.state().borrow().sessions[&session_id].local_addresses,
+                desired
+            );
+        }
+        assert_eq!(state.borrow().sessions.len(), 1);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, DaemonEvent::SessionDown { .. }));
+        }
+        r.shutdown().await.unwrap();
+        m.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn queued_session_metrics_preserve_later_reports_on_the_original_session() {
     use dlep_fsm::session_common::{build_session_update_response, extract_link_metrics};
     for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {

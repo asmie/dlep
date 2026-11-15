@@ -37,6 +37,12 @@ pub enum SessionCommand {
         session_id: dlep_ext::SessionId,
         changes: dlep_fsm::AddressChanges,
     },
+    /// Modem-side: retain the latest desired local address set and reconcile
+    /// it after the current session transaction, splitting large replacements.
+    SetSessionAddresses {
+        session_id: dlep_ext::SessionId,
+        addresses: DestinationAddrs,
+    },
     /// Modem-side: drop a destination at the peer router.
     DropDestination { mac: MacAddress, reason: StatusCode },
     /// Router-side: withdraw interest in a destination on one session only.
@@ -95,6 +101,7 @@ impl SessionCommand {
         match self {
             Self::DropDestinationForSession { session_id, .. }
             | Self::UpdateSessionAddresses { session_id, .. }
+            | Self::SetSessionAddresses { session_id, .. }
             | Self::RequestLinkCharacteristics { session_id, .. } => Some(*session_id),
             _ => None,
         }

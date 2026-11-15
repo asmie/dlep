@@ -281,6 +281,33 @@ after reconnecting. Router adapter snapshots contain remote modem addresses;
 radio `session_sync` snapshots contain remote router addresses and refresh when
 those addresses change.
 
+For modem applications maintaining a complete desired address set,
+`set_session_addresses(session_id, addresses)` accepts a replacement even while
+the session transaction is busy. Omitted addresses are removed, and an empty set
+clears all local addresses. Only the latest desired set is retained; repeating
+unchanged state sends nothing. `validate_session_addresses(&addresses)` checks
+uniqueness, canonical subnet identity, and the size limit before an application
+caches state for replay, including when no routers are connected. Each desired
+set must fit one address-only Session Update when advertised from empty.
+
+Replacing one large set with another can require multiple Session Updates.
+Removals precede additions, each message waits for its own reply, and subsequent
+messages are recomputed from the latest desired set. Queued session metrics
+share available space in the next update, with destination corrections retaining
+later reports and link grants. A new replacement supersedes unsent changes.
+Nonfatal refusals preserve local state; fatal replies or session termination
+stop delivery. Completion notices still correspond to wire replies, so one
+replacement can produce several notices or none. This API applies to one
+existing session; applications must replay desired state to new sessions.
+
+Library `SessionSnapshot.local_addresses` exposes effective desired local
+addresses, including queued modem replacements. It does not confirm peer
+acceptance. `peer_addresses` continues to describe the remote peer; adapter
+snapshots retain their existing remote-address meaning. The added snapshot
+field and `SessionCommand::SetSessionAddresses` /
+`FsmEvent::AppSetSessionAddresses` variants require updating exhaustive Rust
+struct literals or matches.
+
 Embedders retaining destinations for replay can use
 `ModemDaemon::validate_destination_snapshot(id, &metrics, &addresses)` before
 caching a complete snapshot. Supply effective metrics, including supported
@@ -295,8 +322,9 @@ Response addresses are retained. `DestinationEvent::Announced` now also carries
 `requested_addresses`; existing exhaustive patterns need that field or `..`.
 Address-only updates preserve metrics. Destination changes made before Up is
 acknowledged are coalesced; changes made while a router has withdrawn interest
-are retained for a later Announce. Session address commands return an explicit
-Busy error when another session transaction is in progress.
+are retained for a later Announce. The delta-based `update_session_addresses`
+method returns an explicit Busy error when another session transaction is in
+progress; the modem's complete-set `set_session_addresses` method coalesces.
 
 Large effective destination address changes are sent in multiple Destination
 Update messages when necessary. Each carries the destination MAC; removals precede

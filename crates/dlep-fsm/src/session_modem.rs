@@ -39,6 +39,8 @@ pub struct ModemSessionFsm {
     pub destinations: HashMap<MacAddress, DestinationState>,
     pub peer_addresses: DestinationAddrs,
     local_addresses: DestinationAddrs,
+    /// Latest desired replacement; local_addresses tracks what we have sent.
+    pending_session_addresses: Option<DestinationAddrs>,
     session_metrics: LinkMetrics,
     /// Accepted changes waiting for the current session transaction's response.
     pending_session_metrics: Option<LinkMetrics>,
@@ -91,6 +93,7 @@ impl ModemSessionFsm {
             destinations: HashMap::new(),
             peer_addresses: DestinationAddrs::default(),
             local_addresses: DestinationAddrs::default(),
+            pending_session_addresses: None,
             session_metrics: config.initial_metrics,
             pending_session_metrics: None,
             config,
@@ -112,6 +115,14 @@ impl ModemSessionFsm {
     /// Effective local session metrics, including accepted application updates.
     pub fn session_metrics(&self) -> LinkMetrics {
         self.session_metrics
+    }
+
+    /// Desired local addresses, including an accepted replacement awaiting
+    /// delivery. A nonfatal peer refusal does not roll back these values.
+    pub fn local_addresses(&self) -> &DestinationAddrs {
+        self.pending_session_addresses
+            .as_ref()
+            .unwrap_or(&self.local_addresses)
     }
 
     /// Whether a Link Characteristics Request for `mac` awaits an answer.
@@ -554,9 +565,8 @@ impl ModemSessionFsm {
                     status,
                     text,
                 })];
-                if let Some(metrics) = self.pending_session_metrics.take() {
-                    actions.extend(self.send_session_metrics(metrics));
-                }
+                let metrics = self.pending_session_metrics.take();
+                actions.extend(self.send_session_update(metrics));
                 actions.extend(heartbeat_reset_action(
                     TIMER_HEARTBEAT_MISSED,
                     self.peer_heartbeat_interval,
@@ -671,6 +681,14 @@ impl ModemSessionFsm {
                     changes,
                 )
             }
+            (ModemSessionState::InSession, FsmEvent::AppSetSessionAddresses { addresses }) => {
+                self.pending_session_addresses = Some(addresses.canonical());
+                if self.tx.session_busy() {
+                    Vec::new()
+                } else {
+                    self.send_session_update(None)
+                }
+            }
             // Negotiated extension traffic also keeps the session alive.
             (ModemSessionState::InSession, FsmEvent::RecvExtensionMessage) => {
                 heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
@@ -720,7 +738,7 @@ impl ModemSessionFsm {
                     }
                     Vec::new()
                 } else {
-                    self.send_session_metrics(metrics)
+                    self.send_session_update(Some(metrics))
                 }
             }
             (ModemSessionState::InSession, FsmEvent::AppSessionDefaults { metrics }) => {
@@ -730,7 +748,7 @@ impl ModemSessionFsm {
                     &build_session_update(&metrics),
                     &mut self.session_metrics,
                 );
-                self.send_session_metrics(metrics)
+                self.send_session_update(Some(metrics))
             }
             (ModemSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
                 self.termination_reason = reason;
@@ -799,34 +817,69 @@ impl ModemSessionFsm {
         }
     }
 
-    /// Send accepted session metrics without reapplying them over destination
-    /// changes accepted since they were queued. Corrections follow in the same
-    /// action batch; pending Up and withdrawn destinations retain local values.
-    fn send_session_metrics(&mut self, metrics: LinkMetrics) -> Vec<FsmAction> {
+    /// Send pending metrics and one fitting prefix of the effective address
+    /// changes. Recompute from the latest desired set after each response;
+    /// never keep an obsolete list of wire messages. Metrics share the first
+    /// update with addresses, so neither queue can starve the other.
+    fn send_session_update(&mut self, metrics: Option<LinkMetrics>) -> Vec<FsmAction> {
         use crate::transaction::RequestKind;
+        let metric_update = metrics.as_ref().map(build_session_update);
+        let mut message = metric_update
+            .clone()
+            .unwrap_or_else(|| Message::new(MessageType::SESSION_UPDATE));
+        if let Some(desired) = &self.pending_session_addresses {
+            let changes = AddressChanges::between(&self.local_addresses, desired);
+            let mut size = message.encode().expect("validated metrics").len() - 4;
+            let mut encoded_item = bytes::BytesMut::new();
+            for item in changes
+                .append_to(Message::new(MessageType::SESSION_UPDATE))
+                .data_items
+            {
+                encoded_item.clear();
+                item.encode(&mut encoded_item)
+                    .expect("fixed-size address item encodes");
+                if size + encoded_item.len() > usize::from(u16::MAX) {
+                    break;
+                }
+                size += encoded_item.len();
+                message.data_items.push(item);
+            }
+            // Local advertised state advances when sent, including on later
+            // refusal. Removals precede additions within each computed delta.
+            AddressChanges::from_message(&message).apply_lenient(&mut self.local_addresses);
+            if AddressChanges::between(&self.local_addresses, desired).is_empty() {
+                self.pending_session_addresses = None;
+            }
+        }
+        if message.data_items.is_empty() {
+            return Vec::new();
+        }
         self.tx
             .open_session(RequestKind::SessionUpdate)
             .expect("idle session");
-        let message = build_session_update(&metrics);
         let mut corrections = Vec::new();
-        for (&mac, destination) in &mut self.destinations {
-            let mut overwritten = destination.metrics;
-            crate::session_common::merge_link_metrics(&message, &mut overwritten);
-            if overwritten == destination.metrics {
-                continue;
-            }
-            if self
-                .tx
-                .per_destination
-                .get(&mac)
-                .is_some_and(|pending| pending.kind == RequestKind::DestinationUp)
-            {
-                destination.pending_metrics = true;
-            } else if destination.announced && !self.tx.destination_busy(&mac) {
-                corrections.push(FsmAction::SendMessage(build_destination_update(
-                    mac,
-                    &destination.metrics,
-                )));
+        // Do not reapply queued metrics over later destination changes.
+        // Address-only messages have no effect on destination metrics.
+        if let Some(metric_update) = metric_update {
+            for (&mac, destination) in &mut self.destinations {
+                let mut overwritten = destination.metrics;
+                crate::session_common::merge_link_metrics(&metric_update, &mut overwritten);
+                if overwritten == destination.metrics {
+                    continue;
+                }
+                if self
+                    .tx
+                    .per_destination
+                    .get(&mac)
+                    .is_some_and(|pending| pending.kind == RequestKind::DestinationUp)
+                {
+                    destination.pending_metrics = true;
+                } else if destination.announced && !self.tx.destination_busy(&mac) {
+                    corrections.push(FsmAction::SendMessage(build_destination_update(
+                        mac,
+                        &destination.metrics,
+                    )));
+                }
             }
         }
         let mut actions = vec![FsmAction::SendMessage(message)];
@@ -876,7 +929,11 @@ impl ModemSessionFsm {
                     return Err(E::Busy);
                 }
             }
-        } else if self.tx.session_busy() && !matches!(event, FsmEvent::AppQueueSessionUpdate { .. })
+        } else if self.tx.session_busy()
+            && !matches!(
+                event,
+                FsmEvent::AppQueueSessionUpdate { .. } | FsmEvent::AppSetSessionAddresses { .. }
+            )
         {
             return Err(E::Busy);
         }
@@ -963,6 +1020,18 @@ impl ModemSessionFsm {
                 crate::session_common::validate_local_address_update(
                     &self.local_addresses,
                     changes,
+                )?;
+            }
+            FsmEvent::AppSetSessionAddresses { addresses } => {
+                // Bound each retained desired set independently of connection
+                // state. A replacement's combined removes/adds can be larger;
+                // send_session_update splits those across transactions.
+                crate::session_common::validate_local_address_update(
+                    &DestinationAddrs::default(),
+                    &AddressChanges {
+                        added: addresses.clone(),
+                        removed: Default::default(),
+                    },
                 )?;
             }
             _ => return Err(E::Unsupported),

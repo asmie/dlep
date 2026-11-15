@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use dlep_core::StatusCode;
 use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
+use dlep_fsm::DestinationAddrs;
 use dlep_fsm::session_modem::ModemSessionFsm;
 use dlep_net::{Acceptor, ServerConfig};
 use tokio::net::TcpSocket;
@@ -162,6 +163,38 @@ impl ModemDaemon {
             changes: changes.canonical(),
         })
         .await
+    }
+
+    /// Replace desired local addresses on one established session. While busy,
+    /// retain only the latest set; delivery resumes after the peer's response.
+    /// Large replacements span acknowledged Session Updates, removals first.
+    /// Acceptance is local, not peer confirmation; state() includes the desired
+    /// set immediately. Refusals do not roll back state, and ended sessions
+    /// discard queued work. New sessions require a new call.
+    pub async fn set_session_addresses(
+        &self,
+        session_id: dlep_ext::SessionId,
+        addresses: DestinationAddrs,
+    ) -> Result<(), DaemonError> {
+        self.validate_session_addresses(&addresses)?;
+        self.fanout(SessionCommand::SetSessionAddresses {
+            session_id,
+            addresses: addresses.canonical(),
+        })
+        .await
+    }
+
+    /// Validate a complete desired address set before retaining it for replay,
+    /// even without connected peers. Requires unique addresses/networks and a
+    /// set that fits one address-only Session Update when advertised from empty.
+    pub fn validate_session_addresses(
+        &self,
+        addresses: &DestinationAddrs,
+    ) -> Result<(), DaemonError> {
+        crate::runtime::validate_address_changes(&dlep_fsm::AddressChanges {
+            added: addresses.clone(),
+            removed: Default::default(),
+        })
     }
 
     /// Validate metric declarations and wire encoding without sending an update.

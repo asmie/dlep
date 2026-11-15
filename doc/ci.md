@@ -259,6 +259,13 @@ stale sessions, and nonfatal refusal without rollback. The real router binary
 and Python adapter add, replace, and remove IPv4/IPv6 addresses and attached
 subnets, checking canonical subnets, peer state, completion notices, no-op
 acceptance, and unchanged remote snapshots.
+Desired modem address tests exercise complete-set replacements while busy,
+coalescing and cancellation, canonical subnets, duplicate/oversized rejection,
+and near-limit replacements split across acknowledged Session Updates. Combined
+metric/address updates must preserve later destination changes and publish
+completion before the next send. IPv4/IPv6 runtime tests check immediate desired
+state in snapshots, independent router sessions, stale IDs, raw-command
+validation, no-op delivery, large-set convergence, and cleanup on reconnect.
 Destination Down completion tests require removal before completion and preserve
 status text on both roles. Router `Down` events precede completion; modem replies
 must not masquerade as router withdrawals. Invalid replies emit no completion.
