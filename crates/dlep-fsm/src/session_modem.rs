@@ -40,6 +40,8 @@ pub struct ModemSessionFsm {
     pub peer_addresses: DestinationAddrs,
     local_addresses: DestinationAddrs,
     session_metrics: LinkMetrics,
+    /// Accepted changes waiting for the current session transaction's response.
+    pending_session_metrics: Option<LinkMetrics>,
     config: SessionConfig,
     termination_reason: StatusCode,
     /// Peer's announced heartbeat interval, captured from the Heartbeat
@@ -90,6 +92,7 @@ impl ModemSessionFsm {
             peer_addresses: DestinationAddrs::default(),
             local_addresses: DestinationAddrs::default(),
             session_metrics: config.initial_metrics,
+            pending_session_metrics: None,
             config,
             termination_reason: StatusCode::SUCCESS,
             peer_heartbeat_interval: None,
@@ -513,9 +516,15 @@ impl ModemSessionFsm {
                 if msg.message_type == MessageType::SESSION_UPDATE_RESPONSE =>
             {
                 self.tx.close_session();
-                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
-                    .into_iter()
-                    .collect()
+                let mut actions = self
+                    .pending_session_metrics
+                    .take()
+                    .map_or_else(Vec::new, |metrics| self.send_session_metrics(metrics));
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
             }
             // Announce succeeds only when the modem has destination data.
             // Retained destinations declined earlier by this router can be
@@ -654,19 +663,28 @@ impl ModemSessionFsm {
             // InSession: app pushes session-wide metric changes to the router
             // (RFC 8175 §12.7). Occupies the single session-level
             // transaction slot until the Response arrives.
-            (ModemSessionState::InSession, FsmEvent::AppSessionUpdate { metrics }) => {
-                use crate::transaction::RequestKind;
-                self.tx
-                    .open_session(RequestKind::SessionUpdate)
-                    .expect("checked idle session");
-                // Subsequent Link Characteristics Responses must report the
-                // same effective metrics we just advertised for every link.
+            (
+                ModemSessionState::InSession,
+                FsmEvent::AppSessionUpdate { metrics }
+                | FsmEvent::AppQueueSessionUpdate { metrics },
+            ) => {
+                // Apply accepted values now so subsequent destination changes
+                // and link replies build on them, even while delivery waits.
                 let message = build_session_update(&metrics);
                 crate::session_common::merge_link_metrics(&message, &mut self.session_metrics);
                 for destination in self.destinations.values_mut() {
                     crate::session_common::merge_link_metrics(&message, &mut destination.metrics);
                 }
-                vec![FsmAction::SendMessage(message)]
+                if self.tx.session_busy() {
+                    if let Some(pending) = &mut self.pending_session_metrics {
+                        crate::session_common::merge_link_metrics(&message, pending);
+                    } else {
+                        self.pending_session_metrics = Some(metrics);
+                    }
+                    Vec::new()
+                } else {
+                    self.send_session_metrics(metrics)
+                }
             }
             (ModemSessionState::InSession, FsmEvent::AppShutdown { reason }) => {
                 self.termination_reason = reason;
@@ -735,6 +753,41 @@ impl ModemSessionFsm {
         }
     }
 
+    /// Send accepted session metrics without reapplying them over destination
+    /// changes accepted since they were queued. Corrections follow in the same
+    /// action batch; pending Up and withdrawn destinations retain local values.
+    fn send_session_metrics(&mut self, metrics: LinkMetrics) -> Vec<FsmAction> {
+        use crate::transaction::RequestKind;
+        self.tx
+            .open_session(RequestKind::SessionUpdate)
+            .expect("idle session");
+        let message = build_session_update(&metrics);
+        let mut corrections = Vec::new();
+        for (&mac, destination) in &mut self.destinations {
+            let mut overwritten = destination.metrics;
+            crate::session_common::merge_link_metrics(&message, &mut overwritten);
+            if overwritten == destination.metrics {
+                continue;
+            }
+            if self
+                .tx
+                .per_destination
+                .get(&mac)
+                .is_some_and(|pending| pending.kind == RequestKind::DestinationUp)
+            {
+                destination.pending_metrics = true;
+            } else if destination.announced && !self.tx.destination_busy(&mac) {
+                corrections.push(FsmAction::SendMessage(build_destination_update(
+                    mac,
+                    &destination.metrics,
+                )));
+            }
+        }
+        let mut actions = vec![FsmAction::SendMessage(message)];
+        actions.extend(corrections);
+        actions
+    }
+
     fn valid_metrics(&self, metrics: &LinkMetrics) -> bool {
         metrics.supported_by(&self.config.initial_metrics)
             && build_session_update(metrics).encode().is_ok()
@@ -777,7 +830,8 @@ impl ModemSessionFsm {
                     return Err(E::Busy);
                 }
             }
-        } else if self.tx.session_busy() {
+        } else if self.tx.session_busy() && !matches!(event, FsmEvent::AppQueueSessionUpdate { .. })
+        {
             return Err(E::Busy);
         }
         match event {
@@ -829,7 +883,8 @@ impl ModemSessionFsm {
                     .encode()
                     .map_err(|_| E::InvalidInput)?;
             }
-            FsmEvent::AppSessionUpdate { metrics } => {
+            FsmEvent::AppSessionUpdate { metrics }
+            | FsmEvent::AppQueueSessionUpdate { metrics } => {
                 if !self.valid_metrics(metrics) {
                     return Err(E::InvalidInput);
                 }

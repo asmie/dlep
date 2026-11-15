@@ -935,6 +935,8 @@ The order of work was:
     accepted portion of a broadcast; targeted retries leave other sessions alone.
     This prevents a stale duplicate Session Update from overwriting destination
     metrics reported after a newer successful Session Update.
+    Item 44 subsequently moves live session metric coalescing into the FSM;
+    destination and initial replay retries remain in the bridge.
 
     Physical withdrawal cancels deferred re-adds. A Down already awaiting its
     response, or acknowledged before retry bookkeeping, does not create another
@@ -1008,6 +1010,19 @@ The order of work was:
     cover exact limits and one-byte overflow, inherited optional metrics, UTF-8
     byte lengths, both MAC formats, and real IPv4/IPv6 adapter pipelines with
     unchanged replay followed by a valid grant on the original session.
+
+44. Ordered coalescing of session metrics. **Done** — radio session reports use
+    `ModemDaemon::queue_session_metrics`, which retains one pending metric set
+    inside each busy session. Accepted changes immediately update effective
+    local state, so later destination reports and link answers build on them.
+    When the outstanding transaction completes, the session sends the combined
+    defaults followed by corrections for later destination changes in one action
+    batch. This replaces bridge retries that could overwrite newer values.
+    Pending Up corrections wait for acknowledgement, withdrawn destinations
+    remain withdrawn, and shutdown cannot flush queued metrics. The immediate
+    update API retains its Busy behavior. Tests cover hundreds of reports,
+    optional omissions, grants, lifecycle ordering, separate router progress,
+    replay, and both MAC formats over IPv4/IPv6.
 
 ---
 

@@ -161,9 +161,13 @@ all queued notices and complete a pending link request on the original session.
 Radio bridge unit tests separately exercise bounded requests, cancellation,
 partial writes, and the output deadline using virtual time.
 They also hold protocol acknowledgements while sending hundreds of radio reports
-to check retry coalescing and latest-value convergence. Further cases cover
-partial acceptance across routers, stale retries overwriting later destination
-values, and repeated destination flaps during withdrawal acknowledgement.
+to check session metric coalescing and latest-value convergence. Queued metrics
+must preserve later destination reports, optional values, and link answers;
+pending Up, pending Down, withdrawal, and shutdown have dedicated FSM cases.
+Runtime tests check effective retained values before delivery and ordered wire
+corrections over IPv4/IPv6 with both MAC formats. Further bridge cases cover
+independent progress across routers, replay to a later router, and repeated
+destination flaps during withdrawal acknowledgement.
 Replacement regressions hold a link request across physical Down/Up and then
 grant it: the old transaction must complete without changing the replacement's
 cache. Bridge tests cover requests already delivered and requests still queued;

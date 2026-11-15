@@ -585,7 +585,6 @@ enum Retry {
     InitializeSession,
     Add(MacAddress),
     Drop(MacAddress),
-    SessionMetrics,
 }
 
 struct Known {
@@ -733,7 +732,7 @@ impl Bridge<'_> {
             }
             Inbound::SessionMetrics { metrics } => {
                 let metrics = metrics.overlay(self.session_metrics);
-                let result = self.daemon.update_session_metrics(metrics).await;
+                let result = self.daemon.queue_session_metrics(metrics).await;
                 if self.accepted("session metrics", &result) {
                     self.session_metrics = metrics;
                     // Session Update carries all mandatory metrics and every
@@ -742,7 +741,6 @@ impl Bridge<'_> {
                     for known in self.destinations.values_mut() {
                         known.metrics = update.overlay(known.metrics);
                     }
-                    self.update_retries(&result, Retry::SessionMetrics, None);
                 }
             }
             Inbound::LinkResponse {
@@ -1052,9 +1050,6 @@ impl Bridge<'_> {
                 Retry::Drop(mac) => SessionCommand::DropDestination {
                     mac,
                     reason: StatusCode::SUCCESS,
-                },
-                Retry::SessionMetrics => SessionCommand::SessionUpdate {
-                    metrics: self.session_metrics,
                 },
             };
             let result = self.daemon.send_command_to(session_id, command).await;
@@ -2013,73 +2008,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_metric_reports_coalesce_into_one_retry_with_the_latest_values() {
-        let daemon = modem().await;
-        let mut events = daemon.subscribe();
-        let mut bridge = bridge(&daemon);
-        let mut peer = session(&daemon, &mut events).await;
-        bridge
-            .inbound(Inbound::SessionMetrics {
-                metrics: Metrics {
-                    latency_us: Some(100),
-                    ..Default::default()
-                },
-            })
-            .await;
-        assert_eq!(
-            read(&mut peer).await.message_type,
-            MessageType::SESSION_UPDATE
-        );
-        // Keep the first transaction open while reports continue arriving.
-        let mut first_deadline = None;
-        for latency in 101..=612 {
-            bridge
-                .inbound(Inbound::SessionMetrics {
-                    metrics: Metrics {
-                        latency_us: Some(latency),
-                        ..Default::default()
-                    },
-                })
-                .await;
-            first_deadline.get_or_insert(*bridge.retries.values().next().unwrap());
-        }
-        assert_eq!(
-            bridge.retries.len(),
-            1,
-            "reports must not accumulate retry work"
-        );
-        assert_eq!(
-            bridge.retries.values().next().copied(),
-            first_deadline,
-            "new reports must not postpone the first retry"
-        );
-        send(
-            &mut peer,
-            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
-        )
-        .await;
-        flush_peer(&mut peer).await;
-        fire_retries(&mut bridge);
-        bridge.retry().await;
-        let update = read(&mut peer).await;
-        assert_eq!(update.message_type, MessageType::SESSION_UPDATE);
-        assert_eq!(
-            extract_link_metrics(&update).unwrap().latency,
-            Duration::from_micros(612)
-        );
-        assert!(bridge.retries.is_empty());
-        send(
-            &mut peer,
-            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
-        )
-        .await;
-        flush_peer(&mut peer).await;
-        drop(peer);
-        daemon.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn accepted_metric_report_cancels_retries_before_a_later_destination_override() {
+    async fn deferred_session_metrics_preserve_a_later_destination_report() {
         let daemon = modem().await;
         let mut events = daemon.subscribe();
         let mut bridge = bridge(&daemon);
@@ -2109,14 +2038,168 @@ mod tests {
             read(&mut peer).await.message_type,
             MessageType::SESSION_UPDATE
         );
-        assert_eq!(bridge.retries.len(), 1);
+        bridge
+            .inbound(Inbound::DestinationUpdate {
+                mac: Mac(mac()),
+                metrics: Metrics {
+                    latency_us: Some(999),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UPDATE
+        );
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        let correction = read(&mut peer).await;
+        assert_eq!(correction.message_type, MessageType::DESTINATION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&correction).unwrap().latency,
+            Duration::from_micros(999)
+        );
+        let snapshot = daemon.state().borrow().clone();
+        let state = snapshot.sessions.values().next().unwrap();
+        assert_eq!(state.metrics.latency, Duration::from_micros(200));
+        assert_eq!(
+            state.destinations[&mac().into()].metrics.latency,
+            Duration::from_micros(999)
+        );
+        assert_eq!(
+            bridge.destinations[&mac()].metrics,
+            state.destinations[&mac().into()].metrics
+        );
         send(
             &mut peer,
             dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
         )
         .await;
         flush_peer(&mut peer).await;
-        // A new report succeeds before the deferred retry runs.
+        let mut late = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        assert_eq!(
+            read(&mut late).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        let replay = read(&mut late).await;
+        assert_eq!(replay.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&replay),
+            Some(bridge.destinations[&mac()].metrics)
+        );
+        drop((peer, late));
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_metric_reports_coalesce_into_one_pending_update_with_the_latest_values() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(100),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        // Keep the first transaction open while reports continue arriving.
+        for latency in 101..=612 {
+            bridge
+                .inbound(Inbound::SessionMetrics {
+                    metrics: Metrics {
+                        latency_us: Some(latency),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        assert!(bridge.retries.is_empty(), "session owns coalesced metrics");
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        let update = read(&mut peer).await;
+        assert_eq!(update.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&update).unwrap().latency,
+            Duration::from_micros(612)
+        );
+        assert!(bridge.retries.is_empty());
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        drop(peer);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_metric_queue_does_not_overwrite_later_destination_reports() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+        bridge.inbound(up(Metrics::default())).await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        for latency in [100, 200] {
+            bridge
+                .inbound(Inbound::SessionMetrics {
+                    metrics: Metrics {
+                        latency_us: Some(latency),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        assert!(bridge.retries.is_empty());
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        // Once the queue drains, a new report starts its own transaction.
         bridge
             .inbound(Inbound::SessionMetrics {
                 metrics: Metrics {
@@ -2166,7 +2249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_metric_acceptance_preserves_only_the_busy_sessions_retry() {
+    async fn queued_metric_reports_preserve_each_sessions_later_values() {
         let daemon = modem().await;
         let mut events = daemon.subscribe();
         let mut bridge = bridge(&daemon);
@@ -2206,7 +2289,13 @@ mod tests {
         for peer in [&mut a, &mut b] {
             assert_eq!(read(peer).await.message_type, MessageType::SESSION_UPDATE);
         }
-        assert_eq!(bridge.retries.len(), 2);
+        assert!(bridge.retries.is_empty());
+        send(
+            &mut b,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        assert_eq!(read(&mut b).await.message_type, MessageType::SESSION_UPDATE);
         send(
             &mut b,
             dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
@@ -2228,12 +2317,9 @@ mod tests {
         )
         .await;
         flush_peer(&mut b).await;
-        assert_eq!(
-            bridge.retries.keys().copied().collect::<Vec<_>>(),
-            [(aid, Retry::SessionMetrics)]
-        );
-        // Session-specific values on the healthy router must survive retries
-        // needed only by the other router.
+        assert!(bridge.retries.is_empty());
+        // Session-specific values on the healthy router must survive a queued
+        // update needed only by the other router.
         let mut metrics = bridge.destinations[&mac()].metrics;
         metrics.latency = Duration::from_micros(999);
         daemon
@@ -2255,13 +2341,14 @@ mod tests {
             dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
         )
         .await;
-        flush_peer(&mut a).await;
-        fire_retries(&mut bridge);
-        bridge.retry().await;
         let update = read(&mut a).await;
         assert_eq!(update.message_type, MessageType::SESSION_UPDATE);
         assert_eq!(
             extract_link_metrics(&update).unwrap().latency,
+            Duration::from_micros(300)
+        );
+        assert_eq!(
+            daemon.state().borrow().sessions[&aid].metrics.latency,
             Duration::from_micros(300)
         );
         send(

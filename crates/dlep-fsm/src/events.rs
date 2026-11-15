@@ -69,6 +69,11 @@ pub enum FsmEvent {
     AppSessionUpdate {
         metrics: LinkMetrics,
     },
+    /// Like AppSessionUpdate, but retain/coalesce changes while the session
+    /// transaction is busy. Later destination changes keep their ordering.
+    AppQueueSessionUpdate {
+        metrics: LinkMetrics,
+    },
     AppRequestLinkCharacteristics {
         mac: MacAddress,
         requested: LinkCharacteristics,

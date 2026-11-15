@@ -43,7 +43,8 @@ pub enum DestinationPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DestinationSnapshot {
     pub phase: DestinationPhase,
-    /// Effective local values, including changes awaiting acknowledgement.
+    /// Effective local values, including queued changes awaiting delivery or
+    /// acknowledgement.
     pub metrics: LinkMetrics,
     pub addresses: DestinationAddrs,
 }
@@ -54,6 +55,7 @@ pub struct SessionSnapshot {
     pub negotiated_extensions: Vec<ExtensionId>,
     pub phase: SessionPhase,
     /// Effective modem metrics (received on routers, local on modems).
+    /// Modem values include accepted queued updates awaiting wire delivery.
     pub metrics: LinkMetrics,
     /// Addresses advertised by the remote peer, not this daemon's addresses.
     pub peer_addresses: DestinationAddrs,

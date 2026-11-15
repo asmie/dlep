@@ -47,6 +47,9 @@ pub enum SessionCommand {
     /// Modem side: push session-wide metric changes via a Session Update
     /// Message (RFC 8175 §12.7).
     SessionUpdate { metrics: LinkMetrics },
+    /// Modem side: retain/coalesce session metrics when a session transaction
+    /// is busy, preserving subsequent destination changes when sent.
+    QueueSessionUpdate { metrics: LinkMetrics },
     /// Router-side: declare interest in a destination the modem has not
     /// reported, via Destination Announce (RFC 8175 §12.13).
     AnnounceDestination { mac: MacAddress },

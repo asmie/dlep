@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Radio session metrics coalesce inside each session while its transaction is
+  busy. Later destination reports and link answers survive delivery of the queued
+  defaults, preventing deferred updates from restoring stale values. Retained
+  modem state includes accepted queued metrics before wire delivery.
+  `ModemDaemon::queue_session_metrics` exposes this behavior; the immediate
+  `update_session_metrics` API still returns Busy. New `QueueSessionUpdate` and
+  `AppQueueSessionUpdate` enum variants require exhaustive matches to be updated.
 - Radio link replies validate their complete wire size, including status text
   and inherited metrics, before changing the replay cache. Oversized replies
   become Request Denied with unchanged metrics, so later routers cannot receive

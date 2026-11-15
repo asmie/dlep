@@ -232,6 +232,14 @@ rejects attempts to introduce undeclared metrics, and the router terminates a
 peer that sends them. Session metric updates apply supplied values to all
 existing destinations and the defaults for future destinations in that session.
 
+`ModemDaemon::queue_session_metrics` accepts and coalesces updates while the
+session transaction is busy. Retained modem state includes the queued values
+immediately. Once the preceding response arrives, the modem sends the combined
+Session Update and any Destination Updates needed to preserve later destination
+reports or link answers. Routers may observe the defaults before those corrections.
+The radio adapter uses this path; `update_session_metrics` still returns Busy
+when a session transaction is pending.
+
 Layer 3 changes use `AddressChanges { added, removed }`; each side contains a
 `DestinationAddrs` set with IPv4/IPv6 addresses and attached subnets.
 `ModemDaemon::add_destination_with_addresses` supplies the initial destination
@@ -323,15 +331,16 @@ configured and denies requests otherwise. Either way, the modem application rece
 `DestinationEvent::LinkCharacteristicsRequested` for each request.
 
 Command methods now await local acceptance by the session task. `Ok(())` means
-the command was applied, sent, or retained as a pending Up update; peer responses
-still arrive as protocol events. `DaemonError::CommandRejected(report)` contains
+the command was applied, sent, or retained as a pending Up or queued session
+metric update; peer responses still arrive as protocol events.
+`DaemonError::CommandRejected(report)` contains
 accepted session IDs and per-session rejections (`Busy`, `NotReady`,
 `UnknownDestination`, `AlreadyExists`, `Unsupported`, or `InvalidInput`).
 `NoMatchingSession` covers stale IDs and an empty session list. FSM rejections
 also produce `DaemonEvent::CommandRejected` with the command kind, destination,
 and peer/session context.
 
-Busy commands are not queued or replayed. Retry after the outstanding response,
+Commands rejected as Busy are not queued or replayed. Retry after the outstanding response,
 using application-controlled backoff when no completion event is available.
 Broadcasts can partially succeed: inspect the report and use
 `send_command_to(session_id, SessionCommand::...)` on either daemon to retry

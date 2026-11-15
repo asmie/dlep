@@ -106,12 +106,21 @@ event subscriber falls behind. It retries busy session initialization, preserves
 existing per-session destination metrics, and respects a router's withdrawal.
 Closed sessions release pending adapter requests and command retries.
 
-Busy operations share one retry per session and operation (and MAC for a
-destination operation), using the latest cached values. Further reports keep
-the first retry deadline instead of postponing it. A later accepted command
-cancels that operation's retry only for the sessions that accepted it; other
-busy sessions keep their work. Retry storage therefore follows distinct pending
-work, not the number of radio reports.
+Busy destination operations and initial session replay share one retry per
+session and operation (and MAC for a destination operation), using the latest
+cached values. Further reports keep the first retry deadline instead of
+postponing it. A later accepted command cancels that operation's retry only for
+the sessions that accepted it; other busy sessions keep their work.
+
+`session_metrics` instead coalesces inside each session into one pending update
+while a session transaction is busy. Accepted values immediately update the
+modem's retained state and become the basis for later reports and link answers.
+The latest combined update is sent when the preceding response arrives, followed
+by Destination Updates that preserve later destination changes. Receivers may
+briefly observe the defaults before those corrections. Pending Up destinations
+receive corrections after their Up response; withdrawn destinations retain their
+local values without being re-announced. Queue storage is bounded to one metric
+set per session, regardless of the number of reports.
 
 Omitted fields build on the modem's current view: a new destination starts
 from the session-wide metrics, and `session_metrics` also updates every known

@@ -116,6 +116,111 @@ async fn ack_up(peer: &mut TcpStream) {
 }
 
 #[tokio::test]
+async fn queued_session_metrics_preserve_later_reports_on_the_original_session() {
+    use dlep_fsm::session_common::{build_session_update_response, extract_link_metrics};
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        for ip in ["127.0.0.1", "::1"] {
+            let destination = DestinationId::from(match format {
+                MacAddressFormat::Eui48 => id().0,
+                MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+            });
+            let m = modem_on(ip, format).await;
+            let mut events = m.subscribe();
+            let (mut peer, sid) = peer(&m, &mut events).await;
+            m.add_destination(destination, LinkMetrics::default())
+                .await
+                .unwrap();
+            assert_eq!(read(&mut peer).await.message_type, M::DESTINATION_UP);
+            send(
+                &mut peer,
+                build_destination_up_response(destination.0, S::SUCCESS),
+            )
+            .await;
+            send(&mut peer, Message::new(M::SESSION_UPDATE)).await;
+            assert_eq!(
+                read(&mut peer).await.message_type,
+                M::SESSION_UPDATE_RESPONSE
+            );
+            m.update_session_addresses(
+                sid,
+                AddressChanges {
+                    added: DestinationAddrs {
+                        v4: vec!["192.0.2.5".parse().unwrap()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(read(&mut peer).await.message_type, M::SESSION_UPDATE);
+            let mut defaults = LinkMetrics::default();
+            for latency in [100, 200, 300] {
+                defaults.latency = Duration::from_micros(latency);
+                m.queue_session_metrics(defaults).await.unwrap();
+            }
+            rejected(
+                m.update_session_metrics(LinkMetrics::default())
+                    .await
+                    .unwrap_err(),
+                sid,
+                C::Busy,
+            );
+            assert!(matches!(
+                m.queue_session_metrics(LinkMetrics {
+                    resources: Some(50),
+                    ..defaults
+                })
+                .await,
+                Err(DaemonError::Config(_))
+            ));
+            let expected = LinkMetrics {
+                latency: Duration::from_micros(999),
+                ..defaults
+            };
+            m.update_destination(destination, expected).await.unwrap();
+            assert_eq!(read(&mut peer).await.message_type, M::DESTINATION_UPDATE);
+            // Accepted queued values are visible locally before wire delivery.
+            let state = m.state().borrow().clone();
+            assert_eq!(state.sessions[&sid].metrics, defaults);
+            assert_eq!(
+                state.sessions[&sid].destinations[&destination].metrics,
+                expected
+            );
+            send(&mut peer, build_session_update_response(S::SUCCESS)).await;
+            let update = read(&mut peer).await;
+            assert_eq!(update.message_type, M::SESSION_UPDATE);
+            assert_eq!(extract_link_metrics(&update), Some(defaults));
+            let correction = read(&mut peer).await;
+            assert_eq!(correction.message_type, M::DESTINATION_UPDATE);
+            assert_eq!(extract_link_metrics(&correction), Some(expected));
+            send(&mut peer, build_session_update_response(S::SUCCESS)).await;
+            send(&mut peer, Message::new(M::SESSION_UPDATE)).await;
+            assert_eq!(
+                read(&mut peer).await.message_type,
+                M::SESSION_UPDATE_RESPONSE
+            );
+            let state = m.state().borrow().clone();
+            assert_eq!(state.sessions.len(), 1);
+            assert_eq!(state.sessions[&sid].metrics, defaults);
+            assert_eq!(
+                state.sessions[&sid].destinations[&destination].metrics,
+                expected
+            );
+            // A later default supersedes the previous per-destination override.
+            m.queue_session_metrics(defaults).await.unwrap();
+            assert_eq!(read(&mut peer).await.message_type, M::SESSION_UPDATE);
+            assert_eq!(
+                m.state().borrow().sessions[&sid].destinations[&destination].metrics,
+                defaults
+            );
+            drop(peer);
+            m.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn modem_busy_commands_return_errors_then_retry_reaches_wire() {
     let m = modem().await;
     let mut events = m.subscribe();

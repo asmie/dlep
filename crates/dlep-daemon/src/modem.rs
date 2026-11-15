@@ -135,6 +135,18 @@ impl ModemDaemon {
         self.fanout(SessionCommand::SessionUpdate { metrics }).await
     }
 
+    /// Update effective session and destination metrics now, coalescing one
+    /// pending Session Update per busy session. The pending update is sent once
+    /// the current session transaction completes, followed by destination
+    /// corrections for any later changes. Acceptance can precede wire delivery;
+    /// retained state includes these pending values. Omitted optional metrics
+    /// keep their values, as with [`Self::update_session_metrics`].
+    pub async fn queue_session_metrics(&self, metrics: LinkMetrics) -> Result<(), DaemonError> {
+        self.validate_metrics(&metrics)?;
+        self.fanout(SessionCommand::QueueSessionUpdate { metrics })
+            .await
+    }
+
     /// Advertise local peer-address/subnet changes on one session. This sends
     /// an address-only Session Update; it does not alter destination metrics.
     /// Repeated adds/absent removes are successful local no-ops. Busy sessions

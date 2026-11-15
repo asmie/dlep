@@ -110,6 +110,56 @@ fn request(r: &mut RouterSessionFsm, mac: MacAddress) -> Message {
 }
 
 #[test]
+fn a_link_answer_after_queued_session_metrics_survives_their_wire_delivery() {
+    for status in [S::SUCCESS, S::REQUEST_DENIED] {
+        let (mut r, mut m) = deferred_sessions();
+        let initial = sent(
+            &m.step(E::AppSessionUpdate { metrics: metrics() }),
+            M::SESSION_UPDATE,
+        );
+        let ack = sent(&r.step(E::RecvMessage(initial)), M::SESSION_UPDATE_RESPONSE);
+        let defaults = LinkMetrics {
+            current_data_rate_rx_bps: 777,
+            latency: Duration::from_micros(200),
+            ..metrics()
+        };
+        assert!(
+            m.step(E::AppQueueSessionUpdate { metrics: defaults })
+                .is_empty()
+        );
+        let actions = m.step(E::RecvMessage(request(&mut r, mac(1))));
+        assert!(actions.iter().any(|a| matches!(a, A::Emit(EmittedEvent::LinkCharacteristicsRequested { metrics, pending: true, .. }) if *metrics == defaults)));
+        let granted = LinkMetrics {
+            latency: Duration::from_micros(999),
+            resources: Some(0),
+            ..defaults
+        };
+        let reply = sent(
+            &m.step(E::AppLinkCharacteristicsResponse {
+                mac: mac(1),
+                status,
+                text: String::new(),
+                metrics: Some(granted),
+            }),
+            M::LINK_CHARACTERISTICS_RESPONSE,
+        );
+        r.step(E::RecvMessage(reply));
+        let mut messages = 0;
+        for action in m.step(E::RecvMessage(ack)) {
+            if let A::SendMessage(message) = action {
+                messages += 1;
+                r.step(E::RecvMessage(message));
+            }
+        }
+        assert_eq!(messages, 2);
+        assert_eq!(m.destinations[&mac(1)].metrics, granted);
+        assert_eq!(r.destinations[&mac(1)].metrics, granted);
+        assert_eq!(r.session_metrics, defaults);
+        assert_eq!(r.state(), RouterSessionState::InSession);
+    }
+}
+
+#[test]
 fn request_encodes_only_selected_characteristics_including_zero() {
     for requested in [
         LinkCharacteristics {
