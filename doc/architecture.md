@@ -1048,6 +1048,18 @@ The order of work was:
     and abandoned receipts, and check adjacent grant/report lines and later
     replay through real adapters over IPv4/IPv6.
 
+47. Destination Announce completion events. **Done** — validated, nonfatal
+    Announce replies emit `DestinationEvent::AnnounceResponse` with the peer's
+    status and text, including denials. Success retains the existing state
+    publication and `Up` event before completion; rejected announcements do
+    not create destinations. The router adapter forwards an `announce_response`
+    notice carrying session, MAC, status, and text. These transient outcomes
+    complement snapshots and remain subject to event-gap recovery semantics.
+    Tests cover UTF-8 text, unknown nonfatal status codes, transaction release,
+    invalid and duplicate replies, multiple peers sharing a MAC, publication
+    before completion, and real adapter success/denial over IPv4/IPv6 with
+    both MAC formats.
+
 ---
 
 ## 10. Open questions / risks

@@ -71,6 +71,14 @@ pub enum DestinationEvent {
         id: DestinationId,
         requested_addresses: AddressChanges,
     },
+    /// Router side: a validated, nonfatal Destination Announce reply, including
+    /// denials. Success publishes the destination and emits `Up` first. Fatal
+    /// or invalid replies follow session termination instead.
+    AnnounceResponse {
+        id: DestinationId,
+        status: StatusCode,
+        text: String,
+    },
     Down {
         id: DestinationId,
         reason: StatusCode,

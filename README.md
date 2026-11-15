@@ -213,6 +213,10 @@ The modem-side API is symmetric, with
 error: routers may report Layer 3 changes but cannot originate metric items.
 `announce_destination` is router-side only. The modem denies destinations it
 does not know; successful responses create destinations at the router.
+`DestinationEvent::AnnounceResponse` reports each validated, nonfatal reply's
+status and text, including denials. Success publishes the destination and emits
+`DestinationEvent::Up` before this completion event. Both events carry the peer
+and session identity in their enclosing `DaemonEvent::Destination`.
 
 Set `ModemConfig.metrics` (the TOML `[metrics]` section) to the initial
 session-wide values. Rates use bits/second and `latency_us` uses microseconds.

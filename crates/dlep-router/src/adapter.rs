@@ -336,6 +336,13 @@ fn notice(event: DaemonEvent) -> Option<Value> {
     match event {
         DaemonEvent::Destination {
             session_id,
+            event: DestinationEvent::AnnounceResponse { id, status, text },
+            ..
+        } => Some(
+            json!({"type":"announce_response", "session":session_id.0, "mac":id.0.to_string(), "status":status.0, "text":text}),
+        ),
+        DaemonEvent::Destination {
+            session_id,
             event:
                 DestinationEvent::LinkCharacteristicsResponse {
                     id,

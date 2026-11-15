@@ -485,9 +485,17 @@ impl RouterSessionFsm {
                 if msg.message_type == MessageType::DESTINATION_ANNOUNCE_RESPONSE =>
             {
                 let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let (status, text) = msg
+                    .data_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DataItem::Status { code, text } => Some((*code, text.clone())),
+                        _ => None,
+                    })
+                    .expect("validated status");
                 self.tx.close_destination(&mac);
                 let mut actions = Vec::new();
-                if extract_status(&msg) == Some(StatusCode::SUCCESS) {
+                if status == StatusCode::SUCCESS {
                     let mut metrics = self.session_metrics;
                     merge_link_metrics(&msg, &mut metrics);
                     let mut addrs = DestinationAddrs::default();
@@ -507,6 +515,11 @@ impl RouterSessionFsm {
                         addrs,
                     }));
                 }
+                actions.push(FsmAction::Emit(EmittedEvent::DestinationAnnounceResponse {
+                    mac,
+                    status,
+                    text,
+                }));
                 actions.extend(heartbeat_reset_action(
                     TIMER_HEARTBEAT_MISSED,
                     self.peer_heartbeat_interval,

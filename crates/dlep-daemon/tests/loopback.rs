@@ -550,11 +550,8 @@ async fn session_update_round_trip_surfaces_session_wide_metrics() {
 /// RFC 8175 §12.13: Destination Announce is router-originated and must reach
 /// the modem as a `DestinationEvent::Announced`.
 ///
-/// As with the Session Update test above, the mandatory §12.14 Response is
-/// not asserted here — the router emits nothing when it arrives. The
-/// per-destination transaction open→close cycle is pinned in
-/// `dlep-fsm/tests/session_table.rs`
-/// (`router_in_session_announce_opens_then_closes_destination_transaction`).
+/// The router observes the modem's denial through `AnnounceResponse`, without
+/// inventing an Up event for the unknown destination.
 #[tokio::test]
 async fn router_announce_destination_is_acknowledged_by_modem() {
     let modem = ModemDaemon::builder()
@@ -589,6 +586,13 @@ async fn router_announce_destination_is_acknowledged_by_modem() {
         &mut modem_events,
         |d| matches!(d, DestinationEvent::Announced { id: got, .. } if *got == id),
     )
+    .await;
+
+    await_destination_event(&mut router_events, |d| {
+        matches!(d, DestinationEvent::AnnounceResponse {
+            id: got, status: StatusCode::REQUEST_DENIED, text,
+        } if *got == id && text.is_empty())
+    })
     .await;
 
     router.shutdown().await.expect("router shutdown");

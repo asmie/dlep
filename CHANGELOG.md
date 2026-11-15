@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Routers expose successful and denied Destination Announce replies through
+  `DestinationEvent::AnnounceResponse`, preserving peer status and text. The
+  router adapter forwards them as `announce_response` notices scoped by session
+  and MAC. Successful replies still publish destination state and emit `Up`
+  first. Exhaustive matches must handle the new daemon event and FSM
+  `EmittedEvent::DestinationAnnounceResponse` variant.
 - The TCP monitor cleanup test uses an owned abstract Unix socket name to verify
   failed setup releases its socket, avoiding ephemeral-port races with parallel
   network tests.

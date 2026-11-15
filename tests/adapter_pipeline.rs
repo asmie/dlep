@@ -670,6 +670,51 @@ fn announcements(session: &Value, count: u64) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn denied_announces_report_completion_and_allow_retry() {
+    for (format, mac) in [("eui48", MAC), ("eui64", MAC64)] {
+        for ip in ["127.0.0.1", "::1"] {
+            let (mut radio, addr) = Node::modem_with_format("modem-a", ip, 0, format).await;
+            let mut router = Node::router_with_format(&[addr], format).await;
+            let initial = router.wait(|s| session(s, "modem-a").is_some()).await;
+            let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+            for request in 1..=2 {
+                router
+                    .control
+                    .send(json!({"type":"destination_announce", "request":request,
+                    "session":sid, "mac":mac}))
+                    .await;
+                router.result(request, "accepted").await;
+                let replied = router
+                    .wait(|s| {
+                        s["notices"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|n| {
+                                n["type"] == "announce_response"
+                                    && n["session"] == sid
+                                    && n["mac"] == mac
+                            })
+                            .count()
+                            == request as usize
+                    })
+                    .await;
+                assert_eq!(
+                    notice(&replied, "announce_response", |_| true).unwrap(),
+                    &json!({"type":"announce_response", "session":sid,
+                    "mac":mac, "status":2, "text":""})
+                );
+                assert!(destination(&replied, "modem-a", mac).is_none());
+                assert_eq!(session(&replied, "modem-a").unwrap()["session"], sid);
+            }
+            router.stop().await;
+            router.assert_final_empty();
+            radio.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn near_limit_destinations_reannounce_on_the_original_session() {
     for (format, mac) in [("eui48", MAC), ("eui64", MAC64)] {
         for ip in ["127.0.0.1", "::1"] {
@@ -731,6 +776,10 @@ async fn near_limit_destinations_reannounce_on_the_original_session() {
             let restored = router
                 .wait(|s| {
                     session(s, "modem-a").is_some_and(|p| p["session"] == sid)
+                        && notice(s, "announce_response", |n| {
+                            n["session"] == sid && n["mac"] == mac && n["status"] == 0
+                        })
+                        .is_some()
                         && destination(s, "modem-a", mac)
                             .is_some_and(|d| d["addresses"] == json!(expected_addresses))
                 })

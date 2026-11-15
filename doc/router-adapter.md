@@ -135,6 +135,7 @@ Additional notices are best effort and can appear between complete snapshots:
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
+| `announce_response` | `session`, `mac`, `status`, `text` | A validated, nonfatal Destination Announce Response, including denial; status is the numeric DLEP code. |
 | `link_response` | `session`, `mac`, `status`, `text`, `metrics` | A peer Link Characteristics Response; status is the numeric DLEP code. |
 | `destination_down` | `session`, `mac`, `status` | Destination withdrawal/removal outcome. |
 | `session_down` | `session`, `peer`, `status` | Session termination reason. |
@@ -144,9 +145,17 @@ Responses identify session/MAC, not the adapter's request ID. Serialize requests
 for each destination when tracking completions. After `event_gap`, outstanding
 peer-response outcomes may be unknown; snapshots recover current state but
 cannot reconstruct lost responses or reasons. Notices queued before a gap can
-still arrive afterwards and must not overwrite snapshot state. Announce success
-appears as a destination in a snapshot; the current daemon API does not expose
-a denied Announce response. A snapshot may arrive before its command-result notice.
+still arrive afterwards and must not overwrite snapshot state. A snapshot may
+arrive before its command-result or peer-response notice.
+
+`announce_response` completes the peer transaction, so a denied Announce can be
+retried with a new command ID. Status zero means success; other nonfatal statuses
+leave destination state unchanged. For example, an accepted command can receive
+`{"type":"announce_response","session":1,"mac":"02:00:00:00:00:01","status":2,"text":"unreachable"}`.
+Success also creates the destination in retained state. Read its metrics and
+addresses from snapshots; large address sets can continue arriving in subsequent
+updates after the response. Invalid, unsolicited, duplicate, or fatal replies
+follow session termination instead of producing an announce-response notice.
 
 [`examples/router-adapter.py`](../examples/router-adapter.py) is a runnable
 consumer that maintains replacement tables and logs their size. It does not

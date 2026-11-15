@@ -203,4 +203,11 @@ pub enum EmittedEvent {
         mac: MacAddress,
         requested_addresses: AddressChanges,
     },
+    /// Router side: a validated, nonfatal reply to Destination Announce.
+    /// Success also emits `DestinationUp` before this completion event.
+    DestinationAnnounceResponse {
+        mac: MacAddress,
+        status: StatusCode,
+        text: String,
+    },
 }

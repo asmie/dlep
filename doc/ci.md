@@ -211,6 +211,12 @@ Near-limit Announce tests include the required Status item, restore all four
 address families and current metrics after withdrawal, and check subsequent
 updates. The real adapter regression requires the same session ID throughout
 for both MAC formats over IPv4/IPv6, so reconnection cannot mask an encoding failure.
+It also requires an `announce_response` success notice. Denied-announcement
+cases require a separate peer-response notice after local acceptance and allow
+a subsequent request on the same session. FSM tests reject duplicate, unsolicited,
+malformed, and fatal replies without emitting completion; runtime tests preserve
+status text and session/peer attribution, verify state publication before success,
+and isolate two peers sharing a MAC over both IP families and MAC formats.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

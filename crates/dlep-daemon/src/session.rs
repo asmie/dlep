@@ -1038,6 +1038,17 @@ fn translate_emitted(
                 requested_addresses: requested_addresses.clone(),
             },
         }),
+        EmittedEvent::DestinationAnnounceResponse { mac, status, text } => {
+            Some(DaemonEvent::Destination {
+                session_id,
+                peer: peer.clone(),
+                event: DestinationEvent::AnnounceResponse {
+                    id: DestinationId(*mac),
+                    status: *status,
+                    text: text.clone(),
+                },
+            })
+        }
         EmittedEvent::LinkCharacteristicsRequested { mac, requested, .. } => {
             Some(DaemonEvent::Destination {
                 session_id,
