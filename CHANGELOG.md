@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Radio adapter queues and pending requests are bounded. Overload denies excess
+  link requests with `radio adapter busy`; cancelled requests waiting for output
+  capacity are discarded. A broken input pipe or a write stalled for five seconds
+  now triggers modem shutdown and failure exit for supervisor restart. Adapter
+  I/O tasks are also cancelled on drop.
 - End-to-end adapter regression tests run both daemon roles and both external
   adapter processes, covering IPv4/IPv6 commands, exact state, multi-modem
   isolation, restart recovery, and snapshot recovery after consumer backpressure.

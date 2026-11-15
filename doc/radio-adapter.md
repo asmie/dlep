@@ -34,6 +34,12 @@ a file. It does not run the adapter.
   Shutting Down and exits with an error. Under the example systemd unit,
   `Restart=on-failure` restarts both, and the restarted adapter reports the
   current radio state again.
+- Failed writes to the adapter's input, or writes that cannot complete one
+  record within five seconds, trigger the same failure shutdown. Input and
+  output queues each hold at most 64 records. A full output queue pauses the
+  bridge until the writer makes room or fails; the daemon's session tasks keep
+  running. Keep reading stdin while applying slow radio changes so ordinary
+  notices do not fill the pipe.
 - Unknown message types are ignored in both directions, so adapters must ignore
   types they do not recognize. Unknown fields in known messages are errors.
 
@@ -143,6 +149,16 @@ deadline, but `link_request_timeout_ms` bounds a stalled adapter: when it
 expires the modem replies Request Denied with the text
 `radio adapter timed out`, and a later answer is ignored without updating the
 table. A request is abandoned without an answer if its session ends.
+
+The modem queues at most 64 link requests waiting for the bridge and tracks at
+most 64 requests awaiting adapter answers, across all sessions and destinations.
+Excess requests receive Request Denied with `radio adapter busy`; they are not
+forwarded or retried automatically. Completed, cancelled, and timed-out requests
+release capacity. The configured answer timeout includes time waiting in the
+bridge or output queue, separately from the five-second write deadline.
+Requests cancelled or expired before output can be queued are discarded.
+Already queued or delivered requests cannot be recalled; late answers remain
+ignored as described above.
 
 ## Example
 

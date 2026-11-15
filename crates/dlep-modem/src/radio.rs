@@ -5,8 +5,8 @@
 //!
 //! The adapter's destination table is kept here and replayed to every router
 //! session that comes up, so destinations reported before a router connects
-//! are not lost. Adapter exit, closed output, or malformed JSON is fatal: the
-//! modem terminates its sessions and exits so a supervisor restarts both.
+//! are not lost. Adapter exit, failed/stalled input, closed output, or malformed
+//! JSON is fatal: the modem terminates its sessions so a supervisor restarts both.
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
@@ -26,7 +26,7 @@ use dlep_daemon::{
 use dlep_ext::SessionId;
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -35,6 +35,9 @@ use tracing::{debug, warn};
 
 /// Longest accepted adapter line, excluding the newline.
 const MAX_LINE: usize = 64 * 1024;
+const QUEUE_SIZE: usize = 64;
+const MAX_PENDING: usize = 64;
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay before re-sending a command a session rejected as Busy.
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Grace period for the adapter to exit after its input closes.
@@ -304,18 +307,22 @@ type Ask = (LinkRequest, oneshot::Sender<LinkResponse>);
 
 /// Forwards link requests to the bridge task and bounds the adapter's answer.
 struct RadioLink {
-    asks: mpsc::UnboundedSender<Ask>,
+    asks: mpsc::Sender<Ask>,
     timeout: Duration,
 }
 
 impl LinkControl for RadioLink {
     fn request(&self, request: LinkRequest) -> LinkControlFuture {
         let (answer, response) = oneshot::channel();
-        let sent = self.asks.send((request, answer)).is_ok();
+        let sent = self.asks.try_send((request, answer));
         let timeout = self.timeout;
         Box::pin(async move {
-            if !sent {
-                return LinkResponse::denied().with_text("radio adapter unavailable");
+            if let Err(error) = sent {
+                let text = match error {
+                    mpsc::error::TrySendError::Full(_) => "radio adapter busy",
+                    mpsc::error::TrySendError::Closed(_) => "radio adapter unavailable",
+                };
+                return LinkResponse::denied().with_text(text);
             }
             match tokio::time::timeout(timeout, response).await {
                 Ok(Ok(response)) => response,
@@ -333,10 +340,10 @@ impl LinkControl for RadioLink {
 pub(crate) struct Adapter {
     child: Child,
     lines: mpsc::Receiver<Result<String>>,
-    out: mpsc::UnboundedSender<String>,
-    writer: JoinHandle<()>,
+    out: Option<mpsc::Sender<String>>,
+    writer: Option<JoinHandle<Result<()>>>,
     reader: JoinHandle<()>,
-    asks: mpsc::UnboundedReceiver<Ask>,
+    asks: mpsc::Receiver<Ask>,
     link: Arc<RadioLink>,
 }
 
@@ -355,30 +362,22 @@ impl Adapter {
         let mut child = command
             .spawn()
             .with_context(|| format!("starting radio adapter {}", config.command.display()))?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
 
-        // A separate writer keeps an adapter that is slow to read its input
-        // from stalling destination reports.
-        let (out, mut queued) = mpsc::unbounded_channel::<String>();
-        let writer = tokio::spawn(async move {
-            while let Some(mut line) = queued.recv().await {
-                line.push('\n');
-                if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                    warn!("writing to radio adapter failed: {e}");
-                    break;
-                }
-            }
-        });
-        let (lines_tx, lines) = mpsc::channel(64);
+        // Brief pauses can drain without growing an unbounded output backlog.
+        // A stalled record fails the writer and, in turn, the adapter bridge.
+        let (out, queued) = mpsc::channel(QUEUE_SIZE);
+        let writer = tokio::spawn(write_output(stdin, queued));
+        let (lines_tx, lines) = mpsc::channel(QUEUE_SIZE);
         let reader = tokio::spawn(read_lines(BufReader::new(stdout), lines_tx));
 
-        let (asks_tx, asks) = mpsc::unbounded_channel();
+        let (asks_tx, asks) = mpsc::channel(QUEUE_SIZE);
         Ok(Self {
             child,
             lines,
-            out,
-            writer,
+            out: Some(out),
+            writer: Some(writer),
             reader,
             asks,
             link: Arc::new(RadioLink {
@@ -401,7 +400,7 @@ impl Adapter {
     ) -> Result<Infallible> {
         let mut bridge = Bridge {
             daemon,
-            out: self.out.clone(),
+            out: self.out.as_ref().expect("adapter active").clone(),
             destinations: BTreeMap::new(),
             session_metrics: initial,
             pending: HashMap::new(),
@@ -410,42 +409,54 @@ impl Adapter {
             sessions: HashMap::new(),
             synced: false,
         };
-        let mut state = daemon.state();
-        loop {
-            if !bridge.synced || state.has_changed().unwrap_or(false) {
-                let snapshot = state.borrow_and_update().clone();
-                bridge.reconcile(&snapshot).await;
-            }
-            let next_retry = bridge.retries.iter().map(|r| r.0).min();
-            tokio::select! {
-                changed = state.changed() => {
-                    if changed.is_err() { bail!("modem state feed stopped"); }
-                    // `changed` marks the value seen; reconcile it explicitly.
+        // Supervise I/O outside the bridge loop so a writer failure or child
+        // exit also interrupts replay and command acceptance waits.
+        let work = async {
+            let mut state = daemon.state();
+            loop {
+                if !bridge.synced || state.has_changed().unwrap_or(false) {
                     let snapshot = state.borrow_and_update().clone();
-                    bridge.reconcile(&snapshot).await;
-                },
-                line = self.lines.recv() => match line {
-                    Some(Ok(line)) => {
-                        let message = parse_inbound(&line)
-                            .with_context(|| format!("invalid radio adapter message: {line}"))?;
-                        bridge.inbound(message).await;
-                    }
-                    Some(Err(e)) => return Err(e),
-                    None => bail!("radio adapter closed its output"),
-                },
-                Some(ask) = self.asks.recv() => bridge.ask(ask),
-                event = events.recv() => match event {
-                    Ok(event) => bridge.event(event).await,
-                    Err(broadcast::error::RecvError::Lagged(missed)) => warn!(
-                        missed,
-                        "radio bridge missed transient notices; session state is reconciled separately"
-                    ),
-                    Err(broadcast::error::RecvError::Closed) => bail!("modem daemon stopped"),
-                },
-                () = sleep_until(next_retry), if next_retry.is_some() => bridge.retry().await,
-                status = self.child.wait() => {
-                    bail!("radio adapter exited with {}", status.context("waiting for radio adapter")?);
+                    bridge.reconcile(&snapshot).await?;
                 }
+                let next_retry = bridge.retries.iter().map(|r| r.0).min();
+                tokio::select! {
+                    changed = state.changed() => {
+                        if changed.is_err() { bail!("modem state feed stopped"); }
+                        // `changed` marks the value seen; reconcile it explicitly.
+                        let snapshot = state.borrow_and_update().clone();
+                        bridge.reconcile(&snapshot).await?;
+                    },
+                    line = self.lines.recv() => match line {
+                        Some(Ok(line)) => {
+                            let message = parse_inbound(&line)
+                                .with_context(|| format!("invalid radio adapter message: {line}"))?;
+                            bridge.inbound(message).await;
+                        }
+                        Some(Err(e)) => return Err(e),
+                        None => bail!("radio adapter closed its output"),
+                    },
+                    Some(ask) = self.asks.recv() => bridge.ask(ask).await?,
+                    event = events.recv() => match event {
+                        Ok(event) => bridge.event(event).await?,
+                        Err(broadcast::error::RecvError::Lagged(missed)) => warn!(
+                            missed,
+                            "radio bridge missed transient notices; session state is reconciled separately"
+                        ),
+                        Err(broadcast::error::RecvError::Closed) => bail!("modem daemon stopped"),
+                    },
+                    () = sleep_until(next_retry), if next_retry.is_some() => bridge.retry().await,
+                }
+            }
+        };
+        tokio::select! {
+            result = work => result,
+            status = self.child.wait() => {
+                bail!("radio adapter exited with {}", status.context("waiting for radio adapter")?);
+            }
+            result = self.writer.as_mut().expect("writer active") => {
+                self.writer.take();
+                result.context("radio adapter writer task failed")??;
+                bail!("radio adapter input closed");
             }
         }
     }
@@ -453,13 +464,15 @@ impl Adapter {
     /// Close the adapter's input, then kill it if it does not exit promptly.
     pub(crate) async fn stop(mut self) {
         let deadline = Instant::now() + STOP_GRACE;
-        drop(self.out);
-        if tokio::time::timeout_at(deadline, &mut self.writer)
-            .await
-            .is_err()
-        {
-            self.writer.abort();
-            let _ = self.writer.await;
+        self.out.take();
+        if let Some(mut writer) = self.writer.take() {
+            if tokio::time::timeout_at(deadline, &mut writer)
+                .await
+                .is_err()
+            {
+                writer.abort();
+                let _ = writer.await;
+            }
         }
         if tokio::time::timeout_at(deadline, self.child.wait())
             .await
@@ -469,7 +482,32 @@ impl Adapter {
             let _ = self.child.kill().await;
         }
         self.reader.abort();
+        let _ = (&mut self.reader).await;
     }
+}
+
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        self.reader.abort();
+        if let Some(writer) = &self.writer {
+            writer.abort();
+        }
+        // kill_on_drop also covers failures before the daemon starts.
+    }
+}
+
+async fn write_output(
+    mut stdin: impl AsyncWrite + Unpin,
+    mut queued: mpsc::Receiver<String>,
+) -> Result<()> {
+    while let Some(mut line) = queued.recv().await {
+        line.push('\n');
+        tokio::time::timeout(IO_TIMEOUT, stdin.write_all(line.as_bytes()))
+            .await
+            .context("radio adapter input stalled")?
+            .context("writing to radio adapter")?;
+    }
+    Ok(())
 }
 
 /// The modem's ambient capabilities (CAP_NET_RAW and CAP_NET_BIND_SERVICE in
@@ -562,7 +600,7 @@ struct Pending {
 
 struct Bridge<'a> {
     daemon: &'a ModemDaemon,
-    out: mpsc::UnboundedSender<String>,
+    out: mpsc::Sender<String>,
     destinations: BTreeMap<MacAddress, Known>,
     session_metrics: LinkMetrics,
     pending: HashMap<u64, Pending>,
@@ -573,9 +611,12 @@ struct Bridge<'a> {
 }
 
 impl Bridge<'_> {
-    fn send(&self, message: &Outbound) {
+    async fn send(&self, message: &Outbound) -> Result<()> {
         let line = serde_json::to_string(message).expect("serializable message");
-        let _ = self.out.send(line);
+        self.out
+            .send(line)
+            .await
+            .context("radio adapter writer stopped")
     }
 
     async fn inbound(&mut self, message: Inbound) {
@@ -718,12 +759,19 @@ impl Bridge<'_> {
         }
     }
 
-    fn ask(&mut self, (request, answer): Ask) {
+    async fn ask(&mut self, (request, mut answer): Ask) -> Result<()> {
         // Answers that timed out leave closed senders behind.
         self.pending.retain(|_, p| !p.answer.is_closed());
+        if answer.is_closed() {
+            return Ok(());
+        }
+        if self.pending.len() >= MAX_PENDING {
+            let _ = answer.send(LinkResponse::denied().with_text("radio adapter busy"));
+            return Ok(());
+        }
         let id = self.next_request;
         self.next_request += 1;
-        self.send(&Outbound::LinkRequest {
+        let message = Outbound::LinkRequest {
             request: id,
             session: request.session_id.0,
             peer: request.peer.addr,
@@ -734,7 +782,14 @@ impl Bridge<'_> {
                 latency_us: request.requested.latency.map(duration_us),
             },
             current: Metrics::from_link(&request.current),
-        });
+        };
+        tokio::select! {
+            biased;
+            // Do not forward a request that expires while waiting for output
+            // capacity. Already delivered requests cannot be recalled.
+            _ = answer.closed() => return Ok(()),
+            result = self.send(&message) => result?,
+        }
         self.pending.insert(
             id,
             Pending {
@@ -744,12 +799,13 @@ impl Bridge<'_> {
                 current: request.current,
             },
         );
+        Ok(())
     }
 
     /// Reconcile membership from retained runtime state, never lifecycle events.
     /// Replay only for a new session; replaying existing sessions would undo a
     /// router's withdrawal or overwrite a session-specific link-control grant.
-    async fn reconcile(&mut self, snapshot: &DaemonSnapshot) {
+    async fn reconcile(&mut self, snapshot: &DaemonSnapshot) -> Result<()> {
         let sessions: HashMap<_, _> = snapshot
             .sessions
             .iter()
@@ -765,7 +821,7 @@ impl Bridge<'_> {
             snapshot.sessions.contains_key(&pending.session_id) && !pending.answer.is_closed()
         });
         if self.synced && self.sessions == sessions {
-            return;
+            return Ok(());
         }
         for (&session_id, session) in &snapshot.sessions {
             if !self.sessions.contains_key(&session_id)
@@ -775,7 +831,8 @@ impl Bridge<'_> {
                 self.send(&Outbound::SessionUp {
                     session: session_id.0,
                     peer: session.peer.addr,
-                });
+                })
+                .await?;
             }
         }
         let mut peers: Vec<_> = sessions
@@ -786,9 +843,11 @@ impl Bridge<'_> {
             })
             .collect();
         peers.sort_by_key(|peer| peer.session);
-        self.send(&Outbound::SessionSync { sessions: peers });
+        self.send(&Outbound::SessionSync { sessions: peers })
+            .await?;
         self.sessions = sessions;
         self.synced = true;
+        Ok(())
     }
 
     async fn replay_session(
@@ -852,27 +911,34 @@ impl Bridge<'_> {
         }
     }
 
-    async fn event(&mut self, event: DaemonEvent) {
+    async fn event(&mut self, event: DaemonEvent) -> Result<()> {
         match event {
             DaemonEvent::SessionDown {
                 session_id,
                 peer,
                 reason,
-            } => self.send(&Outbound::SessionDown {
-                session: session_id.0,
-                peer: peer.addr,
-                status: reason.0,
-            }),
+            } => {
+                self.send(&Outbound::SessionDown {
+                    session: session_id.0,
+                    peer: peer.addr,
+                    status: reason.0,
+                })
+                .await?
+            }
             DaemonEvent::Destination {
                 session_id,
                 event: DestinationEvent::Announced { id, .. },
                 ..
-            } => self.send(&Outbound::DestinationAnnounced {
-                session: session_id.0,
-                mac: Mac(id.0),
-            }),
+            } => {
+                self.send(&Outbound::DestinationAnnounced {
+                    session: session_id.0,
+                    mac: Mac(id.0),
+                })
+                .await?
+            }
             _ => {}
         }
+        Ok(())
     }
 
     async fn retry(&mut self) {
@@ -1044,9 +1110,11 @@ mod tests {
     }
 
     fn bridge(daemon: &ModemDaemon) -> Bridge<'_> {
+        let (out, mut messages) = mpsc::channel(QUEUE_SIZE);
+        tokio::spawn(async move { while messages.recv().await.is_some() {} });
         Bridge {
             daemon,
-            out: mpsc::unbounded_channel().0,
+            out,
             destinations: BTreeMap::new(),
             session_metrics: ModemConfig::default().metrics.link_metrics(),
             pending: HashMap::new(),
@@ -1059,6 +1127,163 @@ mod tests {
 
     fn mac() -> MacAddress {
         MacAddress::new_eui48([2, 0, 0, 0, 0, 1])
+    }
+
+    fn link_request() -> LinkRequest {
+        LinkRequest {
+            session_id: SessionId(1),
+            peer: PeerInfo {
+                addr: "127.0.0.1:1234".parse().unwrap(),
+                is_tls: false,
+                peer_description: None,
+            },
+            id: mac().into(),
+            requested: dlep_daemon::LinkCharacteristics {
+                current_data_rate_tx_bps: Some(123),
+                ..Default::default()
+            },
+            current: LinkMetrics::default(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_radio_writer_has_a_deadline_and_closes_the_queue() {
+        let (input, _peer) = tokio::io::duplex(8);
+        let (out, queued) = mpsc::channel(QUEUE_SIZE);
+        out.send("x".repeat(32)).await.unwrap();
+        let start = Instant::now();
+        let error = write_output(input, queued).await.unwrap_err();
+        assert!(error.to_string().contains("radio adapter input stalled"));
+        assert_eq!(Instant::now() - start, IO_TIMEOUT);
+        assert!(out.is_closed());
+    }
+
+    #[tokio::test]
+    async fn radio_writer_preserves_records_across_partial_writes_and_reports_broken_input() {
+        let (input, mut peer) = tokio::io::duplex(4);
+        let (out, queued) = mpsc::channel(QUEUE_SIZE);
+        for line in [r#"{"type":"first"}"#, r#"{"type":"second"}"#] {
+            out.send(line.into()).await.unwrap();
+        }
+        drop(out);
+        let mut received = String::new();
+        let (result, read) = tokio::join!(
+            write_output(input, queued),
+            peer.read_to_string(&mut received)
+        );
+        result.unwrap();
+        read.unwrap();
+        assert_eq!(received, "{\"type\":\"first\"}\n{\"type\":\"second\"}\n");
+
+        let (input, peer) = tokio::io::duplex(4);
+        drop(peer);
+        let (out, queued) = mpsc::channel(QUEUE_SIZE);
+        out.send("record".into()).await.unwrap();
+        let error = write_output(input, queued).await.unwrap_err();
+        assert!(error.to_string().contains("writing to radio adapter"));
+        assert!(out.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn radio_link_rejects_queue_overflow_and_times_out_queued_requests() {
+        let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
+        let link = RadioLink {
+            asks,
+            timeout: Duration::from_millis(100),
+        };
+        let requests: Vec<_> = (0..QUEUE_SIZE)
+            .map(|_| link.request(link_request()))
+            .collect();
+        let full = link.request(link_request()).await;
+        assert_eq!(full, LinkResponse::denied().with_text("radio adapter busy"));
+        assert_eq!(queued.len(), QUEUE_SIZE);
+        drop(requests);
+        while let Ok((_, answer)) = queued.try_recv() {
+            assert!(answer.is_closed());
+        }
+        let expired = link.request(link_request()).await;
+        assert_eq!(
+            expired,
+            LinkResponse::denied().with_text("radio adapter timed out")
+        );
+        assert!(queued.recv().await.unwrap().1.is_closed());
+        drop(queued);
+        assert_eq!(
+            link.request(link_request()).await,
+            LinkResponse::denied().with_text("radio adapter unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn radio_bridge_bounds_pending_requests_and_recovers_capacity_after_cancellation() {
+        let daemon = modem().await;
+        let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::channel(QUEUE_SIZE);
+        bridge.out = out;
+        let mut replies = Vec::new();
+        for _ in 0..MAX_PENDING {
+            let (answer, response) = oneshot::channel();
+            bridge.ask((link_request(), answer)).await.unwrap();
+            replies.push(response);
+            let message: serde_json::Value =
+                serde_json::from_str(&notices.recv().await.unwrap()).unwrap();
+            assert_eq!(message["type"], "link_request");
+        }
+        let (answer, response) = oneshot::channel();
+        bridge.ask((link_request(), answer)).await.unwrap();
+        assert_eq!(
+            response.await.unwrap(),
+            LinkResponse::denied().with_text("radio adapter busy")
+        );
+        assert_eq!(bridge.pending.len(), MAX_PENDING);
+        assert!(notices.try_recv().is_err());
+        drop(replies.pop());
+        let (answer, mut response) = oneshot::channel();
+        bridge.ask((link_request(), answer)).await.unwrap();
+        assert!(response.try_recv().is_err());
+        assert_eq!(bridge.pending.len(), MAX_PENDING);
+        assert!(notices.try_recv().is_ok());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_radio_requests_do_not_escape_an_output_backlog() {
+        let daemon = modem().await;
+        let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::channel(1);
+        out.send("occupied".into()).await.unwrap();
+        bridge.out = out;
+        {
+            let (answer, response) = oneshot::channel();
+            let request = bridge.ask((link_request(), answer));
+            tokio::pin!(request);
+            tokio::select! {
+                biased;
+                _ = &mut request => panic!("output queue should apply backpressure"),
+                _ = tokio::task::yield_now() => {}
+            }
+            drop(response);
+            request.await.unwrap();
+        }
+        assert_eq!(notices.recv().await.unwrap(), "occupied");
+        let (answer, response) = oneshot::channel();
+        drop(response);
+        bridge.ask((link_request(), answer)).await.unwrap();
+        assert!(bridge.pending.is_empty());
+        assert!(notices.try_recv().is_err());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_radio_output_fails_membership_delivery() {
+        let daemon = modem().await;
+        let mut bridge = bridge(&daemon);
+        bridge.out = mpsc::channel(1).0;
+        let snapshot = daemon.state().borrow().clone();
+        let error = bridge.reconcile(&snapshot).await.unwrap_err();
+        assert!(error.to_string().contains("radio adapter writer stopped"));
+        assert!(!bridge.synced);
+        daemon.shutdown().await.unwrap();
     }
 
     fn up(metrics: Metrics) -> Inbound {
@@ -1105,7 +1330,7 @@ mod tests {
         let mut events = daemon.subscribe();
         let mut lagged = daemon.subscribe();
         let mut bridge = bridge(&daemon);
-        let (out, mut notices) = mpsc::unbounded_channel();
+        let (out, mut notices) = mpsc::channel(QUEUE_SIZE);
         bridge.out = out;
         bridge.inbound(up(Metrics::default())).await;
         bridge
@@ -1153,7 +1378,7 @@ mod tests {
         ));
         let snapshot = daemon.state().borrow().clone();
         let session_id = *snapshot.sessions.keys().next().unwrap();
-        bridge.reconcile(&snapshot).await;
+        bridge.reconcile(&snapshot).await.unwrap();
         assert_eq!(
             read(&mut peer).await.message_type,
             MessageType::SESSION_UPDATE
@@ -1197,7 +1422,7 @@ mod tests {
             snapshot.sessions[&session_id].destinations[&mac().into()].phase,
             dlep_daemon::DestinationPhase::Withdrawn
         );
-        bridge.reconcile(&snapshot).await;
+        bridge.reconcile(&snapshot).await.unwrap();
         assert!(notices.try_recv().is_err());
         bridge
             .inbound(Inbound::DestinationUpdate {
@@ -1238,7 +1463,7 @@ mod tests {
         .await
         .unwrap();
         let snapshot = state.borrow().clone();
-        bridge.reconcile(&snapshot).await;
+        bridge.reconcile(&snapshot).await.unwrap();
         assert!(bridge.retries.is_empty());
         assert!(bridge.pending.is_empty());
         assert!(abandoned.await.is_err());
@@ -1250,7 +1475,7 @@ mod tests {
         let mut peer = session(&daemon, &mut fresh_events).await;
         let snapshot = daemon.state().borrow().clone();
         assert!(!snapshot.sessions.contains_key(&session_id));
-        bridge.reconcile(&snapshot).await;
+        bridge.reconcile(&snapshot).await.unwrap();
         assert_eq!(
             read(&mut peer).await.message_type,
             MessageType::SESSION_UPDATE
@@ -1347,7 +1572,7 @@ mod tests {
             MessageType::SESSION_UPDATE
         );
         let snapshot = daemon.state().borrow().clone();
-        bridge.reconcile(&snapshot).await;
+        bridge.reconcile(&snapshot).await.unwrap();
         assert_eq!(bridge.retries.len(), 1);
         assert!(matches!(bridge.retries[0].2, Retry::InitializeSession));
         send(
@@ -1774,7 +1999,13 @@ mod tests {
         .unwrap();
         assert_eq!(adapter.lines.recv().await.unwrap().unwrap(), "ready");
         // Much larger than a pipe buffer; the adapter never consumes stdin.
-        adapter.out.send("x".repeat(1024 * 1024)).unwrap();
+        adapter
+            .out
+            .as_ref()
+            .unwrap()
+            .send("x".repeat(1024 * 1024))
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
         tokio::time::timeout(STOP_GRACE + WAIT, adapter.stop())
             .await

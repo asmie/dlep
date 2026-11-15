@@ -647,3 +647,101 @@ async fn paused_consumer_recovers_exact_state_after_a_real_event_gap() {
     router.assert_final_empty();
     radio.stop().await;
 }
+
+fn announcements(session: &Value, count: u64) -> Vec<Value> {
+    (1..=count)
+        .map(|request| json!({"type":"destination_announce", "request":request,
+            "session":session, "mac":format!("02:00:00:01:{:02x}:{:02x}", request >> 8, request & 255)}))
+        .collect()
+}
+
+#[tokio::test]
+async fn radio_input_failure_stops_the_modem_and_clears_router_state() {
+    for op in ["close_input", "pause"] {
+        let (mut radio, addr) = Node::modem("modem-a", "127.0.0.1", 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        let mut router = Node::router(&[addr]).await;
+        let initial = router
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let sid = &session(&initial, "modem-a").unwrap()["session"];
+        radio.control.call(json!({"op":op})).await;
+        // Enough notices to fill the adapter's 4 KiB pipe and the output queue.
+        // The adapter stays alive, keeps stdout open, and never reads stdin.
+        router.control.batch(announcements(sid, 192)).await;
+        router
+            .wait(|s| {
+                s["state"] == json!({})
+                    && notice(s, "session_down", |n| n["status"] == 255).is_some()
+            })
+            .await;
+        assert!(!radio.exit().await.success());
+        let log = radio.log();
+        assert!(
+            [
+                "writing to radio adapter",
+                "radio adapter input stalled",
+                "radio adapter writer stopped"
+            ]
+            .iter()
+            .any(|cause| log.contains(cause)),
+            "{log}"
+        );
+        assert!(log.contains("shutting down"), "{log}");
+        assert!(router.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        router.stop().await;
+        router.assert_final_empty();
+    }
+}
+
+#[tokio::test]
+async fn temporarily_paused_radio_recovers_notices_and_answers_a_pending_request() {
+    let (mut radio, addr) = Node::modem("modem-a", "127.0.0.1", 0).await;
+    report(&mut radio, MAC, 700, 1).await;
+    let mut router = Node::router(&[addr]).await;
+    let initial = router
+        .wait(|s| destination(s, "modem-a", MAC).is_some())
+        .await;
+    let sid = &session(&initial, "modem-a").unwrap()["session"];
+    radio.control.call(json!({"op":"pause"})).await;
+    router.control.batch(announcements(sid, 144)).await;
+    radio
+        .wait(|s| s["queued_bytes"].as_u64().unwrap() > 2048)
+        .await;
+    router
+        .control
+        .send(json!({"type":"link_request", "request":145,
+        "session":sid, "mac":MAC, "requested":{"current_data_rate_tx_bps":444}}))
+        .await;
+    router.result(145, "accepted").await;
+    radio.control.call(json!({"op":"resume"})).await;
+    respond(&mut radio, json!({"current_data_rate_tx_bps":444}), true).await;
+    let latest = router
+        .wait(|s| {
+            destination(s, "modem-a", MAC)
+                .is_some_and(|d| d["metrics"]["current_data_rate_tx_bps"] == 444)
+        })
+        .await;
+    assert_eq!(session(&latest, "modem-a").unwrap()["session"], *sid);
+    let received = radio
+        .wait(|s| {
+            s["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["type"] == "destination_announced")
+                .count()
+                == 144
+        })
+        .await;
+    assert_eq!(
+        notice(&received, "session_sync", |_| true).unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    router.stop().await;
+    router.assert_final_empty();
+    radio.stop().await;
+}

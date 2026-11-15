@@ -25,7 +25,7 @@ buffers = {"control": b"", "stdin": b""}
 state, pending, generation, pending_generation = {}, None, None, None
 notices = collections.deque(maxlen=4096)
 generations = collections.deque(maxlen=512)
-reading, records = True, 0
+reading, input_open, records = True, True, 0
 
 
 def reply(value):
@@ -39,14 +39,15 @@ def send(messages):
 
 def status():
     queued = array.array("i", [0])
-    fcntl.ioctl(0, termios.FIONREAD, queued)
+    if input_open:
+        fcntl.ioctl(0, termios.FIONREAD, queued)
     return {"state": state, "generation": generation,
             "notices": list(notices), "generations": list(generations),
             "records": records, "queued_bytes": queued[0], "reading": reading}
 
 
 def command(message):
-    global reading
+    global reading, input_open
     op = message["op"]
     if op == "send":
         send(message["messages"])
@@ -61,6 +62,11 @@ def command(message):
         if not reading:
             selector.register(0, selectors.EVENT_READ, "stdin")
             reading = True
+    elif op == "close_input":
+        if reading:
+            selector.unregister(0)
+        reading, input_open = False, False
+        os.close(0)
     elif op == "crash":
         sys.exit(3)
     elif op != "status":

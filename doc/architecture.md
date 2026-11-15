@@ -843,9 +843,9 @@ The order of work was:
     retries busy initialization, and discards retries and pending adapter requests
     for ended sessions. Lag only loses transient notices, not current membership.
     Invalid values are logged and leave the table unchanged. Adapter exit,
-    closed output, malformed JSON, and lines over 64 KiB are fatal: the modem
-    terminates sessions with Shutting Down and exits with an error for the
-    supervisor to restart. Unknown message types are ignored for forward
+    failed/stalled input, closed output, malformed JSON, and lines over 64 KiB
+    are fatal: the modem terminates sessions with Shutting Down and exits with
+    an error for the supervisor to restart. Unknown message types are ignored for forward
     compatibility; unknown fields in known messages are errors. The adapter is
     started before sockets open, without the modem's ambient capabilities, and
     is killed if it ignores input EOF for two seconds at shutdown.
@@ -912,6 +912,21 @@ The order of work was:
     Command and restart scenarios run over both IPv4 and IPv6 with strict GTSM.
     These are static plaintext integration tests of our own daemons and scripted
     adapters, not independent protocol or radio hardware interoperability tests.
+
+35. Radio adapter backpressure and failure handling. **Done** — input/output
+    queues and the link-request queue each hold at most 64 entries; at most
+    64 requests can await radio answers. Excess requests receive Request Denied
+    with `radio adapter busy`. Cancellation or timeout frees capacity and prevents
+    forwarding requests still waiting for output capacity. Already queued or
+    delivered requests cannot be recalled.
+
+    The writer has a five-second deadline per record. Broken or stalled writes
+    now fail the bridge, triggering graceful session termination and a failing
+    modem exit for supervisor restart. A bounded output queue backpressures the
+    bridge while session tasks continue running. Shutdown bounds draining and
+    process exit; dropping an adapter also aborts its I/O tasks. Tests cover
+    partial writes, write failure/deadlines, queue and pending-request limits,
+    cancellation, and real subprocess pause/recovery and input-failure shutdown.
 
 ---
 

@@ -154,6 +154,13 @@ fills its real input pipe and causes broadcast lag; the test requires both an
 explicit event-gap notice and recovery of the complete latest state. Control
 sockets operate the adapters without bypassing the daemons' public protocols.
 
+The same suite pauses radio input long enough to block writes and closes it
+while keeping the adapter alive. Both cases must terminate the modem sessions
+with Shutting Down and fail the modem process. A shorter pause must recover
+all queued notices and complete a pending link request on the original session.
+Radio bridge unit tests separately exercise bounded requests, cancellation,
+partial writes, and the output deadline using virtual time.
+
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:
 
