@@ -488,6 +488,28 @@ JSON summary. There is no coverage-percentage gate yet; reports provide a
 baseline for the final coverage review. Reports are under `target/coverage/`,
 which is already ignored by Git.
 
+## Fuzzing
+
+`.github/workflows/fuzz.yml` runs two cargo-fuzz 0.13.2 targets on changes to the
+codec, FSM, fuzz workspace, or workspace manifests, and on manual dispatch.
+Each nightly AddressSanitizer job fuzzes for 30 seconds, with a five-second input
+deadline, 2 GiB RSS limit, and a 15-minute job deadline. Generated corpora and
+failure artifacts are uploaded for 14 days. CI verifies `fuzz/Cargo.lock` did
+not change during execution.
+
+`wire_decode` checks panic freedom and stable re-encoding of accepted messages,
+signals, and Data Items, including maximum-length bodies. `session_sequence`
+drives both session FSMs with real initialization, injected messages, application
+commands, timers, and teardown under both MAC formats. Every emitted message
+must encode/decode before delivery to the other FSM; operation and response
+budgets bound each input. The independent unpublished workspace keeps fuzzing
+dependencies and nightly requirements outside release packages.
+
+See [fuzzing instructions](../fuzz/README.md) for seed generation, longer runs,
+input formats, failure replay/minimization, and the local LeakSanitizer sandbox
+limitation. Short runs are smoke evidence; network transports, TLS, discovery
+FSMs, extensions, and adapters are outside these targets.
+
 ## Dependency audit
 
 `.github/workflows/audit.yml` runs cargo-audit 0.22.2 for dependency,

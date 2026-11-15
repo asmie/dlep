@@ -1,0 +1,66 @@
+name: Fuzz smoke checks
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - 'crates/dlep-core/**'
+      - 'crates/dlep-fsm/**'
+      - 'fuzz/**'
+      - '.github/scripts/seed-fuzz.py'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches: [master]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - 'crates/dlep-core/**'
+      - 'crates/dlep-fsm/**'
+      - 'fuzz/**'
+      - '.github/scripts/seed-fuzz.py'
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wire_decode, session_sequence]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - run: cargo fetch --manifest-path fuzz/Cargo.toml --locked
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+      - run: python3 -B .github/scripts/seed-fuzz.py
+      - name: Run bounded AddressSanitizer fuzzing
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: cargo +nightly fuzz run '${{ matrix.target }}' -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+      - name: Verify fuzz dependency resolution stayed locked
+        if: always()
+        run: git diff --exit-code -- fuzz/Cargo.lock
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,33 @@
+[package]
+name = "dlep-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Keep fuzz tooling outside the release workspace and its MSRV/dependency set.
+[workspace]
+members = ["."]
+resolver = "3"
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+bytes = "1"
+dlep-core = { path = "../crates/dlep-core" }
+dlep-fsm = { path = "../crates/dlep-fsm" }
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_sequence"
+path = "fuzz_targets/session_sequence.rs"
+test = false
+doc = false
+bench = false

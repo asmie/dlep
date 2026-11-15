@@ -495,8 +495,10 @@ session lifecycle events. No production changes were needed. The full suite now
 passes **449 tests**, with formatting, clippy, and Rust 1.85 checks also passing.
 See [local reproduction](ci.md#network-tests-and-coverage) to increase
 the cycle count. This does not measure heap growth, simultaneous clients, TLS
-churn, or multi-day stability. Dedicated `cargo-fuzz` targets remain a validation
-gap; coverage percentages have not been recollected for this checkpoint.
+churn, or multi-day stability. Dedicated codec and session-sequence fuzz targets
+are now available in the separate [fuzz workspace](../fuzz/README.md), with
+bounded nightly CI smoke runs. Coverage percentages have not been recollected
+for this checkpoint.
 
 See [CI documentation](ci.md) for exact jobs and reproduction
 commands. Linux tests run in a disposable network namespace with strict GTSM
@@ -1251,6 +1253,17 @@ The order of work was:
     regressions exercise both IP families. No production protocol changes or
     peer source patches were needed. IPv6 discovery interoperability and TLS
     interoperability remain unverified.
+
+63. Coverage-guided codec and session fuzzing. **Done** — a separate unpublished
+    workspace provides libFuzzer targets for decoding/re-encoding messages,
+    signals, and Data Items, plus bounded router/modem event sequences using
+    both MAC formats. Real initialization and peer delivery keep the session
+    harness on reachable protocol paths; injected malformed messages, commands,
+    timers, and teardown explore failure paths. Deterministic seeds include
+    maximum-length wire bodies. Nightly CI runs each target with AddressSanitizer
+    for 30 seconds and retains corpora/failure artifacts. Release dependencies
+    and Rust 1.85 remain unchanged. Network/TLS and discovery FSM fuzzing remain
+    future work; short runs do not establish complete semantic correctness.
 
 ---
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added separate cargo-fuzz targets for message/signal/Data Item decoding and
+  bounded router/modem session event sequences. Deterministic seeds, nightly
+  AddressSanitizer CI smoke runs, and corpus/failure artifacts support longer
+  local campaigns without changing the release workspace or its Rust minimum.
 - Independent dlepard checks now discover our modem over IPv4 multicast and
   complete both termination directions without a configured TCP endpoint.
   The harness configures multicast TTL 255 and local loopback on the upstream
