@@ -199,6 +199,13 @@ into this router's response. Routers already connected learn of another
 session's grant only through a `destination_update`, so send one if they should
 see it. Later routers receive the accumulated cached values.
 
+For a valid reply, the bridge waits for the requesting session to accept and
+write the response before updating the table or processing the next radio
+report. This preserves the order of a grant followed immediately by newer
+metrics. A reply rejected during termination or lost before local acceptance
+leaves the table unchanged. Local acceptance does not acknowledge receipt by
+the router.
+
 Both merged results must use declared metrics and fit the wire format. The
 complete response, including the MAC, status text, and every declared metric,
 must also fit the 65,535-byte DLEP message body. Text counts in UTF-8 bytes;

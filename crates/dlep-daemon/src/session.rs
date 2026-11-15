@@ -650,21 +650,25 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
             // A link-control backend answered a deferred request. If the FSM
             // rejects the answer (e.g. undeclared metrics), deny instead so
             // the router's transaction still completes.
-            Some(event) = lifecycle.link_jobs.next(), if !lifecycle.link_jobs.is_empty() => {
+            Some((event, receipt)) = lifecycle.link_jobs.next(), if !lifecycle.link_jobs.is_empty() => {
                 let fallback = crate::link_control::fallback_denial(&event);
                 let mut actions = fsm.step(event);
-                if actions.iter().any(|action| matches!(action, FsmAction::Emit(EmittedEvent::CommandRejected(r)) if r.reason == dlep_fsm::CommandError::InvalidInput)) {
+                let outcome = actions.iter().find_map(|action| match action {
+                    FsmAction::Emit(EmittedEvent::CommandRejected(rejection)) => Some(*rejection),
+                    _ => None,
+                }).map_or(Ok(()), Err);
+                if matches!(outcome, Err(r) if r.reason == dlep_fsm::CommandError::InvalidInput) {
                     tracing::warn!(session = session_id.0, "link-control backend returned an invalid response; denying the request");
                     actions.extend(fsm.step(fallback.expect("link-control response")));
                 }
-                if process_actions(&mut fsm,
+                let closed = process_actions(&mut fsm,
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
                     &mut lifecycle, &mut pending_sends,
-                ).await? {
-                    break;
-                }
+                ).await?;
+                if let Some(receipt) = receipt { let _ = receipt.send(outcome); }
+                if closed { break; }
             }
 
             Some((id, kind, generation)) = timer_expiry_rx.recv() => {

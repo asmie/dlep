@@ -17,6 +17,7 @@ use std::sync::Arc;
 use dlep_core::{MacAddress, StatusCode};
 use dlep_ext::SessionId;
 use dlep_fsm::FsmEvent;
+use tokio::sync::oneshot;
 use tokio::task::{Id, JoinSet};
 use tracing::warn;
 
@@ -84,6 +85,33 @@ impl LinkResponse {
 
 pub type LinkControlFuture = Pin<Box<dyn Future<Output = LinkResponse> + Send + 'static>>;
 
+/// Local disposition of a backend reply. Success means the session accepted
+/// it and completed its local actions, including the response write; it is not
+/// a peer acknowledgement. Rejection refers to the original reply even when
+/// the runtime sends a fallback denial. A dropped sender leaves the outcome
+/// unknown (for example, cancellation or an I/O failure during the write).
+pub type LinkResponseReceipt = oneshot::Sender<Result<(), dlep_fsm::CommandRejection>>;
+
+/// Backend answer with an optional local acceptance receipt.
+#[derive(Debug)]
+pub struct LinkControlReply {
+    pub response: LinkResponse,
+    /// Sent after the original reply's local actions and state publication.
+    /// Dropping the receiver does not cancel the reply.
+    pub receipt: Option<LinkResponseReceipt>,
+}
+
+impl From<LinkResponse> for LinkControlReply {
+    fn from(response: LinkResponse) -> Self {
+        Self {
+            response,
+            receipt: None,
+        }
+    }
+}
+
+pub type LinkControlReplyFuture = Pin<Box<dyn Future<Output = LinkControlReply> + Send + 'static>>;
+
 /// Applies router-requested link changes on behalf of the modem daemon.
 ///
 /// The returned future runs on its own task. It is dropped without a response
@@ -109,6 +137,15 @@ pub type LinkControlFuture = Pin<Box<dyn Future<Output = LinkResponse> + Send + 
 /// ```
 pub trait LinkControl: Send + Sync + 'static {
     fn request(&self, request: LinkRequest) -> LinkControlFuture;
+
+    /// The runtime calls this method. Override it to attach an acceptance
+    /// receipt before retaining a grant or handling a later hardware report.
+    /// Existing backends use `request` unchanged through this default.
+    /// Await the receipt outside the returned future, which must finish first.
+    fn request_with_receipt(&self, request: LinkRequest) -> LinkControlReplyFuture {
+        let response = self.request(request);
+        Box::pin(async move { response.await.into() })
+    }
 }
 
 impl<F, Fut> LinkControl for F
@@ -125,7 +162,7 @@ where
 #[derive(Default)]
 pub(crate) struct LinkJobs {
     backend: Option<Arc<dyn LinkControl>>,
-    tasks: JoinSet<LinkResponse>,
+    tasks: JoinSet<LinkControlReply>,
     macs: HashMap<Id, MacAddress>,
 }
 
@@ -145,9 +182,9 @@ impl LinkJobs {
             Some(backend) => {
                 let backend = Arc::clone(backend);
                 self.tasks
-                    .spawn(async move { backend.request(request).await })
+                    .spawn(async move { backend.request_with_receipt(request).await })
             }
-            None => self.tasks.spawn(async { LinkResponse::denied() }),
+            None => self.tasks.spawn(async { LinkResponse::denied().into() }),
         };
         self.macs.insert(handle.id(), mac);
     }
@@ -157,16 +194,16 @@ impl LinkJobs {
     }
 
     /// Next completed answer as the FSM event that sends it.
-    pub(crate) async fn next(&mut self) -> Option<FsmEvent> {
+    pub(crate) async fn next(&mut self) -> Option<(FsmEvent, Option<LinkResponseReceipt>)> {
         let (id, response) = match self.tasks.join_next_with_id().await? {
             Ok((id, response)) => (id, response),
             Err(error) => {
                 warn!("link-control backend failed: {error}; denying the request");
-                (error.id(), LinkResponse::denied())
+                (error.id(), LinkResponse::denied().into())
             }
         };
         let mac = self.macs.remove(&id).expect("tracked link-control task");
-        Some(response.into_event(mac))
+        Some((response.response.into_event(mac), response.receipt))
     }
 }
 
@@ -209,12 +246,12 @@ mod tests {
 
             assert!(matches!(
                 jobs.next().await,
-                Some(FsmEvent::AppLinkCharacteristicsResponse {
+                Some((FsmEvent::AppLinkCharacteristicsResponse {
                     mac: response_mac,
                     status: StatusCode::REQUEST_DENIED,
                     text,
                     metrics: None,
-                }) if response_mac == mac && text.is_empty()
+                }, None)) if response_mac == mac && text.is_empty()
             ));
             assert!(jobs.is_empty());
             assert!(jobs.macs.is_empty());

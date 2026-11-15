@@ -1035,6 +1035,19 @@ The order of work was:
     validation and Busy handling, and verify a single retained-state change with
     isolated router sessions across both MAC formats and IP families.
 
+46. Local acceptance receipts for link replies. **Done** —
+    `LinkControl::request_with_receipt` returns a `LinkControlReply` with an
+    optional receipt; its default preserves existing backends and closures.
+    The session reports success after processing the reply, writing the response,
+    and publishing local state. Rejection refers to the original answer even
+    when an invalid reply becomes a fallback denial; cancellation or a write
+    failure can drop the receipt with the outcome unknown. The radio bridge
+    waits for success before retaining a grant, and completes this handoff
+    before handling later reports. Regressions reproduce rejected grants
+    changing replay during termination, cover acceptance, rejection, cancellation,
+    and abandoned receipts, and check adjacent grant/report lines and later
+    replay through real adapters over IPv4/IPv6.
+
 ---
 
 ## 10. Open questions / risks

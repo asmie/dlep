@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Radio link grants enter the replay cache only after the session accepts and
+  writes the response. Replies rejected during termination or cancelled before
+  acceptance leave the cache unchanged, and later radio reports wait for the
+  reply to be handled. Backends can opt into the same local acceptance receipt
+  through `LinkControl::request_with_receipt` and `LinkControlReply`; existing
+  implementations and closures keep working unchanged.
 - Initial radio replay preserves live destination metrics in a single session
   command. A stale membership snapshot can no longer restore old values over a
   completed link grant. `SessionCommand::SessionDefaults` changes defaults while

@@ -1115,6 +1115,80 @@ async fn partial_link_grants_preserve_new_reports_and_other_sessions_cache_chang
 }
 
 #[tokio::test]
+async fn a_report_immediately_after_a_link_grant_wins_for_live_state_and_replay() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        let mut router = Node::router(&[addr]).await;
+        let initial = router
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+        let requested = json!({"current_data_rate_tx_bps":321,"latency_us":444});
+        router
+            .control
+            .send(json!({"type":"link_request", "request":1,
+            "session":sid, "mac":MAC, "requested":requested}))
+            .await;
+        router.result(1, "accepted").await;
+        let pending = radio
+            .wait(|s| notice(s, "link_request", |_| true).is_some())
+            .await;
+        let request = notice(&pending, "link_request", |_| true).unwrap()["request"].clone();
+        // Send adjacent lines without waiting for the grant to reach the router.
+        // The address change marks completion of the later destination report.
+        radio
+            .control
+            .batch(vec![
+                json!({"type":"link_response", "request":request, "status":"success",
+                "text":"applied before report", "metrics":requested}),
+                json!({"type":"destination_update", "mac":MAC,
+                "metrics":{"current_data_rate_tx_bps":654,"current_data_rate_rx_bps":250}}),
+                json!({"type":"destination_addresses", "mac":MAC,
+                "remove":addresses(1), "add":addresses(2)}),
+            ])
+            .await;
+        let updated = router
+            .wait(|s| {
+                notice(s, "link_response", |n| n["text"] == "applied before report").is_some()
+                    && destination(s, "modem-a", MAC)
+                        .is_some_and(|d| d["addresses"] == expected_addresses(2))
+            })
+            .await;
+        assert_eq!(
+            notice(&updated, "link_response", |_| true).unwrap()["status"],
+            0
+        );
+        let mut expected = defaults();
+        expected["current_data_rate_tx_bps"] = json!(654);
+        expected["current_data_rate_rx_bps"] = json!(250);
+        expected["latency_us"] = json!(444);
+        expected["rlq_tx"] = json!(0);
+        assert_eq!(
+            destination(&updated, "modem-a", MAC).unwrap()["metrics"],
+            expected
+        );
+        let mut late = Node::router(&[addr]).await;
+        let replay = late
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["metrics"],
+            expected
+        );
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["addresses"],
+            expected_addresses(2)
+        );
+        for consumer in [&mut router, &mut late] {
+            consumer.stop().await;
+            consumer.assert_final_empty();
+        }
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn old_link_grant_cannot_change_a_replacement_or_its_replay() {
     for ip in ["127.0.0.1", "::1"] {
         let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;

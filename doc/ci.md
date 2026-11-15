@@ -186,6 +186,13 @@ checking exact wire limits and one-byte overflow with ASCII and multibyte text
 under both MAC formats. The real adapter pipeline sends compact JSON that fits
 the line limit but exceeds the response limit; IPv4/IPv6 cases require unchanged
 replay to a later router and a subsequent valid grant on the original session.
+Link-reply acceptance tests reject a grant during session termination and require
+unchanged replay. Runtime tests check receipt delivery after state publication,
+original rejection despite fallback denial, cancellation, and abandoned receipt
+receivers. Bridge tests require successful acceptance before caching and hold
+the receipt to check ordering. The IPv4/IPv6 adapter pipeline sends a grant and
+a newer report on adjacent lines; live state and later replay must retain the
+newer report.
 Address-cache regressions accumulate individually valid batches beyond the
 Destination Up wire limit, with and without a connected router. Rejected batches
 must preserve all addresses, later replay must work, and a batch that frees space

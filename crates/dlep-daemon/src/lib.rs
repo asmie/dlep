@@ -30,7 +30,7 @@ pub use events::{
     AddressChanges, DaemonEvent, DestinationAddrs, DestinationEvent, DestinationId,
     LinkCharacteristics, LinkMetrics, MetricsEvent, PeerInfo, PeerOffer,
 };
-pub use link_control::{LinkControl, LinkRequest, LinkResponse};
+pub use link_control::{LinkControl, LinkControlReply, LinkRequest, LinkResponse};
 pub use modem::{ModemBuilder, ModemDaemon};
 pub use router::{RouterBuilder, RouterDaemon};
 pub use state::{

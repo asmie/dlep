@@ -17,11 +17,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dlep_core::{MacAddress, MacAddressFormat, StatusCode};
-use dlep_daemon::link_control::LinkControlFuture;
+use dlep_daemon::link_control::{LinkControlFuture, LinkControlReplyFuture};
 use dlep_daemon::{
     AddressChanges, CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs,
-    DestinationEvent, DestinationId, DestinationPhase, LinkControl, LinkMetrics, LinkRequest,
-    LinkResponse, ModemDaemon, PeerInfo, RadioConfig, SessionCommand, SessionPhase,
+    DestinationEvent, DestinationId, DestinationPhase, LinkControl, LinkControlReply, LinkMetrics,
+    LinkRequest, LinkResponse, ModemDaemon, PeerInfo, RadioConfig, SessionCommand, SessionPhase,
 };
 use dlep_ext::SessionId;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -303,7 +303,7 @@ struct SessionPeer {
     peer: SocketAddr,
 }
 
-type Ask = (LinkRequest, oneshot::Sender<LinkResponse>);
+type Ask = (LinkRequest, oneshot::Sender<LinkControlReply>);
 
 /// Forwards link requests to the bridge task and bounds the adapter's answer.
 struct RadioLink {
@@ -313,6 +313,11 @@ struct RadioLink {
 
 impl LinkControl for RadioLink {
     fn request(&self, request: LinkRequest) -> LinkControlFuture {
+        let reply = self.request_with_receipt(request);
+        Box::pin(async move { reply.await.response })
+    }
+
+    fn request_with_receipt(&self, request: LinkRequest) -> LinkControlReplyFuture {
         let (answer, response) = oneshot::channel();
         let sent = self.asks.try_send((request, answer));
         let timeout = self.timeout;
@@ -322,14 +327,18 @@ impl LinkControl for RadioLink {
                     mpsc::error::TrySendError::Full(_) => "radio adapter busy",
                     mpsc::error::TrySendError::Closed(_) => "radio adapter unavailable",
                 };
-                return LinkResponse::denied().with_text(text);
+                return LinkResponse::denied().with_text(text).into();
             }
             match tokio::time::timeout(timeout, response).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) => LinkResponse::denied().with_text("radio adapter unavailable"),
+                Ok(Err(_)) => LinkResponse::denied()
+                    .with_text("radio adapter unavailable")
+                    .into(),
                 Err(_) => {
                     warn!("radio adapter did not answer a link request in time");
-                    LinkResponse::denied().with_text("radio adapter timed out")
+                    LinkResponse::denied()
+                        .with_text("radio adapter timed out")
+                        .into()
                 }
             }
         })
@@ -594,7 +603,7 @@ struct Known {
 
 struct Pending {
     session_id: SessionId,
-    answer: oneshot::Sender<LinkResponse>,
+    answer: oneshot::Sender<LinkControlReply>,
     mac: MacAddress,
     current: LinkMetrics,
     /// False once this request's physical destination has been withdrawn.
@@ -783,7 +792,7 @@ impl Bridge<'_> {
                 for metrics in metrics.iter().chain(cached.iter()) {
                     if let Err(e) = self.daemon.validate_metrics(metrics) {
                         warn!(request, "radio adapter link response rejected: {e}");
-                        let _ = pending.answer.send(LinkResponse::denied());
+                        let _ = pending.answer.send(LinkResponse::denied().into());
                         return;
                     }
                 }
@@ -802,16 +811,38 @@ impl Bridge<'_> {
                         .validate_link_response(pending.mac.into(), &response, &current)
                 {
                     warn!(request, "radio adapter link response rejected: {e}");
-                    let _ = pending.answer.send(LinkResponse::denied());
+                    let _ = pending.answer.send(LinkResponse::denied().into());
                     return;
                 }
-                let delivered = pending.answer.send(response);
-                if delivered.is_ok() {
-                    if let (Some(metrics), Some(known)) =
-                        (cached, self.destinations.get_mut(&pending.mac))
-                    {
-                        known.metrics = metrics;
+                let (receipt, accepted) = oneshot::channel();
+                if pending
+                    .answer
+                    .send(LinkControlReply {
+                        response,
+                        receipt: Some(receipt),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                // Serialize later radio reports after session acceptance, not
+                // merely delivery to the backend future. A rejected or lost
+                // response must not poison the replay cache.
+                match accepted.await {
+                    Ok(Ok(())) => {
+                        if let (Some(metrics), Some(known)) =
+                            (cached, self.destinations.get_mut(&pending.mac))
+                        {
+                            known.metrics = metrics;
+                        }
                     }
+                    Ok(Err(error)) => {
+                        debug!(request, ?error, "radio link reply rejected by session")
+                    }
+                    Err(_) => debug!(
+                        request,
+                        "radio link reply acceptance unknown; cache unchanged"
+                    ),
                 }
             }
             Inbound::Unknown => debug!("ignoring unknown radio adapter message type"),
@@ -825,7 +856,11 @@ impl Bridge<'_> {
             return Ok(());
         }
         if self.pending.len() >= MAX_PENDING {
-            let _ = answer.send(LinkResponse::denied().with_text("radio adapter busy"));
+            let _ = answer.send(
+                LinkResponse::denied()
+                    .with_text("radio adapter busy")
+                    .into(),
+            );
             return Ok(());
         }
         let id = self.next_request;
@@ -1346,7 +1381,7 @@ mod tests {
         let (answer, response) = oneshot::channel();
         bridge.ask((link_request(), answer)).await.unwrap();
         assert_eq!(
-            response.await.unwrap(),
+            response.await.unwrap().response,
             LinkResponse::denied().with_text("radio adapter busy")
         );
         assert_eq!(bridge.pending.len(), MAX_PENDING);
@@ -3273,6 +3308,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn link_grant_rejected_during_termination_does_not_change_replay() {
+        let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
+        let daemon = modem_with(Some(Arc::new(RadioLink {
+            asks,
+            timeout: Duration::from_secs(30),
+        })))
+        .await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(100),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        send(
+            &mut peer,
+            build_link_characteristics_request(
+                mac(),
+                &dlep_daemon::LinkCharacteristics {
+                    latency: Some(Duration::from_micros(321)),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        let ask = tokio::time::timeout(WAIT, queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let sid = ask.0.session_id;
+        bridge.ask(ask).await.unwrap();
+        daemon
+            .send_command_to(
+                sid,
+                SessionCommand::Shutdown {
+                    reason: StatusCode::SHUTTING_DOWN,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_TERMINATION
+        );
+        assert_eq!(
+            daemon.state().borrow().sessions[&sid].phase,
+            SessionPhase::Terminating
+        );
+        bridge
+            .inbound(Inbound::LinkResponse {
+                request: 1,
+                status: Status::Success,
+                text: String::new(),
+                metrics: Some(Metrics {
+                    latency_us: Some(321),
+                    ..Default::default()
+                }),
+            })
+            .await;
+        assert_eq!(
+            bridge.destinations[&mac()].metrics.latency,
+            Duration::from_micros(100),
+            "a reply the terminating session cannot accept must not change replay"
+        );
+        send(
+            &mut peer,
+            Message::new(MessageType::SESSION_TERMINATION_RESPONSE),
+        )
+        .await;
+        let mut state = daemon.state();
+        tokio::time::timeout(WAIT, async {
+            while state.borrow_and_update().sessions.contains_key(&sid) {
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let mut late = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let replay = read(&mut late).await;
+        assert_eq!(replay.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&replay).unwrap().latency,
+            Duration::from_micros(100)
+        );
+        drop((peer, late));
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn link_responses_cache_only_live_valid_successes() {
         let daemon = modem().await;
         let mut bridge = bridge(&daemon);
@@ -3326,24 +3464,34 @@ mod tests {
             if closed {
                 assert!(response.await.is_err());
             } else {
-                assert_eq!(response.await.unwrap(), LinkResponse::denied());
+                assert_eq!(response.await.unwrap().response, LinkResponse::denied());
             }
             assert!(bridge.pending.is_empty());
             assert_eq!(bridge.destinations[&mac()].metrics, original);
         }
-        let (answer, response) = oneshot::channel();
-        bridge.pending.insert(
-            2,
-            Pending {
-                session_id: SessionId(1),
-                answer,
-                mac: mac(),
-                current: original,
-                update_cache: true,
-            },
-        );
-        bridge
-            .inbound(Inbound::LinkResponse {
+        for outcome in [
+            None,
+            Some(Err(dlep_fsm::CommandRejection {
+                command: dlep_fsm::CommandInfo {
+                    kind: dlep_fsm::CommandKind::LinkCharacteristicsResponse,
+                    destination: Some(mac()),
+                },
+                reason: CommandError::NotReady,
+            })),
+            Some(Ok(())),
+        ] {
+            let (answer, response) = oneshot::channel();
+            bridge.pending.insert(
+                2,
+                Pending {
+                    session_id: SessionId(1),
+                    answer,
+                    mac: mac(),
+                    current: original,
+                    update_cache: true,
+                },
+            );
+            let mut inbound = Box::pin(bridge.inbound(Inbound::LinkResponse {
                 request: 2,
                 status: Status::Success,
                 text: String::new(),
@@ -3351,13 +3499,37 @@ mod tests {
                     latency_us: Some(456),
                     ..Default::default()
                 }),
-            })
-            .await;
-        assert_eq!(response.await.unwrap().status, StatusCode::SUCCESS);
-        assert_eq!(
-            bridge.destinations[&mac()].metrics.latency,
-            Duration::from_micros(456)
-        );
+            }));
+            let reply = tokio::select! {
+                biased;
+                () = &mut inbound => panic!("reply delivery must wait for acceptance"),
+                reply = response => reply.unwrap(),
+            };
+            assert_eq!(reply.response.status, StatusCode::SUCCESS);
+            let receipt = reply.receipt.expect("acceptance requested");
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    inbound.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            if let Some(outcome) = outcome {
+                receipt.send(outcome).unwrap();
+            } else {
+                drop(receipt);
+            }
+            inbound.await;
+            assert_eq!(
+                bridge.destinations[&mac()].metrics.latency,
+                if outcome == Some(Ok(())) {
+                    Duration::from_micros(456)
+                } else {
+                    original.latency
+                }
+            );
+        }
         daemon.shutdown().await.unwrap();
     }
 

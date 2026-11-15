@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dlep_core::{MacAddress, StatusCode as S};
+use dlep_daemon::link_control::{LinkControlFuture, LinkControlReply, LinkControlReplyFuture};
 use dlep_daemon::{
     DaemonError, DaemonEvent, DestinationEvent, DestinationId, LinkCharacteristics, LinkControl,
     LinkMetrics, LinkRequest, LinkResponse, ModemConfig, ModemDaemon, RouterConfig, RouterDaemon,
@@ -37,9 +38,13 @@ struct Pair {
 
 impl Pair {
     async fn new(backend: Arc<dyn LinkControl>) -> Self {
+        Self::new_on(backend, "127.0.0.1").await
+    }
+
+    async fn new_on(backend: Arc<dyn LinkControl>, ip: &str) -> Self {
         let mut config = ModemConfig::default();
         config.shared.network.use_tls = false;
-        config.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
+        config.shared.network.bind_addr = ip.parse().unwrap();
         config.shared.network.tcp_port = 0;
         config.shared.network.discovery_port = 0;
         let modem = ModemDaemon::builder()
@@ -125,6 +130,140 @@ impl Pair {
         self.router.shutdown().await.unwrap();
         self.modem.shutdown().await.unwrap();
     }
+}
+
+struct ReceiptBackend<F>(F);
+
+impl<F, Fut> LinkControl for ReceiptBackend<F>
+where
+    F: Fn(LinkRequest) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = LinkControlReply> + Send + 'static,
+{
+    fn request(&self, request: LinkRequest) -> LinkControlFuture {
+        let reply = self.request_with_receipt(request);
+        Box::pin(async move { reply.await.response })
+    }
+
+    fn request_with_receipt(&self, request: LinkRequest) -> LinkControlReplyFuture {
+        Box::pin((self.0)(request))
+    }
+}
+
+#[tokio::test]
+async fn reply_receipts_follow_local_processing_and_preserve_original_rejection() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        let backend = ReceiptBackend(move |request: LinkRequest| {
+            let (answer, response) = oneshot::channel();
+            requests.send((request, answer)).unwrap();
+            async move { response.await.unwrap() }
+        });
+        let mut pair = Pair::new_on(Arc::new(backend), ip).await;
+        let granted = LinkMetrics {
+            current_data_rate_tx_bps: 123_000,
+            ..current()
+        };
+        for (response, valid) in [
+            (LinkResponse::granted(granted), true),
+            (
+                LinkResponse::granted(LinkMetrics {
+                    mtu: Some(1400),
+                    ..granted
+                }),
+                false,
+            ),
+            (
+                LinkResponse {
+                    status: S::INVALID_DATA,
+                    ..LinkResponse::denied()
+                },
+                false,
+            ),
+            (
+                LinkResponse::granted(granted).with_text("x".repeat(65536)),
+                false,
+            ),
+            (LinkResponse::denied().with_text("unchanged"), true),
+        ] {
+            pair.request().await.unwrap();
+            let (request, answer) = timeout(WAIT, pending.recv()).await.unwrap().unwrap();
+            let wire_status = if valid {
+                response.status
+            } else {
+                S::REQUEST_DENIED
+            };
+            let (receipt, accepted) = oneshot::channel();
+            answer
+                .send(LinkControlReply {
+                    response,
+                    receipt: Some(receipt),
+                })
+                .unwrap();
+            let outcome = timeout(WAIT, accepted).await.unwrap().unwrap();
+            if valid {
+                assert_eq!(outcome, Ok(()));
+            } else {
+                let rejection = outcome.unwrap_err();
+                assert_eq!(rejection.reason, dlep_daemon::CommandError::InvalidInput);
+                assert_eq!(
+                    rejection.command.kind,
+                    dlep_daemon::CommandKind::LinkCharacteristicsResponse
+                );
+                assert_eq!(rejection.command.destination, Some(destination().0));
+            }
+            // The receipt follows local state publication and the wire write.
+            assert_eq!(
+                pair.modem.state().borrow().sessions[&request.session_id].destinations
+                    [&destination()]
+                    .metrics,
+                granted
+            );
+            let (status, _, metrics) = pair.response().await;
+            assert_eq!(status, wire_status);
+            assert_eq!(metrics, granted);
+        }
+        // A consumer abandoning its receipt does not cancel an accepted reply.
+        pair.request().await.unwrap();
+        let (_, answer) = timeout(WAIT, pending.recv()).await.unwrap().unwrap();
+        let (receipt, accepted) = oneshot::channel();
+        drop(accepted);
+        answer
+            .send(LinkControlReply {
+                response: LinkResponse::granted(current()),
+                receipt: Some(receipt),
+            })
+            .unwrap();
+        assert_eq!(
+            pair.response().await,
+            (S::SUCCESS, String::new(), current())
+        );
+        pair.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_backend_drops_its_unaccepted_receipt() {
+    let (receipt, accepted) = oneshot::channel();
+    let (started, ready) = oneshot::channel();
+    let channels = Arc::new(Mutex::new(Some((receipt, started))));
+    let backend = ReceiptBackend(move |request: LinkRequest| {
+        let (receipt, started) = channels.lock().unwrap().take().unwrap();
+        async move {
+            let reply = LinkControlReply {
+                response: LinkResponse::granted(request.current),
+                receipt: Some(receipt),
+            };
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            reply
+        }
+    });
+    let pair = Pair::new(Arc::new(backend)).await;
+    pair.request().await.unwrap();
+    timeout(WAIT, ready).await.unwrap().unwrap();
+    pair.router.shutdown().await.unwrap();
+    assert!(timeout(WAIT, accepted).await.unwrap().is_err());
+    pair.modem.shutdown().await.unwrap();
 }
 
 async fn event(

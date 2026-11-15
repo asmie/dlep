@@ -325,11 +325,21 @@ let modem = ModemDaemon::builder()
     .await?;
 ```
 
-Before caching an answer, embedders can call
+To check an answer's content before dispatch, embedders can call
 `ModemDaemon::validate_link_response(id, &response, &current)` with the
 destination's latest effective metrics. It checks the status, metric declarations,
 and complete response encoding, including status text and inherited optional
 metrics. Session state and pending-request checks still occur when dispatching.
+
+Backends that retain granted values can override `LinkControl::request_with_receipt`
+and return a `LinkControlReply` with a Tokio oneshot sender in `receipt`.
+`Ok(())` means the session accepted the reply, completed the local response write,
+and published its state; it does not acknowledge receipt by the peer. `Err`
+describes rejection of the original answer, even if the daemon sends a fallback
+denial. A dropped sender means the outcome is unknown, for example after
+cancellation or a write failure. Wait for the receipt outside the returned
+future, which must finish first, and retain a grant only after `Ok(())`.
+Existing implementations and closures use the default method unchanged.
 
 Without a backend, the modem returns `Request Denied` with current destination
 metrics, keeping the session alive. The `dlep-modem` binary uses its
