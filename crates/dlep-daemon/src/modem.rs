@@ -90,6 +90,8 @@ impl ModemDaemon {
 
     /// Send effective address additions/removals to subscribed routers. Changes
     /// during Up acknowledgement are coalesced and sent once Up completes.
+    /// Large effective changes span multiple Destination Update messages;
+    /// receivers may observe intermediate address snapshots.
     pub async fn update_destination_addresses(
         &self,
         id: DestinationId,

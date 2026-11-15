@@ -978,6 +978,16 @@ The order of work was:
     with and without active sessions, policy retention after the final withdrawal,
     and valid reports, link grants, and replay through real adapters over IPv4/IPv6.
 
+41. Bounded destination address-update messages. **Done** — immediate and
+    coalesced address changes split into messages that fit the 16-bit body limit,
+    accounting for the MAC and any deferred metrics. Every chunk identifies the
+    destination; removals precede additions, metrics appear once, and advertised
+    state advances to the complete result. This prevents accepted changes from
+    later closing the session on encoding failure. FSM tests apply every encoded
+    chunk to a router and verify all four address families and optional metrics.
+    Runtime tests hold Up acknowledgements and exercise live MAC-overhead
+    boundaries over IPv4/IPv6 with both EUI-48 and EUI-64.
+
 ---
 
 ## 10. Open questions / risks

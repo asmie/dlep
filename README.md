@@ -256,6 +256,12 @@ acknowledged are coalesced; changes made while a router has withdrawn interest
 are retained for a later Announce. Session address commands return an explicit
 Busy error when another session transaction is in progress.
 
+Large effective destination address changes are sent in multiple Destination
+Update messages when necessary. Each carries the destination MAC; removals precede
+additions across messages, and deferred metrics are included once. Receivers can
+observe intermediate address snapshots as these messages arrive. Individual API
+batches and complete destination snapshots still undergo normal validation.
+
 `RouterDaemon::drop_destination(session_id, destination)` withdraws interest
 from one modem. The modem acknowledges with Destination Down Response, stops
 reporting that destination on this session, and emits a `DestinationEvent::Down`.

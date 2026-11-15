@@ -181,6 +181,12 @@ connects and after the last destination is removed. Real adapter pipelines verif
 valid reports, targeted link grants, and later replay under both format settings
 over IPv4 and IPv6 while incompatible reports are ignored.
 
+FSM address tests replace large snapshots while Up is pending, encode/decode
+each resulting chunk, and apply them to a router to check exact addresses and
+metrics. Runtime command tests cover accumulated changes and live batches whose
+MAC overhead crosses the message limit. Both MAC formats and transport families
+must deliver every chunk and keep the original session usable.
+
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:
 

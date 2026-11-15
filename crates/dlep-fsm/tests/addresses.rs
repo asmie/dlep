@@ -1,5 +1,7 @@
 mod common;
-use dlep_core::{DataItem, LinkMetrics, MacAddress, Message, MessageType as M, StatusCode as S};
+use dlep_core::{
+    DataItem, LinkMetrics, MacAddress, MacAddressFormat, Message, MessageType as M, StatusCode as S,
+};
 use dlep_fsm::events::EmittedEvent;
 use dlep_fsm::session_common::build_destination_update;
 use dlep_fsm::session_modem::{ModemSessionFsm, ModemSessionState};
@@ -324,6 +326,142 @@ fn address_changes_before_up_ack_coalesce_to_the_latest_state() {
     assert_eq!(AddressChanges::from_message(&update), replace(1, 3));
     r.step(E::RecvMessage(update));
     assert_eq!(r.destinations[&mac(1)].addrs, addresses(3));
+}
+
+#[test]
+fn large_coalesced_address_replacements_keep_every_update_encodable() {
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        let destination = match format {
+            MacAddressFormat::Eui48 => mac(1),
+            MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+        };
+        let initial_metrics = LinkMetrics {
+            resources: Some(80),
+            rlq_rx: Some(60),
+            rlq_tx: Some(70),
+            mtu: Some(1500),
+            ..Default::default()
+        };
+        let config = dlep_fsm::SessionConfig {
+            mac_address_format: format,
+            initial_metrics,
+            ..Default::default()
+        };
+        let mut r = RouterSessionFsm::with_config(config.clone());
+        let mut m = ModemSessionFsm::with_config(config);
+        m.step(E::TcpAccepted);
+        let init = sent(&r.step(E::TcpConnected), M::SESSION_INITIALIZATION);
+        let response = sent(
+            &m.step(E::RecvMessage(init)),
+            M::SESSION_INITIALIZATION_RESPONSE,
+        );
+        r.step(E::RecvMessage(response));
+        let large = |n| DestinationAddrs {
+            v6: (1..=3000)
+                .map(|suffix| std::net::Ipv6Addr::new(0x2001, 0xdb8, n, 0, 0, 0, 0, suffix))
+                .collect(),
+            ..addresses(n as u8)
+        };
+        let old = large(1);
+        let new = large(2);
+        let up = sent(
+            &m.step(E::AppAddDestination {
+                mac: destination,
+                metrics: initial_metrics,
+                addrs: old.clone(),
+            }),
+            M::DESTINATION_UP,
+        );
+        let up = Message::decode(up.encode().unwrap().freeze()).unwrap();
+        let ack = sent(&r.step(E::RecvMessage(up)), M::DESTINATION_UP_RESPONSE);
+        // Each accepted batch and resulting snapshot fits individually. The
+        // accumulated removals plus additions exceed one 16-bit message body.
+        for start in [0, 1000, 2000] {
+            let changes = AddressChanges {
+                added: DestinationAddrs {
+                    v6: new.v6[start..start + 1000].to_vec(),
+                    ..if start == 0 {
+                        addresses(2)
+                    } else {
+                        DestinationAddrs::default()
+                    }
+                },
+                removed: DestinationAddrs {
+                    v6: old.v6[start..start + 1000].to_vec(),
+                    ..if start == 0 {
+                        addresses(1)
+                    } else {
+                        DestinationAddrs::default()
+                    }
+                },
+            };
+            assert!(
+                m.step(E::AppUpdateAddresses {
+                    mac: destination,
+                    changes
+                })
+                .is_empty()
+            );
+        }
+        let metrics = LinkMetrics {
+            latency: Duration::from_micros(900),
+            rlq_rx: Some(0),
+            mtu: Some(1400),
+            ..initial_metrics
+        };
+        assert!(
+            m.step(E::AppUpdateMetrics {
+                mac: destination,
+                metrics
+            })
+            .is_empty()
+        );
+        let actions = m.step(E::RecvMessage(ack));
+        let mut updates = 0;
+        let mut metric_updates = 0;
+        let mut advertised = old;
+        for action in actions {
+            let A::SendMessage(message) = action else {
+                continue;
+            };
+            assert_eq!(message.message_type, M::DESTINATION_UPDATE);
+            let encoded = message
+                .encode()
+                .expect("coalesced update must fit on the wire");
+            assert!(encoded.len() <= usize::from(u16::MAX) + 4);
+            let message = Message::decode(encoded.freeze()).unwrap();
+            assert_eq!(
+                dlep_fsm::session_common::extract_destination_mac(&message),
+                Some(destination)
+            );
+            if let Some(actual) = dlep_fsm::session_common::extract_link_metrics(&message) {
+                assert_eq!(actual, metrics);
+                metric_updates += 1;
+            }
+            AddressChanges::from_message(&message)
+                .apply_strict(&mut advertised)
+                .unwrap();
+            r.step(E::RecvMessage(message));
+            assert_eq!(r.state(), RouterSessionState::InSession);
+            updates += 1;
+        }
+        assert_eq!(updates, 2);
+        assert_eq!(metric_updates, 1);
+        assert_eq!(advertised, new);
+        assert_eq!(r.destinations[&destination].addrs, new);
+        assert_eq!(r.destinations[&destination].metrics, metrics);
+        assert_eq!(m.destinations[&destination].advertised_addrs, new);
+        assert!(!m.destinations[&destination].pending_metrics);
+        assert_eq!(m.state(), ModemSessionState::InSession);
+        // A subsequent no-op must not replay any portion of the split update.
+        assert!(
+            m.step(E::AppUpdateAddresses {
+                mac: destination,
+                changes: AddressChanges::default()
+            })
+            .is_empty()
+        );
+    }
 }
 
 #[test]

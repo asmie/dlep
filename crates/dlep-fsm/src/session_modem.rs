@@ -8,10 +8,10 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
     SessionConfig, build_destination_announce_response, build_destination_down,
-    build_destination_up, build_destination_update, build_heartbeat, build_session_termination,
-    build_session_termination_response, build_session_update, build_session_update_response,
-    extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
-    extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    build_destination_up, build_destination_update, build_destination_updates, build_heartbeat,
+    build_session_termination, build_session_termination_response, build_session_update,
+    build_session_update_response, extract_destination_mac, extract_extensions_supported,
+    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -353,13 +353,15 @@ impl ModemSessionFsm {
                             d.announced = true;
                             let changes = AddressChanges::between(&d.advertised_addrs, &d.addrs);
                             if d.pending_metrics || !changes.is_empty() {
-                                let message = if d.pending_metrics {
-                                    build_destination_update(mac, &d.metrics)
-                                } else {
-                                    Message::new(MessageType::DESTINATION_UPDATE)
-                                        .with_item(DataItem::MacAddress(mac))
-                                };
-                                actions.push(FsmAction::SendMessage(changes.append_to(message)));
+                                actions.extend(
+                                    build_destination_updates(
+                                        mac,
+                                        d.pending_metrics.then_some(&d.metrics),
+                                        &changes,
+                                    )
+                                    .into_iter()
+                                    .map(FsmAction::SendMessage),
+                                );
                                 d.pending_metrics = false;
                                 d.advertised_addrs = d.addrs.clone();
                             }
@@ -414,12 +416,10 @@ impl ModemSessionFsm {
                     return Vec::new();
                 }
                 destination.advertised_addrs = destination.addrs.clone();
-                vec![FsmAction::SendMessage(
-                    effective.append_to(
-                        Message::new(MessageType::DESTINATION_UPDATE)
-                            .with_item(DataItem::MacAddress(mac)),
-                    ),
-                )]
+                build_destination_updates(mac, None, &effective)
+                    .into_iter()
+                    .map(FsmAction::SendMessage)
+                    .collect()
             }
             // InSession: app asks us to tear down a previously announced
             // destination. RFC 8175 §12.15 — open a per-destination transaction

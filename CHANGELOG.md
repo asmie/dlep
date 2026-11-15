@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Destination address updates split across wire-sized messages when accumulated
+  changes exceed one message, including updates coalesced before Up is acknowledged.
+  MAC and metric overhead count toward the limit. This prevents session closure
+  on encoding failure while preserving all removals, additions, and deferred metrics.
 - Radio destination reports with a MAC format incompatible with
   `[network].mac_address_format` are logged and ignored before entering the
   replay cache, including before any router connects.

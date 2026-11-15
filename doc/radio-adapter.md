@@ -92,6 +92,11 @@ removals in that batch. Remove enough addresses, either in the same batch or a
 later one, before adding more. This check also applies when no routers are
 connected, so the retained destination remains replayable.
 
+Effective address changes may span multiple Destination Update messages,
+especially when several reports coalesce while Up awaits acknowledgement.
+Removals precede additions across messages, and any coalesced metrics appear
+once. Routers can observe intermediate address snapshots before all changes arrive.
+
 Replay uses retained daemon session state and recovers even if the internal
 event subscriber falls behind. It retries busy session initialization, preserves
 existing per-session destination metrics, and respects a router's withdrawal.

@@ -370,6 +370,49 @@ pub fn build_destination_update(mac: MacAddress, metrics: &LinkMetrics) -> Messa
     push_metric_items(msg, metrics)
 }
 
+/// Split effective destination changes into encodable messages. Both address
+/// snapshots can fit in an Up while their combined removals/additions exceed
+/// the Update limit. Metrics, when supplied, belong only to the first message;
+/// every message carries the MAC, and removals precede additions across chunks.
+pub(crate) fn build_destination_updates(
+    mac: MacAddress,
+    metrics: Option<&LinkMetrics>,
+    changes: &crate::AddressChanges,
+) -> Vec<Message> {
+    let base = Message::new(MessageType::DESTINATION_UPDATE).with_item(DataItem::MacAddress(mac));
+    let mac_size = base.encode().expect("MAC item encodes").len() - 4;
+    let mut message = metrics.map_or_else(
+        || base.clone(),
+        |metrics| build_destination_update(mac, metrics),
+    );
+    let mut size = message
+        .encode()
+        .expect("validated destination metrics")
+        .len()
+        - 4;
+    let mut messages = Vec::new();
+    let mut encoded_item = bytes::BytesMut::new();
+    for item in changes
+        .append_to(Message::new(MessageType::DESTINATION_UPDATE))
+        .data_items
+    {
+        encoded_item.clear();
+        item.encode(&mut encoded_item)
+            .expect("fixed-size address item encodes");
+        if size + encoded_item.len() > usize::from(u16::MAX) {
+            messages.push(message);
+            message = base.clone();
+            size = mac_size;
+        }
+        size += encoded_item.len();
+        message.data_items.push(item);
+    }
+    if message.data_items.len() > 1 {
+        messages.push(message);
+    }
+    messages
+}
+
 /// Build a `Destination_Down` message (RFC 8175 §12.15).
 pub fn build_destination_down(mac: MacAddress, _reason: StatusCode) -> Message {
     // Status is not allowed in Destination Down (§12.15). The API reason

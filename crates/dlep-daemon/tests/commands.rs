@@ -1,7 +1,7 @@
-use dlep_core::{MacAddress, Message, MessageType as M, StatusCode as S};
+use dlep_core::{MacAddress, MacAddressFormat, Message, MessageType as M, StatusCode as S};
 use dlep_daemon::{
-    CommandError as C, DaemonError, DaemonEvent, DestinationId, LinkMetrics, ModemConfig,
-    ModemDaemon, SessionCommand,
+    AddressChanges, CommandError as C, DaemonError, DaemonEvent, DestinationAddrs, DestinationId,
+    LinkMetrics, ModemConfig, ModemDaemon, SessionCommand,
 };
 use dlep_ext::SessionId;
 use dlep_fsm::session_common::{build_destination_down_response, build_destination_up_response};
@@ -20,9 +20,13 @@ fn id() -> DestinationId {
     MacAddress::new_eui48([2, 0, 0, 0, 0, 1]).into()
 }
 async fn modem() -> ModemDaemon {
+    modem_on("127.0.0.1", MacAddressFormat::Eui48).await
+}
+async fn modem_on(ip: &str, format: MacAddressFormat) -> ModemDaemon {
     let mut c = ModemConfig::default();
+    c.shared.network.mac_address_format = format;
     c.shared.network.use_tls = false;
-    c.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
+    c.shared.network.bind_addr = ip.parse().unwrap();
     c.shared.network.tcp_port = 0;
     c.shared.network.discovery_port = 0;
     ModemDaemon::builder().config(c).spawn().await.unwrap()
@@ -64,8 +68,14 @@ async fn peer(
     m: &ModemDaemon,
     events: &mut broadcast::Receiver<DaemonEvent>,
 ) -> (TcpStream, SessionId) {
-    let socket = TcpSocket::new_v4().unwrap();
-    dlep_net::gtsm::configure_tcp(&socket, false, true).unwrap();
+    let is_v6 = m.local_addr().is_ipv6();
+    let socket = if is_v6 {
+        TcpSocket::new_v6()
+    } else {
+        TcpSocket::new_v4()
+    }
+    .unwrap();
+    dlep_net::gtsm::configure_tcp(&socket, is_v6, true).unwrap();
     let mut peer = socket.connect(m.local_addr()).await.unwrap();
     let mut r = RouterSessionFsm::new();
     let init = r
@@ -244,4 +254,152 @@ async fn broadcast_partial_acceptance_reports_sessions_and_targeted_retry_is_iso
     drop(first);
     drop(second);
     m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coalesced_address_updates_split_without_closing_the_session() {
+    address_replacement_on_wire(true).await;
+}
+
+#[tokio::test]
+async fn address_updates_include_mac_overhead_when_splitting() {
+    address_replacement_on_wire(false).await;
+}
+
+async fn address_replacement_on_wire(pending_up: bool) {
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        for ip in ["127.0.0.1", "::1"] {
+            let destination = DestinationId::from(match format {
+                MacAddressFormat::Eui48 => MacAddress::new_eui48([2, 0, 0, 0, 0, 1]),
+                MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+            });
+            let m = modem_on(ip, format).await;
+            let mut events = m.subscribe();
+            let (mut peer, sid) = peer(&m, &mut events).await;
+            let count = if pending_up { 3000 } else { 1560 };
+            let addresses = |prefix| DestinationAddrs {
+                v6: (1..=count)
+                    .map(|suffix| {
+                        std::net::Ipv6Addr::new(0x2001, 0xdb8, prefix, 0, 0, 0, 0, suffix)
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let old = addresses(1);
+            let new = DestinationAddrs {
+                v4: vec!["192.0.2.1".parse().unwrap()],
+                ..addresses(2)
+            };
+            m.add_destination_with_addresses(destination, LinkMetrics::default(), old.clone())
+                .await
+                .unwrap();
+            let up = read(&mut peer).await;
+            assert_eq!(up.message_type, M::DESTINATION_UP);
+            let mut observed = AddressChanges::from_message(&up).added;
+            assert_eq!(observed, old);
+            if !pending_up {
+                send(
+                    &mut peer,
+                    build_destination_up_response(destination.0, S::SUCCESS),
+                )
+                .await;
+                send(&mut peer, Message::new(M::SESSION_UPDATE)).await;
+                assert_eq!(
+                    read(&mut peer).await.message_type,
+                    M::SESSION_UPDATE_RESPONSE
+                );
+            }
+            let chunk = if pending_up { 1000 } else { 1560 };
+            for start in (0..usize::from(count)).step_by(chunk) {
+                let changes = AddressChanges {
+                    added: DestinationAddrs {
+                        v6: new.v6[start..start + chunk].to_vec(),
+                        v4: if start == 0 {
+                            new.v4.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    },
+                    removed: DestinationAddrs {
+                        v6: old.v6[start..start + chunk].to_vec(),
+                        ..Default::default()
+                    },
+                };
+                // The live case is 65,529 bytes of address items: it fits the
+                // public API's batch limit but needs splitting once the MAC is
+                // included. Pending batches are smaller and accumulate later.
+                m.update_destination_addresses(destination, changes)
+                    .await
+                    .unwrap();
+            }
+            if pending_up {
+                m.update_destination(
+                    destination,
+                    LinkMetrics {
+                        latency: Duration::from_micros(900),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                send(
+                    &mut peer,
+                    build_destination_up_response(destination.0, S::SUCCESS),
+                )
+                .await;
+            }
+            // This response comes after all destination chunks on the stream
+            // and demonstrates that the same session is still usable.
+            send(&mut peer, Message::new(M::SESSION_UPDATE)).await;
+            let mut updates = 0;
+            let mut metrics = 0;
+            loop {
+                let message = read(&mut peer).await;
+                if message.message_type == M::SESSION_UPDATE_RESPONSE {
+                    break;
+                }
+                assert_eq!(message.message_type, M::DESTINATION_UPDATE);
+                assert_eq!(
+                    dlep_fsm::session_common::extract_destination_mac(&message),
+                    Some(destination.0)
+                );
+                AddressChanges::from_message(&message)
+                    .apply_strict(&mut observed)
+                    .unwrap();
+                if let Some(current) = dlep_fsm::session_common::extract_link_metrics(&message) {
+                    assert_eq!(current.latency, Duration::from_micros(900));
+                    metrics += 1;
+                }
+                updates += 1;
+            }
+            assert_eq!(updates, 2);
+            assert_eq!(metrics, usize::from(pending_up));
+            assert_eq!(observed, new);
+            let state = m.state().borrow().clone();
+            assert_eq!(
+                state.sessions[&sid].destinations[&destination].addresses,
+                new
+            );
+            m.update_destination(
+                destination,
+                LinkMetrics {
+                    latency: Duration::from_micros(1000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let later = read(&mut peer).await;
+            assert_eq!(later.message_type, M::DESTINATION_UPDATE);
+            assert_eq!(
+                dlep_fsm::session_common::extract_link_metrics(&later)
+                    .unwrap()
+                    .latency,
+                Duration::from_micros(1000)
+            );
+            drop(peer);
+            m.shutdown().await.unwrap();
+        }
+    }
 }
