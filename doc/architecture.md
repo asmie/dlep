@@ -943,6 +943,15 @@ The order of work was:
     convergence, unchanged retry deadlines, partial acceptance across routers,
     and preserving later per-destination values on successful sessions.
 
+37. Link replies across physical destination replacement. **Done** — a radio
+    withdrawal makes outstanding link requests ineligible to update the cached
+    destination, including requests still queued for the bridge. Their replies
+    still complete the original transactions before the required Down/Up exchange.
+    A delayed grant can no longer overwrite the replacement's reported metrics
+    or its replay to another router. New requests for the replacement retain
+    normal cache updates. Regressions cover both request-delivery timings and
+    complete IPv4/IPv6 adapter pipelines with a later router connection.
+
 ---
 
 ## 10. Open questions / risks

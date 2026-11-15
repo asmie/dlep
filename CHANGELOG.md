@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Link grants for a physically withdrawn destination no longer overwrite the
+  cached metrics of a replacement using the same MAC. Old transactions still
+  complete, while replacement replay and subsequent grants retain their own state.
 - Radio command retries coalesce by session and operation. Successful updates
   cancel superseded retries, preventing stale Session Updates from overwriting
   later destination metrics. Repeated destination flaps retain the latest re-add

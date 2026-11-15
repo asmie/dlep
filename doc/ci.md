@@ -164,6 +164,10 @@ They also hold protocol acknowledgements while sending hundreds of radio reports
 to check retry coalescing and latest-value convergence. Further cases cover
 partial acceptance across routers, stale retries overwriting later destination
 values, and repeated destination flaps during withdrawal acknowledgement.
+Replacement regressions hold a link request across physical Down/Up and then
+grant it: the old transaction must complete without changing the replacement's
+cache. Bridge tests cover requests already delivered and requests still queued;
+the IPv4/IPv6 subprocess case also checks replay to a later router and new grants.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

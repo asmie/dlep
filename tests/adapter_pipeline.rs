@@ -656,6 +656,88 @@ fn announcements(session: &Value, count: u64) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn old_link_grant_cannot_change_a_replacement_or_its_replay() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        let mut router = Node::router(&[addr]).await;
+        let initial = router
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+        router
+            .control
+            .send(json!({"type":"link_request", "request":1,
+            "session":sid, "mac":MAC, "requested":{"current_data_rate_tx_bps":321}}))
+            .await;
+        router.result(1, "accepted").await;
+        radio
+            .wait(|s| notice(s, "link_request", |_| true).is_some())
+            .await;
+        radio
+            .control
+            .batch(vec![
+                json!({"type":"destination_down", "mac":MAC}),
+                json!({"type":"destination_up", "mac":MAC,
+                "metrics":{"current_data_rate_tx_bps":900,"rlq_tx":0}, "addresses":addresses(2)}),
+            ])
+            .await;
+        // The old answer still completes its transaction; the pending Down
+        // must then be followed by the replacement's own metrics and addresses.
+        respond(&mut radio, json!({"current_data_rate_tx_bps":321}), true).await;
+        let replacement = router
+            .wait(|s| {
+                destination(s, "modem-a", MAC)
+                    .is_some_and(|d| d["addresses"] == expected_addresses(2))
+            })
+            .await;
+        let mut expected = defaults();
+        expected["current_data_rate_tx_bps"] = json!(900);
+        expected["rlq_tx"] = json!(0);
+        assert_eq!(
+            destination(&replacement, "modem-a", MAC).unwrap()["metrics"],
+            expected
+        );
+
+        let mut late = Node::router(&[addr]).await;
+        let replay = late
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["metrics"],
+            expected
+        );
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["addresses"],
+            expected_addresses(2)
+        );
+        router
+            .control
+            .send(json!({"type":"link_request", "request":2,
+            "session":sid, "mac":MAC, "requested":{"current_data_rate_tx_bps":444}}))
+            .await;
+        router.result(2, "accepted").await;
+        respond(&mut radio, json!({"current_data_rate_tx_bps":444}), true).await;
+        router
+            .wait(|s| {
+                destination(s, "modem-a", MAC)
+                    .is_some_and(|d| d["metrics"]["current_data_rate_tx_bps"] == 444)
+            })
+            .await;
+        let unchanged = late.control.call(json!({"op":"status"})).await;
+        assert_eq!(
+            destination(&unchanged, "modem-a", MAC).unwrap()["metrics"],
+            expected
+        );
+        router.stop().await;
+        router.assert_final_empty();
+        late.stop().await;
+        late.assert_final_empty();
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn radio_input_failure_stops_the_modem_and_clears_router_state() {
     for op in ["close_input", "pause"] {
         let (mut radio, addr) = Node::modem("modem-a", "127.0.0.1", 0).await;

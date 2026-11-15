@@ -106,6 +106,12 @@ A further withdrawal cancels a deferred re-add. If the previous Down is already
 awaiting acknowledgement or has completed, the modem does not queue another
 Down that could withdraw the replacement destination.
 
+Continue answering outstanding link requests for the withdrawn destination.
+Their replies complete the original session transactions, but cannot change
+the cached metrics of a replacement reported under the same MAC. This also
+applies to requests that were queued inside the modem when the withdrawal
+arrived. New requests for the replacement can update its cached metrics normally.
+
 ## Modem to adapter
 
 | `type` | Fields | Meaning |
@@ -147,7 +153,8 @@ number, in any order:
   when granting. The response always carries every declared metric.
 - `text` is sent to the router as the status text.
 
-Granted metrics update this router's view and the modem's table. Other routers
+Granted metrics update this router's view and, if the physical destination has
+not been withdrawn since the request, the modem's table. Other routers
 learn of the change only through a `destination_update`, so send one if they
 should see it. Metrics the modem cannot send, such as undeclared optional
 metrics, turn the answer into Request Denied without your text, and the table

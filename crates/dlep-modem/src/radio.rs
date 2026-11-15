@@ -596,6 +596,8 @@ struct Pending {
     answer: oneshot::Sender<LinkResponse>,
     mac: MacAddress,
     current: LinkMetrics,
+    /// False once this request's physical destination has been withdrawn.
+    update_cache: bool,
 }
 
 struct Bridge<'a> {
@@ -693,6 +695,11 @@ impl Bridge<'_> {
                     warn!(%mac, "radio adapter reported an unknown destination down; ignored");
                     return;
                 }
+                // Finish old transactions, but do not let their answers alter
+                // a replacement reported under the same MAC in the meantime.
+                for pending in self.pending.values_mut().filter(|p| p.mac == mac) {
+                    pending.update_cache = false;
+                }
                 // A new physical withdrawal cancels any deferred re-add.
                 self.retries
                     .retain(|(_, retry), _| *retry != Retry::Add(mac));
@@ -751,7 +758,7 @@ impl Bridge<'_> {
                     text,
                     metrics,
                 });
-                if delivered.is_ok() {
+                if delivered.is_ok() && pending.update_cache {
                     if let (Status::Success, Some(metrics), Some(known)) =
                         (status, metrics, self.destinations.get_mut(&pending.mac))
                     {
@@ -801,6 +808,20 @@ impl Bridge<'_> {
                 answer,
                 mac: request.id.0,
                 current: request.current,
+                // A backend request can wait in the bounded queue while the
+                // bridge processes Down and a replacement Up. Its session still
+                // needs the old Down after the link transaction completes.
+                update_cache: self.destinations.contains_key(&request.id.0)
+                    && !self
+                        .retries
+                        .contains_key(&(request.session_id, Retry::Drop(request.id.0)))
+                    && self
+                        .daemon
+                        .state()
+                        .borrow()
+                        .sessions
+                        .get(&request.session_id)
+                        .is_some_and(|session| session.phase == SessionPhase::Established),
             },
         );
         Ok(())
@@ -1504,6 +1525,7 @@ mod tests {
                 answer,
                 mac: mac(),
                 current: LinkMetrics::default(),
+                update_cache: true,
             },
         );
         let mut state = daemon.state();
@@ -2339,6 +2361,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_flight_link_grant_keeps_replacement_cache_unchanged() {
+        grant_during_replacement(false).await;
+    }
+
+    #[tokio::test]
+    async fn queued_link_grant_keeps_replacement_cache_unchanged() {
+        grant_during_replacement(true).await;
+    }
+
+    async fn grant_during_replacement(delayed_ask: bool) {
+        let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
+        let daemon = modem_with(Some(Arc::new(RadioLink {
+            asks,
+            timeout: Duration::from_secs(30),
+        })))
+        .await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(100),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        send(
+            &mut peer,
+            build_link_characteristics_request(
+                mac(),
+                &dlep_daemon::LinkCharacteristics {
+                    latency: Some(Duration::from_micros(321)),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        let ask = tokio::time::timeout(WAIT, queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ask = if delayed_ask {
+            Some(ask)
+        } else {
+            bridge.ask(ask).await.unwrap();
+            None
+        };
+        bridge
+            .inbound(Inbound::DestinationDown { mac: Mac(mac()) })
+            .await;
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(900),
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            bridge
+                .retries
+                .keys()
+                .any(|(_, retry)| *retry == Retry::Drop(mac()))
+        );
+        if let Some(ask) = ask {
+            // The backend request was queued before withdrawal, but reaches
+            // the bridge only after the replacement has been reported.
+            bridge.ask(ask).await.unwrap();
+        }
+        bridge
+            .inbound(Inbound::LinkResponse {
+                request: 1,
+                status: Status::Success,
+                text: "old request".into(),
+                metrics: Some(Metrics {
+                    latency_us: Some(321),
+                    ..Default::default()
+                }),
+            })
+            .await;
+        let response = read(&mut peer).await;
+        assert_eq!(
+            response.message_type,
+            MessageType::LINK_CHARACTERISTICS_RESPONSE
+        );
+        assert_eq!(
+            extract_link_metrics(&response).unwrap().latency,
+            Duration::from_micros(321)
+        );
+        assert_eq!(
+            bridge.destinations[&mac()].metrics.latency,
+            Duration::from_micros(900),
+            "the old grant must not overwrite the replacement's cached metrics"
+        );
+        flush_peer(&mut peer).await;
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_DOWN
+        );
+        send(
+            &mut peer,
+            build_destination_down_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        let replacement = read(&mut peer).await;
+        assert_eq!(replacement.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&replacement).unwrap().latency,
+            Duration::from_micros(900)
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        assert!(bridge.retries.is_empty());
+        // Requests for the replacement may still update its cache normally.
+        send(
+            &mut peer,
+            build_link_characteristics_request(
+                mac(),
+                &dlep_daemon::LinkCharacteristics {
+                    latency: Some(Duration::from_micros(444)),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        let ask = tokio::time::timeout(WAIT, queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ask.0.current.latency, Duration::from_micros(900));
+        bridge.ask(ask).await.unwrap();
+        bridge
+            .inbound(Inbound::LinkResponse {
+                request: 2,
+                status: Status::Success,
+                text: "replacement request".into(),
+                metrics: Some(Metrics {
+                    latency_us: Some(444),
+                    ..Default::default()
+                }),
+            })
+            .await;
+        let response = read(&mut peer).await;
+        assert_eq!(
+            response.message_type,
+            MessageType::LINK_CHARACTERISTICS_RESPONSE
+        );
+        assert_eq!(
+            extract_link_metrics(&response).unwrap().latency,
+            Duration::from_micros(444)
+        );
+        assert_eq!(
+            bridge.destinations[&mac()].metrics.latency,
+            Duration::from_micros(444)
+        );
+        drop(peer);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn link_responses_cache_only_live_valid_successes() {
         let daemon = modem().await;
         let mut bridge = bridge(&daemon);
@@ -2378,6 +2576,7 @@ mod tests {
                     answer,
                     mac: mac(),
                     current: original,
+                    update_cache: true,
                 },
             );
             bridge
@@ -2404,6 +2603,7 @@ mod tests {
                 answer,
                 mac: mac(),
                 current: original,
+                update_cache: true,
             },
         );
         bridge
