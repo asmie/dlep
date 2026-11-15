@@ -1156,6 +1156,18 @@ The order of work was:
     replacements and combined wire budgets, completion before subsequent writes,
     refusals, termination, IPv4/IPv6 session isolation, and reconnect cleanup.
 
+57. Radio-originated session addresses. **Done** — `session_addresses` reports
+    apply IPv4/IPv6 address and subnet deltas to a retained physical modem set.
+    The bridge validates complete replay state without peers, updates established
+    sessions through desired-set reconciliation, and replays the latest addresses
+    to new sessions after defaults. Invalid or oversized reports change neither
+    cache nor live state; repeated additions and absent removals are no-ops.
+    Controlled-peer tests cover busy defaults, coalesced metrics and addresses,
+    refusals, canonicalization, atomic rejection, and replacements spanning
+    multiple messages. IPv4/IPv6 adapter pipelines verify multiple routers,
+    independent local and remote address sets, removal, reconnect replay, and
+    preservation of withdrawals and link grants.
+
 ---
 
 ## 10. Open questions / risks

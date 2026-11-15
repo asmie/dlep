@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Radio adapters can report modem `session_addresses` using optional `add` and
+  `remove` objects. The bridge retains a validated complete set without routers,
+  updates every connected router, coalesces busy updates, and replays addresses
+  on new sessions. Invalid or oversized reports preserve cached and live state;
+  large replacements use multiple acknowledged updates. Address reports preserve
+  destination withdrawals and link grants. Existing `session_update_response`
+  notices report wire completion, and `session_sync` still describes remote
+  router addresses.
 - `ModemDaemon::set_session_addresses` retains a complete desired address set
   per session, coalesces replacements while busy, and sends fitting changes
   after each response. Large replacements remove addresses before adding new

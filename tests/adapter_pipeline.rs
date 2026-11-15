@@ -1550,6 +1550,191 @@ async fn radio_input_failure_stops_the_modem_and_clears_router_state() {
 }
 
 #[tokio::test]
+async fn radio_session_addresses_reach_all_routers_and_survive_reconnect() {
+    let sync_count = |s: &Value| {
+        s["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["type"] == "session_sync")
+            .count()
+    };
+    let has_addresses = |s: &Value, expected: &Value| {
+        session(s, "modem-a").is_some_and(|m| m["addresses"] == *expected)
+    };
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        let before = radio.control.call(json!({"op":"status"})).await;
+        let mut with_host_bits = addresses(2);
+        with_host_bits["ipv4_subnets"] = json!(["198.51.2.7/24"]);
+        with_host_bits["ipv6_subnets"] = json!(["2001:db8:2::7/64"]);
+        radio
+            .control
+            .batch(vec![
+                json!({"type":"session_addresses","add":addresses(1)}),
+                json!({"type":"session_addresses","remove":addresses(1),"add":with_host_bits}),
+                json!({"type":"resync"}),
+            ])
+            .await;
+        radio.wait(|s| sync_count(s) > sync_count(&before)).await;
+
+        let mut first = Node::router(&[addr]).await;
+        let initial = first
+            .wait(|s| {
+                has_addresses(s, &expected_addresses(2)) && destination(s, "modem-a", MAC).is_some()
+            })
+            .await;
+        let first_id = session(&initial, "modem-a").unwrap()["session"].clone();
+        assert_eq!(
+            destination(&initial, "modem-a", MAC).unwrap()["addresses"],
+            expected_addresses(1)
+        );
+        let mut second = Node::router(&[addr]).await;
+        let initial = second
+            .wait(|s| {
+                has_addresses(s, &expected_addresses(2)) && destination(s, "modem-a", MAC).is_some()
+            })
+            .await;
+        let second_id = session(&initial, "modem-a").unwrap()["session"].clone();
+        // Local modem addresses and the remote router snapshot are independent.
+        first
+            .control
+            .send(json!({"type":"session_addresses","request":1,
+            "session":first_id,"add":addresses(9)}))
+            .await;
+        first.result(1, "accepted").await;
+        let state = radio
+            .wait(|s| {
+                notice(s, "session_sync", |_| true).is_some_and(|n| {
+                    n["sessions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["addresses"] == addresses(9))
+                })
+            })
+            .await;
+        let remote = notice(&state, "session_sync", |_| true).unwrap()["sessions"].clone();
+        assert_eq!(remote.as_array().unwrap().len(), 2);
+        assert_eq!(
+            remote
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["addresses"] == addresses(9))
+                .count(),
+            1
+        );
+        assert!(
+            remote.as_array().unwrap().iter().any(|m| m["addresses"]
+                == json!({"ipv4":[],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]}))
+        );
+
+        first
+            .control
+            .send(json!({"type":"destination_down","request":2,
+            "session":first_id,"mac":MAC}))
+            .await;
+        first.result(2, "accepted").await;
+        first
+            .wait(|s| destination(s, "modem-a", MAC).is_none())
+            .await;
+        second
+            .control
+            .send(json!({"type":"link_request","request":1,
+            "session":second_id,"mac":MAC,"requested":{"current_data_rate_tx_bps":444}}))
+            .await;
+        second.result(1, "accepted").await;
+        respond(&mut radio, json!({"current_data_rate_tx_bps":444}), true).await;
+        second
+            .wait(|s| {
+                destination(s, "modem-a", MAC)
+                    .is_some_and(|d| d["metrics"]["current_data_rate_tx_bps"] == 444)
+            })
+            .await;
+
+        let before = radio.control.call(json!({"op":"status"})).await;
+        radio
+            .control
+            .batch(vec![
+                json!({"type":"session_addresses","remove":addresses(2),"add":addresses(3)}),
+                json!({"type":"resync"}),
+            ])
+            .await;
+        let updated = first
+            .wait(|s| has_addresses(s, &expected_addresses(3)))
+            .await;
+        assert!(destination(&updated, "modem-a", MAC).is_none());
+        let updated = second
+            .wait(|s| has_addresses(s, &expected_addresses(3)))
+            .await;
+        assert_eq!(
+            destination(&updated, "modem-a", MAC).unwrap()["metrics"]["current_data_rate_tx_bps"],
+            444
+        );
+        assert_eq!(
+            destination(&updated, "modem-a", MAC).unwrap()["addresses"],
+            expected_addresses(1)
+        );
+        let refreshed = radio.wait(|s| sync_count(s) > sync_count(&before)).await;
+        assert_eq!(
+            notice(&refreshed, "session_sync", |_| true).unwrap()["sessions"],
+            remote
+        );
+        radio
+            .wait(|s| {
+                s["notices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|n| n["type"] == "session_update_response" && n["status"] == 0)
+                    .count()
+                    == 4
+            })
+            .await;
+
+        let mut late = Node::router(&[addr]).await;
+        late.wait(|s| {
+            has_addresses(s, &expected_addresses(3))
+                && destination(s, "modem-a", MAC)
+                    .is_some_and(|d| d["metrics"]["current_data_rate_tx_bps"] == 444)
+        })
+        .await;
+        radio
+            .control
+            .send(json!({"type":"session_addresses","remove":addresses(3)}))
+            .await;
+        for router in [&mut first, &mut second, &mut late] {
+            router.wait(|s| has_addresses(s, &json!([]))).await;
+            router.stop().await;
+            router.assert_final_empty();
+        }
+        radio
+            .wait(|s| {
+                notice(s, "session_sync", |_| true).is_some_and(|n| n["sessions"] == json!([]))
+            })
+            .await;
+        // After all routers leave, new reports still update the replay cache.
+        radio
+            .control
+            .send(json!({"type":"session_addresses","add":addresses(4)}))
+            .await;
+        let mut reconnected = Node::router(&[addr]).await;
+        reconnected
+            .wait(|s| {
+                has_addresses(s, &expected_addresses(4))
+                    && destination(s, "modem-a", MAC)
+                        .is_some_and(|d| d["metrics"]["current_data_rate_tx_bps"] == 444)
+            })
+            .await;
+        reconnected.stop().await;
+        reconnected.assert_final_empty();
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn radio_session_sync_tracks_router_addresses_and_removals() {
     fn members(status: &Value) -> &[Value] {
         notice(status, "session_sync", |_| true).unwrap()["sessions"]

@@ -23,9 +23,9 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > [`doc/deployment.md`](doc/deployment.md) for deployment.
 >
 > The modem binary integrates a radio through an external
-> [adapter process](doc/radio-adapter.md) that reports destinations and answers
-> Link Characteristics Requests; embedders can register a link-control backend
-> directly. Busy commands return explicit acceptance errors.
+> [adapter process](doc/radio-adapter.md) that reports destinations and session
+> addresses and answers Link Characteristics Requests. Embedders can register
+> a link-control backend directly. Busy commands return explicit acceptance errors.
 >
 > The router binary can run a [router adapter](doc/router-adapter.md) to consume
 > retained session/destination snapshots and submit targeted session address,
@@ -299,6 +299,14 @@ Nonfatal refusals preserve local state; fatal replies or session termination
 stop delivery. Completion notices still correspond to wire replies, so one
 replacement can produce several notices or none. This API applies to one
 existing session; applications must replay desired state to new sessions.
+
+Radio adapters use this reconciliation through `session_addresses` reports
+with optional `add`/`remove` address objects. The bridge retains the modem's
+complete address set, sends it to every connected router, and replays it after
+new connections, including reports received with no routers connected. Duplicate
+or conflicting entries and oversized resulting sets reject the whole report.
+Repeated additions and absent removals are no-ops. These reports take no session
+or request ID; the radio's `session_sync` addresses remain remote router data.
 
 Library `SessionSnapshot.local_addresses` exposes effective desired local
 addresses, including queued modem replacements. It does not confirm peer

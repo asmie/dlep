@@ -178,8 +178,14 @@ complete address snapshots larger than the adapter's input-line limit.
 An IPv4/IPv6 pipeline sends session address commands through both real adapters
 and checks per-router isolation, additions/removals, explicit refresh, session
 removal, reconnect state, and preservation of a withdrawn destination.
-They also hold protocol acknowledgements while sending hundreds of radio reports
-to check session metric coalescing and latest-value convergence. Queued metrics
+Radio-originated `session_addresses` cases cover reports before any routers,
+replay behind busy defaults, coalescing with metrics, nonfatal refusal, no-ops,
+invalid/duplicate/conflicting entries, accumulated replay limits, and large
+replacements across multiple acknowledged updates. An IPv4/IPv6 adapter pipeline
+checks broadcast to multiple routers, local/remote address separation, complete
+removal, reconnect replay, and preserved destination withdrawals and link grants.
+Bridge tests also hold protocol acknowledgements while sending hundreds of
+radio reports to check session metric coalescing and latest-value convergence. Queued metrics
 must preserve later destination reports, optional values, and link answers;
 pending Up, pending Down, withdrawal, and shutdown have dedicated FSM cases.
 Runtime tests check effective retained values before delivery and ordered wire

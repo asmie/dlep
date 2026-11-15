@@ -244,6 +244,12 @@ enum Inbound {
     SessionMetrics {
         metrics: Metrics,
     },
+    SessionAddresses {
+        #[serde(default)]
+        add: Addresses,
+        #[serde(default)]
+        remove: Addresses,
+    },
     LinkResponse {
         request: u64,
         status: Status,
@@ -262,6 +268,7 @@ const INBOUND_FIELDS: &[(&str, &[&str])] = &[
     ("destination_addresses", &["mac", "add", "remove"]),
     ("destination_down", &["mac"]),
     ("session_metrics", &["metrics"]),
+    ("session_addresses", &["add", "remove"]),
     ("link_response", &["request", "status", "text", "metrics"]),
 ];
 
@@ -460,6 +467,7 @@ impl Adapter {
             out: self.out.as_ref().expect("adapter active").clone(),
             destinations: BTreeMap::new(),
             session_metrics: initial,
+            session_addresses: DestinationAddrs::default(),
             pending: HashMap::new(),
             next_request: 1,
             retries: BTreeMap::new(),
@@ -659,6 +667,7 @@ struct Bridge<'a> {
     out: mpsc::Sender<String>,
     destinations: BTreeMap<MacAddress, Known>,
     session_metrics: LinkMetrics,
+    session_addresses: DestinationAddrs,
     pending: HashMap<u64, Pending>,
     next_request: u64,
     /// One deadline per operation and session; reports share the latest cache.
@@ -796,6 +805,39 @@ impl Bridge<'_> {
                     let update = Metrics::from_link(&metrics);
                     for known in self.destinations.values_mut() {
                         known.metrics = update.overlay(known.metrics);
+                    }
+                }
+            }
+            Inbound::SessionAddresses { add, remove } => {
+                let changes = match (add.parse(), remove.parse()) {
+                    (Ok(added), Ok(removed)) => AddressChanges { added, removed }.canonical(),
+                    (Err(e), _) | (_, Err(e)) => {
+                        warn!("radio adapter session addresses rejected: {e:#}");
+                        return;
+                    }
+                };
+                // Validate before lenient application can collapse duplicates.
+                if let Err(status) = changes.validate() {
+                    warn!(?status, "radio adapter session address changes rejected");
+                    return;
+                }
+                let mut addresses = self.session_addresses.clone();
+                changes.apply_lenient(&mut addresses);
+                // Bound the complete replay set, even without connected routers.
+                // The effective replacement may need multiple wire messages.
+                if let Err(e) = self.daemon.validate_session_addresses(&addresses) {
+                    warn!("radio adapter session addresses rejected: {e}");
+                    return;
+                }
+                self.session_addresses = addresses;
+                let snapshot = self.daemon.state().borrow().clone();
+                for (&session_id, session) in &snapshot.sessions {
+                    if session.phase == SessionPhase::Established {
+                        let result = self
+                            .daemon
+                            .set_session_addresses(session_id, self.session_addresses.clone())
+                            .await;
+                        self.accepted("session addresses", &result);
                     }
                 }
             }
@@ -1043,6 +1085,14 @@ impl Bridge<'_> {
             if result.is_err() {
                 return;
             }
+        }
+        if self.session_addresses != session.local_addresses {
+            // The session owns coalescing behind defaults or an earlier update.
+            let result = self
+                .daemon
+                .set_session_addresses(session_id, self.session_addresses.clone())
+                .await;
+            self.accepted("session addresses replay", &result);
         }
         let commands: Vec<_> = self
             .destinations
@@ -1304,7 +1354,7 @@ mod tests {
     use dlep_daemon::ModemConfig;
     use dlep_fsm::session_common::{
         build_destination_down_response, build_destination_up_response,
-        build_link_characteristics_request, extract_link_metrics,
+        build_link_characteristics_request, build_session_update_response, extract_link_metrics,
     };
     use tokio::net::TcpStream;
 
@@ -1395,6 +1445,7 @@ mod tests {
             out,
             destinations: BTreeMap::new(),
             session_metrics: ModemConfig::default().metrics.link_metrics(),
+            session_addresses: DestinationAddrs::default(),
             pending: HashMap::new(),
             next_request: 1,
             retries: BTreeMap::new(),
@@ -2343,19 +2394,15 @@ mod tests {
         );
         flush_peer(&mut peer).await;
 
-        daemon
-            .update_session_addresses(
-                session_id,
-                AddressChanges {
-                    added: DestinationAddrs {
-                        v4: vec!["192.0.2.5".parse().unwrap()],
-                        ..Default::default()
-                    },
-                    removed: Default::default(),
+        bridge
+            .inbound(Inbound::SessionAddresses {
+                add: Addresses {
+                    ipv4: vec!["192.0.2.5".parse().unwrap()],
+                    ..Default::default()
                 },
-            )
-            .await
-            .unwrap();
+                remove: Default::default(),
+            })
+            .await;
         assert_eq!(
             read(&mut peer).await.message_type,
             MessageType::SESSION_UPDATE
@@ -3484,6 +3531,313 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_addresses_coalesce_behind_defaults_and_replay_after_refusal() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let addresses = |n| Addresses {
+            ipv4: vec![Ipv4Addr::new(192, 0, 2, n)],
+            ipv6: vec![format!("2001:db8::{n}").parse().unwrap()],
+            ipv4_subnets: vec![format!("198.51.{n}.7/24")],
+            ipv6_subnets: vec![format!("2001:db8:{n}::7/64")],
+        };
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(42),
+                    ..Default::default()
+                },
+            })
+            .await;
+        bridge
+            .inbound(Inbound::SessionAddresses {
+                add: addresses(1),
+                remove: Default::default(),
+            })
+            .await;
+        let mut peer = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        let sid = *snapshot.sessions.keys().next().unwrap();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let defaults = read(&mut peer).await;
+        assert_eq!(defaults.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&defaults).unwrap().latency,
+            Duration::from_micros(42)
+        );
+        assert!(AddressChanges::from_message(&defaults).is_empty());
+        // Hold the defaults reply: only the last address set may reach the wire.
+        for n in 2..=3 {
+            bridge
+                .inbound(Inbound::SessionAddresses {
+                    add: addresses(n),
+                    remove: addresses(n - 1),
+                })
+                .await;
+        }
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(43),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let expected = addresses(3).parse().unwrap().canonical();
+        assert_eq!(bridge.session_addresses, expected);
+        assert_eq!(
+            daemon.state().borrow().sessions[&sid].local_addresses,
+            expected
+        );
+        assert!(bridge.retries.is_empty());
+        send(
+            &mut peer,
+            build_session_update_response(StatusCode::REQUEST_DENIED),
+        )
+        .await;
+        let update = read(&mut peer).await;
+        assert_eq!(update.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            AddressChanges::from_message(&update),
+            AddressChanges {
+                added: expected.clone(),
+                removed: Default::default(),
+            }
+        );
+        assert_eq!(
+            extract_link_metrics(&update).unwrap().latency,
+            Duration::from_micros(43)
+        );
+        send(
+            &mut peer,
+            build_session_update_response(StatusCode::REQUEST_DENIED),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        // Repeated additions and absent removals are no-ops, even after refusal.
+        bridge
+            .inbound(Inbound::SessionAddresses {
+                add: addresses(3),
+                remove: addresses(2),
+            })
+            .await;
+        flush_peer(&mut peer).await;
+        let mut late = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let defaults = read(&mut late).await;
+        assert_eq!(
+            extract_link_metrics(&defaults).unwrap().latency,
+            Duration::from_micros(43)
+        );
+        send(
+            &mut late,
+            build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        let replay = read(&mut late).await;
+        assert_eq!(replay.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(AddressChanges::from_message(&replay).added, expected);
+        send(
+            &mut late,
+            build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut late).await;
+        drop((peer, late));
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_session_address_reports_preserve_live_state_and_replay() {
+        for connected in [false, true] {
+            let daemon = modem().await;
+            let mut events = daemon.subscribe();
+            let mut bridge = bridge(&daemon);
+            let mut peer = if connected {
+                let peer = session(&daemon, &mut events).await;
+                let snapshot = daemon.state().borrow().clone();
+                bridge.reconcile(&snapshot).await.unwrap();
+                Some(peer)
+            } else {
+                None
+            };
+            let initial = Addresses {
+                ipv4: vec!["192.0.2.1".parse().unwrap()],
+                ipv6: vec!["2001:db8::1".parse().unwrap()],
+                ipv4_subnets: vec!["198.51.1.7/24".into()],
+                ipv6_subnets: vec!["2001:db8:1::7/64".into()],
+            };
+            bridge
+                .inbound(Inbound::SessionAddresses {
+                    add: initial.clone(),
+                    remove: Default::default(),
+                })
+                .await;
+            let expected = initial.parse().unwrap().canonical();
+            if let Some(peer) = &mut peer {
+                assert_eq!(
+                    AddressChanges::from_message(&read(peer).await).added,
+                    expected
+                );
+                send(peer, build_session_update_response(StatusCode::SUCCESS)).await;
+                flush_peer(peer).await;
+            }
+            for line in [
+                r#"{"type":"session_addresses","add":{"ipv4":["192.0.2.2","192.0.2.2"]},"remove":{"ipv6":["2001:db8::1"]}}"#,
+                r#"{"type":"session_addresses","add":{"ipv4":["192.0.2.2"]},"remove":{"ipv6":["2001:db8::1","2001:db8::1"]}}"#,
+                r#"{"type":"session_addresses","add":{"ipv4_subnets":["198.51.2.1/24","198.51.2.2/24"]},"remove":{"ipv4":["192.0.2.1"]}}"#,
+                r#"{"type":"session_addresses","add":{"ipv6_subnets":["2001:db8:1::1/64"]},"remove":{"ipv6_subnets":["2001:db8:1::2/64"]}}"#,
+                r#"{"type":"session_addresses","add":{"ipv4":["192.0.2.2"],"ipv6_subnets":["bad"]},"remove":{"ipv4":["192.0.2.1"]}}"#,
+            ] {
+                bridge.inbound(parse_inbound(line).unwrap()).await;
+                assert_eq!(bridge.session_addresses, expected, "{line}");
+                if let Some(peer) = &mut peer {
+                    flush_peer(peer).await;
+                }
+            }
+            // The addition fits by itself, but the accumulated replay set does not.
+            bridge
+                .inbound(Inbound::SessionAddresses {
+                    add: Addresses {
+                        ipv6: (1..=3120u128).map(Ipv6Addr::from).collect(),
+                        ..Default::default()
+                    },
+                    remove: Addresses {
+                        ipv4: initial.ipv4.clone(),
+                        ..Default::default()
+                    },
+                })
+                .await;
+            assert_eq!(bridge.session_addresses, expected);
+            if let Some(peer) = &mut peer {
+                flush_peer(peer).await;
+                assert_eq!(
+                    daemon
+                        .state()
+                        .borrow()
+                        .sessions
+                        .values()
+                        .next()
+                        .unwrap()
+                        .local_addresses,
+                    expected
+                );
+            }
+            let mut late = session(&daemon, &mut events).await;
+            let snapshot = daemon.state().borrow().clone();
+            bridge.reconcile(&snapshot).await.unwrap();
+            assert_eq!(
+                AddressChanges::from_message(&read(&mut late).await).added,
+                expected
+            );
+            send(
+                &mut late,
+                build_session_update_response(StatusCode::SUCCESS),
+            )
+            .await;
+            flush_peer(&mut late).await;
+            // A valid removal still works after rejected reports.
+            bridge
+                .inbound(Inbound::SessionAddresses {
+                    add: Default::default(),
+                    remove: initial,
+                })
+                .await;
+            assert!(bridge.session_addresses.is_empty());
+            for peer in peer.iter_mut().chain(std::iter::once(&mut late)) {
+                assert_eq!(
+                    AddressChanges::from_message(&read(peer).await).removed,
+                    expected
+                );
+                send(peer, build_session_update_response(StatusCode::SUCCESS)).await;
+                flush_peer(peer).await;
+            }
+            drop((peer, late));
+            daemon.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn large_session_address_replacements_split_and_replay_the_complete_set() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let initial = Addresses {
+            ipv6: (1..=3120u128).map(Ipv6Addr::from).collect(),
+            ..Default::default()
+        };
+        bridge
+            .inbound(Inbound::SessionAddresses {
+                add: initial.clone(),
+                remove: Default::default(),
+            })
+            .await;
+        let mut peer = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        assert_eq!(
+            AddressChanges::from_message(&read(&mut peer).await).added,
+            initial.parse().unwrap()
+        );
+        send(
+            &mut peer,
+            build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        let replacement = Addresses {
+            ipv6: (3121..=6240u128).map(Ipv6Addr::from).collect(),
+            ..Default::default()
+        };
+        let line = serde_json::json!({
+            "type":"session_addresses", "add":replacement, "remove":initial,
+        })
+        .to_string();
+        assert!(line.len() <= MAX_LINE);
+        bridge.inbound(parse_inbound(&line).unwrap()).await;
+        let expected = replacement.parse().unwrap();
+        assert_eq!(bridge.session_addresses, expected);
+        let removal = read(&mut peer).await;
+        assert_eq!(removal.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            AddressChanges::from_message(&removal),
+            AddressChanges {
+                added: Default::default(),
+                removed: initial.parse().unwrap(),
+            }
+        );
+        send(
+            &mut peer,
+            build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        let addition = read(&mut peer).await;
+        assert_eq!(
+            AddressChanges::from_message(&addition),
+            AddressChanges {
+                added: expected.clone(),
+                removed: Default::default(),
+            }
+        );
+        send(
+            &mut peer,
+            build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        let mut late = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        assert_eq!(
+            AddressChanges::from_message(&read(&mut late).await).added,
+            expected
+        );
+        drop((peer, late));
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn oversized_address_updates_leave_a_replayable_cache_and_allow_recovery() {
         for connected in [false, true] {
             let daemon = modem().await;
@@ -4199,6 +4553,13 @@ mod tests {
             parse_inbound(r#"{"type":"resync"}"#).unwrap(),
             Inbound::Resync
         ));
+        let Inbound::SessionAddresses { add, remove } =
+            parse_inbound(r#"{"type":"session_addresses"}"#).unwrap()
+        else {
+            panic!("expected session addresses")
+        };
+        assert!(add.parse().unwrap().is_empty());
+        assert!(remove.parse().unwrap().is_empty());
         let up = parse_inbound(
             r#"{"type":"destination_up","mac":"02:00:00:00:00:01","metrics":{"latency_us":5},"addresses":{"ipv4":["192.0.2.1"],"ipv6_subnets":["2001:db8::/32"]}}"#,
         )
@@ -4235,6 +4596,12 @@ mod tests {
             "[1]",
             r#"{"type":"resync","request":1}"#,
             r#"{"type":"resync","sessions":[]}"#,
+            r#"{"type":"session_addresses","session":1}"#,
+            r#"{"type":"session_addresses","request":1}"#,
+            r#"{"type":"session_addresses","mac":"02:00:00:00:00:01"}"#,
+            r#"{"type":"session_addresses","add":{"v4":[]}}"#,
+            r#"{"type":"session_addresses","remove":{"ipv4":["bad"]}}"#,
+            r#"{"type":"session_addresses","add":null}"#,
             r#"{"mac":"02:00:00:00:00:01"}"#,
             r#"{"type":"destination_down","mac":"02:00:00:00:00:01","reason":1}"#,
             r#"{"type":"destination_update","mac":"02:00:00:00:00:01","metrics":{"latency":5}}"#,

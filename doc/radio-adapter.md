@@ -1,9 +1,9 @@
 # Radio adapter protocol
 
 The `dlep-modem` binary has no built-in radio driver. A `[radio]` section makes
-it start one external program, the *adapter*, which reports destinations and
-link metrics from the radio and decides router Link Characteristics Requests
-(RFC 8175 §12.18–12.19). Library embedders can use
+it start one external program, the *adapter*, which reports destinations,
+session addresses and link metrics from the radio and decides router Link
+Characteristics Requests (RFC 8175 §12.18–12.19). Library embedders can use
 `ModemDaemon` and `ModemBuilder::link_control` directly instead; see the
 [README](../README.md#library-use).
 
@@ -75,17 +75,20 @@ a file. It does not run the adapter.
 | `destination_addresses` | `mac`, optional `add`, `remove` (addresses) | Sends address and subnet changes. |
 | `destination_down` | `mac` | Withdraws the destination from every router. |
 | `session_metrics` | `metrics` | Sends session-wide metrics in a Session Update. Routers apply them to every destination too (RFC 8175 §12.7). |
+| `session_addresses` | optional `add`, `remove` (addresses) | Reports modem IPv4/IPv6 addresses and attached subnets to every router, retaining them for later sessions. |
 | `link_response` | `request`, `status`, optional `text`, `metrics` | Answers a `link_request`. |
 
 ```json
 {"type":"resync"}
+{"type":"session_addresses","add":{"ipv4":["192.0.2.1"],"ipv6_subnets":["2001:db8:1::/64"]}}
 {"type":"destination_up","mac":"02:00:00:00:00:01","metrics":{"current_data_rate_tx_bps":5000000},"addresses":{"ipv4":["192.0.2.10"]}}
 {"type":"link_response","request":7,"status":"success","text":"applied","metrics":{"current_data_rate_tx_bps":2000000}}
 ```
 
 The modem keeps the destination table and replays it, together with changed
-session metrics, to each router that connects later. Report each destination
-once with `destination_up`; a repeated `destination_up`, or a message for an
+session metrics and modem session addresses, to each router that connects later.
+Report each destination once with `destination_up`; a repeated `destination_up`,
+or a message for an
 unknown destination, is logged and ignored. Messages the modem rejects as
 invalid, such as undeclared optional metrics, are also logged and ignored
 without changing its state.
@@ -98,14 +101,37 @@ removals in that batch. Remove enough addresses, either in the same batch or a
 later one, before adding more. This check also applies when no routers are
 connected, so the retained destination remains replayable.
 
-Effective address changes may span multiple Destination Update messages,
-especially when several reports coalesce while Up awaits acknowledgement.
-Removals precede additions across messages, and any coalesced metrics appear
-once. Routers can observe intermediate address snapshots before all changes arrive.
-Re-announcing a large destination also accounts for the response's required
-Status item. A successful response includes its metrics and fitting addresses;
-any remaining addresses follow in updates on the same session. The complete
-cached destination is preserved.
+Effective destination address changes may span multiple Destination Update
+messages, especially when several reports coalesce while Up awaits
+acknowledgement. Removals precede additions across messages, and any coalesced
+metrics appear once. Routers can observe intermediate address snapshots before
+all changes arrive. Re-announcing a large destination also accounts for the
+response's required Status item. A successful response includes its metrics and
+fitting addresses; any remaining addresses follow in updates on the same
+session. The complete cached destination is preserved.
+
+`session_addresses` describes the modem's own Layer 3 addresses, separate from
+destination addresses and the remote router addresses in `session_sync`. It
+takes no `session`, `request`, or `mac`: reports apply to all current and future
+router sessions. Each `add`/`remove` object uses the four address arrays above;
+omitted arrays are empty. Subnets are canonicalized to their network prefixes.
+Adding an existing address or removing an absent address is a no-op. To clear
+the set, remove all previously reported addresses; an empty report changes
+nothing. Duplicate entries within a report, an address both added and removed,
+or an invalid subnet reject the entire report with a warning. Malformed JSON
+or field types follow the process-failure rules above.
+
+The resulting complete modem address set must fit one address-only Session
+Update from empty, including when no router is connected. An oversized result
+rejects the whole report before changing cached or live addresses, including its
+removals. Reports accepted while a session transaction is busy coalesce into
+one desired set per session. Large replacements can span multiple acknowledged
+Session Updates: removals precede additions, queued metrics share the next
+message, and unsent changes are recomputed from the latest set after each reply.
+Routers can observe intermediate sets. Address reports preserve destination
+metrics, withdrawals, and link grants. Cached addresses survive router
+disconnects and are replayed in Session Updates after initialization; they do
+not survive a modem process restart, so the adapter must report them again.
 
 Replay uses retained daemon session state and recovers even if the internal
 event subscriber falls behind. It retries busy session initialization, preserves
@@ -167,7 +193,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `event_gap` | `skipped` | Daemon broadcast events were lost. A fresh `session_sync` follows, even if membership is unchanged. |
 | `session_up` | `session`, `peer` | A router session is established. |
 | `session_down` | `session`, `peer`, `status` (numeric RFC 8175 status code) | A router session ended. |
-| `session_update_response` | `session`, `status`, `text` | The router's validated, nonfatal reply to a Session Update, including initial replay of changed defaults. Zero means success. |
+| `session_update_response` | `session`, `status`, `text` | The router's validated, nonfatal reply to a Session Update, including metrics, addresses, and initial replay. Zero means success. |
 | `destination_up_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to Destination Up. Zero means accepted; other status codes mean it declined reports for this destination. |
 | `destination_down_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to a modem-originated Destination Down. Zero means success. |
 | `destination_withdrawn` | `session`, `mac` | The router withdrew interest in this destination on this session. Physical destination knowledge remains cached. |
@@ -213,11 +239,13 @@ use a separate delivery path and are not cancelled by event loss; continue
 answering outstanding requests.
 
 `session_update_response` preserves the peer's status text, including on refusal.
-It reports one wire reply, so coalesced `session_metrics` lines do not each
-produce a notice. A queued next update may already be pending when the notice
-arrives. Refusal leaves the radio's cached metrics and destination reports intact;
-later replay uses those latest values. Membership snapshots cannot recover lost
-responses. Invalid, unsolicited, duplicate, or fatal replies terminate the
+It reports one wire reply, so coalesced `session_metrics` or `session_addresses`
+lines do not each produce a notice. An unchanged address set sends no update;
+a large replacement can produce several notices. A queued next update may
+already be pending when the notice arrives. Refusal leaves the radio's cached
+metrics, session addresses, and destination reports intact; later replay uses
+those latest values. Membership snapshots cannot recover lost responses.
+Invalid, unsolicited, duplicate, or fatal replies terminate the
 session instead of producing this notice.
 
 `destination_up_response` reports that router's outcome, including any status
