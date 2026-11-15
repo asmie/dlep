@@ -43,6 +43,14 @@ pub enum DestinationEvent {
         v4_subnets: Vec<Ipv4Net>,
         v6_subnets: Vec<Ipv6Net>,
     },
+    /// Modem side: a validated, nonfatal Destination Up reply. Retained state
+    /// is already Up on success or Withdrawn otherwise, with current metrics
+    /// and addresses preserved. Fatal or invalid replies terminate instead.
+    UpResponse {
+        id: DestinationId,
+        status: StatusCode,
+        text: String,
+    },
     Update {
         id: DestinationId,
         metrics: LinkMetrics,

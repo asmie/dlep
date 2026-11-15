@@ -348,35 +348,45 @@ impl ModemSessionFsm {
                 if msg.message_type == MessageType::DESTINATION_UP_RESPONSE =>
             {
                 let mut actions = Vec::new();
-                let mac = extract_destination_mac(&msg);
-                let status = extract_status(&msg).unwrap_or(StatusCode::SUCCESS);
-                if let Some(mac) = mac {
-                    self.tx.close_destination(&mac);
-                    if status == StatusCode::SUCCESS {
-                        if let Some(d) = self.destinations.get_mut(&mac) {
-                            d.announced = true;
-                            let changes = AddressChanges::between(&d.advertised_addrs, &d.addrs);
-                            if d.pending_metrics || !changes.is_empty() {
-                                actions.extend(
-                                    build_destination_updates(
-                                        mac,
-                                        d.pending_metrics.then_some(&d.metrics),
-                                        &changes,
-                                    )
-                                    .into_iter()
-                                    .map(FsmAction::SendMessage),
-                                );
-                                d.pending_metrics = false;
-                                d.advertised_addrs = d.addrs.clone();
-                            }
-                        }
-                    } else {
-                        // Retain knowledge, but respect the router's refusal.
-                        if let Some(d) = self.destinations.get_mut(&mac) {
-                            d.announced = false;
+                let mac = extract_destination_mac(&msg).expect("validated MAC");
+                let (status, text) = msg
+                    .data_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DataItem::Status { code, text } => Some((*code, text.clone())),
+                        _ => None,
+                    })
+                    .expect("validated status");
+                self.tx.close_destination(&mac);
+                if status == StatusCode::SUCCESS {
+                    if let Some(d) = self.destinations.get_mut(&mac) {
+                        d.announced = true;
+                        let changes = AddressChanges::between(&d.advertised_addrs, &d.addrs);
+                        if d.pending_metrics || !changes.is_empty() {
+                            actions.extend(
+                                build_destination_updates(
+                                    mac,
+                                    d.pending_metrics.then_some(&d.metrics),
+                                    &changes,
+                                )
+                                .into_iter()
+                                .map(FsmAction::SendMessage),
+                            );
+                            d.pending_metrics = false;
+                            d.advertised_addrs = d.addrs.clone();
                         }
                     }
+                } else {
+                    // Retain knowledge, but respect the router's refusal.
+                    if let Some(d) = self.destinations.get_mut(&mac) {
+                        d.announced = false;
+                    }
                 }
+                actions.push(FsmAction::Emit(EmittedEvent::DestinationUpResponse {
+                    mac,
+                    status,
+                    text,
+                }));
                 actions.extend(heartbeat_reset_action(
                     TIMER_HEARTBEAT_MISSED,
                     self.peer_heartbeat_interval,

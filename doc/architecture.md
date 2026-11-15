@@ -1060,6 +1060,19 @@ The order of work was:
     before completion, and real adapter success/denial over IPv4/IPv6 with
     both MAC formats.
 
+48. Destination Up completion events. **Done** — the modem emits
+    `DestinationEvent::UpResponse` for validated, nonfatal router replies,
+    preserving status and text after updating the retained destination phase.
+    Successful replies flush queued changes before emitting completion;
+    refusals retain the latest metrics and addresses for later Announce.
+    The radio adapter receives `destination_up_response` notices with session,
+    MAC, status, and text; these do not alter its physical destination cache.
+    Tests cover queued corrections, refusals, unknown nonfatal statuses,
+    invalid and duplicate replies, per-router isolation, retained-state ordering,
+    both MAC formats over IPv4/IPv6, replay after refusal, and escaped status
+    text larger than the adapter's input-line limit. The churn test now verifies
+    every Destination Up response as well as the router's corresponding arrival.
+
 ---
 
 ## 10. Open questions / risks

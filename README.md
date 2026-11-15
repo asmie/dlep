@@ -208,6 +208,13 @@ The modem-side API is symmetric, with
 `add_destination` / `update_destination` / `drop_destination` in place of
 `start_discovery` / `connect_static`.
 
+`DestinationEvent::UpResponse` tells the modem whether a router accepted or
+declined its Destination Up, preserving the peer's status and text. The event
+follows retained-state publication: the destination is `Up` on success or
+`Withdrawn` on a nonfatal refusal, with its latest metrics and addresses kept.
+A refusal affects only that router; the physical destination remains available
+to other routers and for a later Announce.
+
 `ModemDaemon::update_session_metrics` sends session-wide metric changes via
 `Session Update` (RFC 8175 §12.7). The router compatibility method returns an
 error: routers may report Layer 3 changes but cannot originate metric items.

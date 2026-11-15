@@ -970,6 +970,17 @@ fn translate_emitted(
                 v6_subnets: addrs.v6_subnets.clone(),
             },
         }),
+        EmittedEvent::DestinationUpResponse { mac, status, text } => {
+            Some(DaemonEvent::Destination {
+                session_id,
+                peer: peer.clone(),
+                event: DestinationEvent::UpResponse {
+                    id: DestinationId(*mac),
+                    status: *status,
+                    text: text.clone(),
+                },
+            })
+        }
         EmittedEvent::CommandRejected(rejection) => Some(DaemonEvent::CommandRejected {
             session_id,
             peer: peer.clone(),

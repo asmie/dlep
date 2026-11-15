@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Modems expose validated Destination Up replies through
+  `DestinationEvent::UpResponse`, including refusals and peer status text.
+  Radio adapters receive `destination_up_response` notices scoped by session
+  and MAC. Declines preserve destination knowledge and later replay. Exhaustive
+  matches must handle the new daemon event and FSM
+  `EmittedEvent::DestinationUpResponse` variant. Modem notices may exceed
+  64 KiB after escaping peer text; that limit applies to messages sent by the adapter.
 - Routers expose successful and denied Destination Announce replies through
   `DestinationEvent::AnnounceResponse`, preserving peer status and text. The
   router adapter forwards them as `announce_response` notices scoped by session

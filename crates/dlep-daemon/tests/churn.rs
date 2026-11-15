@@ -259,6 +259,18 @@ async fn churn(bind: &str, cycles: usize) {
                         other => panic!("expected Up, got {other:?}"),
                     }
                 }
+                seen.clear();
+                for _ in first..=DESTINATIONS {
+                    match destination_event(&mut modem_events, modem_id, modem_peer).await {
+                        DestinationEvent::UpResponse { id, status, text } => {
+                            assert!((first..=DESTINATIONS).any(|i| destination(i) == id));
+                            assert!(seen.insert(id), "duplicate Up response");
+                            assert_eq!(status, S::SUCCESS);
+                            assert!(text.is_empty());
+                        }
+                        other => panic!("expected Up response, got {other:?}"),
+                    }
+                }
                 barrier(
                     &router,
                     &mut router_events,

@@ -356,6 +356,22 @@ async fn both_adapter_processes_exchange_complete_state_and_commands_over_ipv4_a
             destination(&initial, "modem-a", MAC).unwrap()["addresses"],
             expected_addresses(1)
         );
+        let acknowledged = radio
+            .wait(|s| notice(s, "destination_up_response", |n| n["mac"] == MAC).is_some())
+            .await;
+        let response = notice(&acknowledged, "destination_up_response", |_| true).unwrap();
+        assert_eq!(response["status"], 0);
+        assert_eq!(response["text"], "");
+        assert!(
+            notice(&acknowledged, "session_sync", |n| {
+                n["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["session"] == response["session"])
+            })
+            .is_some()
+        );
 
         router
             .control

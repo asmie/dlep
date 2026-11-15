@@ -287,6 +287,12 @@ enum Outbound {
         session: u64,
         mac: Mac,
     },
+    DestinationUpResponse {
+        session: u64,
+        mac: Mac,
+        status: u8,
+        text: String,
+    },
     LinkRequest {
         request: u64,
         session: u64,
@@ -1007,6 +1013,19 @@ impl Bridge<'_> {
 
     async fn event(&mut self, event: DaemonEvent) -> Result<()> {
         match event {
+            DaemonEvent::Destination {
+                session_id,
+                event: DestinationEvent::UpResponse { id, status, text },
+                ..
+            } => {
+                self.send(&Outbound::DestinationUpResponse {
+                    session: session_id.0,
+                    mac: Mac(id.0),
+                    status: status.0,
+                    text,
+                })
+                .await?
+            }
             DaemonEvent::SessionDown {
                 session_id,
                 peer,
@@ -1471,6 +1490,98 @@ mod tests {
             read(peer).await.message_type,
             MessageType::SESSION_UPDATE_RESPONSE
         );
+    }
+
+    #[tokio::test]
+    async fn destination_up_outcomes_reach_radio_without_changing_replay() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::channel(QUEUE_SIZE);
+        bridge.out = out;
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(321),
+                ..Default::default()
+            }))
+            .await;
+        let original_metrics = bridge.destinations[&mac()].metrics;
+        let original_addresses = bridge.destinations[&mac()].addresses.clone();
+        let mut peers = Vec::new();
+        let mut sessions = Vec::new();
+        for status in [StatusCode::NOT_INTERESTED, StatusCode::SUCCESS] {
+            let mut peer = session(&daemon, &mut events).await;
+            let snapshot = daemon.state().borrow().clone();
+            bridge.reconcile(&snapshot).await.unwrap();
+            let replay = read(&mut peer).await;
+            assert_eq!(replay.message_type, MessageType::DESTINATION_UP);
+            assert_eq!(extract_link_metrics(&replay), Some(original_metrics));
+            let mut text = "router says: dostęp ✓\n\"response\"".to_owned();
+            if status == StatusCode::NOT_INTERESTED {
+                // A valid wire status can exceed the adapter input limit once
+                // escaped for output; preserve the complete peer explanation.
+                text.push_str(&"\n".repeat(MAX_LINE / 2));
+            }
+            send(
+                &mut peer,
+                Message::new(MessageType::DESTINATION_UP_RESPONSE)
+                    .with_item(dlep_core::DataItem::MacAddress(mac()))
+                    .with_item(dlep_core::DataItem::Status {
+                        code: status,
+                        text: text.clone(),
+                    }),
+            )
+            .await;
+            let event = tokio::time::timeout(WAIT, async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if matches!(
+                        event,
+                        DaemonEvent::Destination {
+                            event: DestinationEvent::UpResponse { .. },
+                            ..
+                        }
+                    ) {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let DaemonEvent::Destination { session_id, .. } = &event else {
+                unreachable!()
+            };
+            let session_id = *session_id;
+            assert!(!sessions.contains(&session_id));
+            sessions.push(session_id);
+            bridge.event(event).await.unwrap();
+            let reply = tokio::time::timeout(WAIT, async {
+                loop {
+                    let line = notices.recv().await.unwrap();
+                    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if value["type"] == "destination_up_response" {
+                        if status == StatusCode::NOT_INTERESTED {
+                            assert!(line.len() > MAX_LINE);
+                        }
+                        break value;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                reply,
+                serde_json::json!({
+                    "type":"destination_up_response", "session":session_id.0,
+                    "mac":mac().to_string(), "status":status.0, "text":text,
+                })
+            );
+            assert_eq!(bridge.destinations[&mac()].metrics, original_metrics);
+            assert_eq!(bridge.destinations[&mac()].addresses, original_addresses);
+            peers.push(peer);
+        }
+        drop(peers);
+        daemon.shutdown().await.unwrap();
     }
 
     #[tokio::test]

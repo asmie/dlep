@@ -24,8 +24,10 @@ a file. It does not run the adapter.
   under systemd). The adapter runs as the modem's user without the modem's
   ambient capabilities.
 - Messages are [JSON Lines](https://jsonlines.org/): one UTF-8 JSON object per
-  line, at most 64 KiB, with a `"type"` field. Blank lines are ignored.
-  Flush standard output after each line.
+  line with a `"type"` field. Adapter output sent to the modem is limited to
+  64 KiB per line, excluding the newline; blank lines are ignored. Flush standard
+  output after each line. Modem notices can exceed this limit when JSON escaping
+  expands a peer's status text, so do not apply it to the adapter's stdin.
 - The adapter must exit when its standard input closes. On shutdown the modem
   terminates its DLEP sessions, closes the adapter's input, and kills the
   adapter if it is still running two seconds later.
@@ -153,6 +155,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `session_sync` | `sessions` (array of `{ "session": number, "peer": "address:port" }`) | Authoritative current session membership, sent at bridge startup and whenever membership changes. Replace the adapter's session list with this list; an empty array means no sessions. |
 | `session_up` | `session`, `peer` | A router session is established. |
 | `session_down` | `session`, `peer`, `status` (numeric RFC 8175 status code) | A router session ended. |
+| `destination_up_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to Destination Up. Zero means accepted; other status codes mean it declined reports for this destination. |
 | `destination_announced` | `session`, `mac` | The router asked about a destination it has not been told about (§12.13). The modem has already answered; send `destination_up` if the radio can reach it. |
 | `link_request` | `request`, `session`, `peer`, `mac`, `requested`, `current` | A router asks to change a destination's link. |
 
@@ -161,11 +164,20 @@ Session IDs are unique during a modem process lifetime. Intermediate sessions
 may be omitted if they start and end before the bridge observes them.
 `session_up` accompanies replay for a newly observed established session;
 `session_down` supplies the termination reason when its event is available.
-Transient down/announce notices may be lost under event lag. Use `session_sync`
+Transient down/announce/Up-response notices may be lost under event lag. Use `session_sync`
 to reconcile membership; a delayed down notice for an absent ID is harmless.
 Link requests use a separate delivery path. Older adapters may ignore
 `session_sync` under the unknown-message rule, but then cannot recover missing
 lifecycle notices.
+
+`destination_up_response` reports that router's outcome, including any status
+text. A refusal stops reports on that session but preserves the modem's cached
+destination, metrics, and addresses. It does not withdraw the physical destination
+or affect other routers; later routers still receive normal replay. Do not send
+`destination_down` solely because one router declined the destination. Session
+membership snapshots cannot recover a lost response or its explanation.
+Invalid, unsolicited, duplicate, or fatal replies follow session termination
+instead of producing an Up-response notice.
 
 ```json
 {"type":"link_request","request":7,"session":1,"peer":"192.0.2.1:41000","mac":"02:00:00:00:00:01","requested":{"current_data_rate_tx_bps":2000000},"current":{"max_data_rate_rx_bps":10000000,"max_data_rate_tx_bps":10000000,"current_data_rate_rx_bps":5000000,"current_data_rate_tx_bps":5000000,"latency_us":2500}}

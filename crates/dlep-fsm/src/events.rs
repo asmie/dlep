@@ -155,6 +155,13 @@ pub enum EmittedEvent {
         metrics: LinkMetrics,
         addrs: DestinationAddrs,
     },
+    /// Modem side: a validated, nonfatal reply to Destination Up. The
+    /// destination remains known even when the router declines it.
+    DestinationUpResponse {
+        mac: MacAddress,
+        status: StatusCode,
+        text: String,
+    },
     DestinationDown {
         mac: MacAddress,
         reason: StatusCode,

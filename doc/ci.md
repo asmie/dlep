@@ -217,6 +217,12 @@ a subsequent request on the same session. FSM tests reject duplicate, unsolicite
 malformed, and fatal replies without emitting completion; runtime tests preserve
 status text and session/peer attribution, verify state publication before success,
 and isolate two peers sharing a MAC over both IP families and MAC formats.
+Destination Up completion tests cover accepted and declined reports, queued
+metric/address corrections, preserved state after refusal, later Announce, and
+peer/session attribution. Bridge tests preserve replay for a later router and
+round-trip escaped status text beyond the adapter input-line limit. The real
+adapter pipeline requires the acceptance notice, and churn checks each peer
+response without discarding unexpected modem events.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

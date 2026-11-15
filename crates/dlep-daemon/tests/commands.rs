@@ -1,7 +1,9 @@
-use dlep_core::{MacAddress, MacAddressFormat, Message, MessageType as M, StatusCode as S};
+use dlep_core::{
+    DataItem, MacAddress, MacAddressFormat, Message, MessageType as M, StatusCode as S,
+};
 use dlep_daemon::{
-    AddressChanges, CommandError as C, DaemonError, DaemonEvent, DestinationAddrs, DestinationId,
-    LinkMetrics, ModemConfig, ModemDaemon, SessionCommand,
+    AddressChanges, CommandError as C, DaemonError, DaemonEvent, DestinationAddrs,
+    DestinationEvent, DestinationId, LinkMetrics, ModemConfig, ModemDaemon, SessionCommand,
 };
 use dlep_ext::SessionId;
 use dlep_fsm::session_common::{build_destination_down_response, build_destination_up_response};
@@ -113,6 +115,105 @@ async fn ack_up(peer: &mut TcpStream) {
     // A response on the same stream proves the Up acknowledgement was handled.
     send(peer, Message::new(M::SESSION_UPDATE)).await;
     assert_eq!(read(peer).await.message_type, M::SESSION_UPDATE_RESPONSE);
+}
+
+#[tokio::test]
+async fn destination_up_outcomes_publish_current_state_and_keep_routers_isolated() {
+    use dlep_daemon::DestinationPhase as P;
+    use dlep_fsm::session_common::{build_destination_announce, extract_link_metrics};
+
+    for (format, mac) in [
+        (
+            MacAddressFormat::Eui48,
+            MacAddress::new_eui48([2, 0, 0, 0, 0, 1]),
+        ),
+        (
+            MacAddressFormat::Eui64,
+            MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+        ),
+    ] {
+        for ip in ["127.0.0.1", "::1"] {
+            let m = modem_on(ip, format).await;
+            let mut events = m.subscribe();
+            let (mut a, aid) = peer(&m, &mut events).await;
+            let (mut b, bid) = peer(&m, &mut events).await;
+            m.add_destination(mac.into(), LinkMetrics::default())
+                .await
+                .unwrap();
+            for stream in [&mut a, &mut b] {
+                assert_eq!(read(stream).await.message_type, M::DESTINATION_UP);
+            }
+            let expected = LinkMetrics {
+                latency: Duration::from_micros(321),
+                ..Default::default()
+            };
+            let addrs = DestinationAddrs {
+                v4: vec!["192.0.2.1".parse().unwrap()],
+                ..Default::default()
+            };
+            m.update_destination(mac.into(), expected).await.unwrap();
+            m.update_destination_addresses(
+                mac.into(),
+                AddressChanges {
+                    added: addrs.clone(),
+                    removed: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+            for (stream, sid, status, phase) in [
+                (&mut a, aid, S::NOT_INTERESTED, P::Withdrawn),
+                (&mut b, bid, S::SUCCESS, P::Up),
+            ] {
+                let addr = stream.local_addr().unwrap();
+                let text = format!("router {sid:?}: dostęp ✓\n\"reply\"");
+                send(
+                    stream,
+                    Message::new(M::DESTINATION_UP_RESPONSE)
+                        .with_item(DataItem::MacAddress(mac))
+                        .with_item(DataItem::Status {
+                            code: status,
+                            text: text.clone(),
+                        }),
+                )
+                .await;
+                let reply = event(&mut events, |e| {
+                    matches!(e, DaemonEvent::Destination { .. })
+                })
+                .await;
+                assert!(matches!(reply, DaemonEvent::Destination {
+                    session_id, peer, event: DestinationEvent::UpResponse { id, status: got, text: got_text }
+                } if session_id == sid && peer.addr == addr && id.0 == mac && got == status && got_text == text));
+                // The completion event follows publication, including queued values.
+                let state = m.state().borrow().clone();
+                let destination = &state.sessions[&sid].destinations[&mac.into()];
+                assert_eq!(destination.phase, phase);
+                assert_eq!(destination.metrics, expected);
+                assert_eq!(destination.addresses, addrs);
+                assert_eq!(
+                    state.sessions[&aid].destinations[&mac.into()].phase,
+                    P::Withdrawn
+                );
+                assert_eq!(
+                    state.sessions[&bid].destinations[&mac.into()].phase,
+                    if sid == aid { P::PendingUp } else { P::Up }
+                );
+                if status == S::SUCCESS {
+                    let update = read(stream).await;
+                    assert_eq!(update.message_type, M::DESTINATION_UPDATE);
+                    assert_eq!(extract_link_metrics(&update), Some(expected));
+                    assert_eq!(AddressChanges::from_message(&update).added, addrs);
+                }
+            }
+            send(&mut a, build_destination_announce(mac)).await;
+            let restored = read(&mut a).await;
+            assert_eq!(restored.message_type, M::DESTINATION_ANNOUNCE_RESPONSE);
+            assert_eq!(extract_link_metrics(&restored), Some(expected));
+            assert_eq!(AddressChanges::from_message(&restored).added, addrs);
+            drop((a, b));
+            m.shutdown().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]
