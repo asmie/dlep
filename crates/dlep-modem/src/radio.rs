@@ -789,14 +789,25 @@ impl Bridge<'_> {
                         return;
                     }
                 }
-                let delivered = pending.answer.send(LinkResponse {
+                let response = LinkResponse {
                     status: match status {
                         Status::Success => StatusCode::SUCCESS,
                         Status::Denied => StatusCode::REQUEST_DENIED,
                     },
                     text,
                     metrics,
-                });
+                };
+                // The status text shares the wire budget with the complete
+                // metric set. A valid JSON line can still exceed that budget.
+                if let Err(e) =
+                    self.daemon
+                        .validate_link_response(pending.mac.into(), &response, &current)
+                {
+                    warn!(request, "radio adapter link response rejected: {e}");
+                    let _ = pending.answer.send(LinkResponse::denied());
+                    return;
+                }
+                let delivered = pending.answer.send(response);
                 if delivered.is_ok() {
                     if let (Some(metrics), Some(known)) =
                         (cached, self.destinations.get_mut(&pending.mac))
@@ -2927,6 +2938,152 @@ mod tests {
                         if invalid { "" } else { "processed" },
                     ))
                 );
+            }
+            drop(peer);
+            daemon.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn link_response_wire_limit_is_checked_before_caching_grants() {
+        for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+            let mac = match format {
+                MacAddressFormat::Eui48 => mac(),
+                MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+            };
+            let mut config = ModemConfig::default();
+            config.shared.network.use_tls = false;
+            config.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
+            config.shared.network.tcp_port = 0;
+            config.shared.network.discovery_port = 0;
+            config.shared.network.mac_address_format = format;
+            config.metrics.resources = Some(80);
+            config.metrics.rlq_rx = Some(60);
+            config.metrics.rlq_tx = Some(70);
+            config.metrics.mtu = Some(1500);
+            let initial = config.metrics.link_metrics();
+            let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
+            let daemon = ModemDaemon::builder()
+                .config(config)
+                .link_control(Arc::new(RadioLink {
+                    asks,
+                    timeout: Duration::from_secs(30),
+                }))
+                .spawn()
+                .await
+                .unwrap();
+            let mut events = daemon.subscribe();
+            let mut bridge = bridge(&daemon);
+            bridge.session_metrics = initial;
+            bridge.mac_address_format = format;
+            let mut peer = session(&daemon, &mut events).await;
+            bridge
+                .inbound(Inbound::DestinationUp {
+                    mac: Mac(mac),
+                    metrics: Metrics {
+                        latency_us: Some(100),
+                        ..Default::default()
+                    },
+                    addresses: Addresses::default(),
+                })
+                .await;
+            assert_eq!(
+                read(&mut peer).await.message_type,
+                MessageType::DESTINATION_UP
+            );
+            send(
+                &mut peer,
+                build_destination_up_response(mac, StatusCode::SUCCESS),
+            )
+            .await;
+            flush_peer(&mut peer).await;
+            let overhead = dlep_fsm::session_common::build_link_characteristics_response(
+                mac,
+                StatusCode::SUCCESS,
+                &initial,
+            )
+            .encode()
+            .unwrap()
+            .len()
+                - 4;
+            let text_limit = usize::from(u16::MAX) - overhead;
+            let mut latency = 321;
+            for multibyte in [false, true] {
+                for oversized in [true, false] {
+                    let original = bridge.destinations[&mac].metrics;
+                    send(
+                        &mut peer,
+                        build_link_characteristics_request(
+                            mac,
+                            &dlep_daemon::LinkCharacteristics {
+                                latency: Some(Duration::from_micros(latency)),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await;
+                    let ask = tokio::time::timeout(WAIT, queued.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let request = bridge.next_request;
+                    bridge.ask(ask).await.unwrap();
+                    let length = text_limit + usize::from(oversized);
+                    let text = if multibyte {
+                        format!("{}{}", "é".repeat(length / 2), "x".repeat(length % 2))
+                    } else {
+                        "x".repeat(length)
+                    };
+                    assert_eq!(text.len(), length);
+                    let line = serde_json::json!({"type":"link_response", "request":request, "status":"success",
+                        "text":text,"metrics":{"latency_us":latency}}).to_string();
+                    assert!(
+                        line.len() <= MAX_LINE,
+                        "valid adapter framing must reach response validation"
+                    );
+                    bridge.inbound(parse_inbound(&line).unwrap()).await;
+                    let response = read(&mut peer).await;
+                    assert_eq!(
+                        response.message_type,
+                        MessageType::LINK_CHARACTERISTICS_RESPONSE
+                    );
+                    let expected = if oversized {
+                        original
+                    } else {
+                        LinkMetrics {
+                            latency: Duration::from_micros(latency),
+                            ..original
+                        }
+                    };
+                    assert_eq!(extract_link_metrics(&response), Some(expected));
+                    assert_eq!(
+                        bridge.destinations[&mac].metrics, expected,
+                        "a response rejected on the wire must not change cached metrics"
+                    );
+                    let (code, actual_text) = response
+                        .data_items
+                        .iter()
+                        .find_map(|item| match item {
+                            dlep_core::DataItem::Status { code, text } => {
+                                Some((*code, text.as_str()))
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        code,
+                        if oversized {
+                            StatusCode::REQUEST_DENIED
+                        } else {
+                            StatusCode::SUCCESS
+                        }
+                    );
+                    assert_eq!(actual_text, if oversized { "" } else { &text });
+                    if !oversized {
+                        assert_eq!(response.encode().unwrap().len(), usize::from(u16::MAX) + 4);
+                    }
+                    latency += 1;
+                }
             }
             drop(peer);
             daemon.shutdown().await.unwrap();

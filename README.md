@@ -294,8 +294,8 @@ slot, so the router's further requests and the modem's `drop_destination` for it
 return Busy until the answer. Destination updates remain available. Granted
 metrics merge into the destination like `update_destination` and are reported
 only on the requesting session. Undeclared metrics, session-terminating
-statuses, and backend panics produce `Request Denied` with current metrics. The
-backend future is dropped if the session ends first. A closure works:
+statuses, oversized responses, and backend panics produce `Request Denied` with
+current metrics. The backend future is dropped if the session ends first. A closure works:
 
 ```rust
 let modem = ModemDaemon::builder()
@@ -309,6 +309,12 @@ let modem = ModemDaemon::builder()
     .spawn()
     .await?;
 ```
+
+Before caching an answer, embedders can call
+`ModemDaemon::validate_link_response(id, &response, &current)` with the
+destination's latest effective metrics. It checks the status, metric declarations,
+and complete response encoding, including status text and inherited optional
+metrics. Session state and pending-request checks still occur when dispatching.
 
 Without a backend, the modem returns `Request Denied` with current destination
 metrics, keeping the session alive. The `dlep-modem` binary uses its

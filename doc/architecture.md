@@ -999,6 +999,16 @@ The order of work was:
     cover both MAC formats over IPv4/IPv6 and require the original session ID,
     preventing reconnect-and-replay from masking a failed re-announcement.
 
+43. Complete radio link-reply validation. **Done** — the bridge validates status
+    text and effective metrics together before sending an answer or caching its
+    grant. A JSON line can fit the adapter limit while its complete DLEP response
+    exceeds the wire limit; these answers now become Request Denied without
+    altering replayed metrics. `ModemDaemon::validate_link_response` exposes the
+    same content checks using the FSM's shared response builder. Regressions
+    cover exact limits and one-byte overflow, inherited optional metrics, UTF-8
+    byte lengths, both MAC formats, and real IPv4/IPv6 adapter pipelines with
+    unchanged replay followed by a valid grant on the original session.
+
 ---
 
 ## 10. Open questions / risks

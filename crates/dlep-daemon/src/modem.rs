@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::config::{ModemConfig, TimersConfig};
 use crate::connections::ConnectedRouters;
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
-use crate::link_control::LinkControl;
+use crate::link_control::{LinkControl, LinkResponse};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
     new_event_channel,
@@ -153,7 +153,7 @@ impl ModemDaemon {
     }
 
     /// Validate metric declarations and wire encoding without sending an update.
-    /// Link-control backends can use this before retaining response metrics.
+    /// Use [`Self::validate_link_response`] to check a complete link reply.
     pub fn validate_metrics(&self, metrics: &LinkMetrics) -> Result<(), DaemonError> {
         if !metrics.supported_by(&self.initial_metrics) {
             return Err(DaemonError::Config(
@@ -161,6 +161,41 @@ impl ModemDaemon {
             ));
         }
         dlep_fsm::session_common::build_session_update(metrics).encode()?;
+        Ok(())
+    }
+
+    /// Validate a link reply's status, effective metrics, and complete wire
+    /// encoding without sending it. Supply the destination's latest metrics;
+    /// omitted optional values in the reply retain their current values.
+    /// Session state, MAC-format policy, and pending-request checks still happen
+    /// on dispatch.
+    pub fn validate_link_response(
+        &self,
+        id: DestinationId,
+        response: &LinkResponse,
+        current: &LinkMetrics,
+    ) -> Result<(), DaemonError> {
+        if response.status.terminates_session() {
+            return Err(DaemonError::Config(
+                "link response status must not terminate the session".into(),
+            ));
+        }
+        let mut effective = *current;
+        if let Some(metrics) = &response.metrics {
+            self.validate_metrics(metrics)?;
+            dlep_fsm::session_common::merge_link_metrics(
+                &dlep_fsm::session_common::build_session_update(metrics),
+                &mut effective,
+            );
+        }
+        self.validate_metrics(&effective)?;
+        dlep_fsm::session_common::build_link_characteristics_reply(
+            id.0,
+            response.status,
+            response.text.clone(),
+            &effective,
+        )
+        .encode()?;
         Ok(())
     }
 

@@ -51,6 +51,10 @@ def command(message):
     op = message["op"]
     if op == "send":
         send(message["messages"])
+    elif op == "send_line":
+        # Preserve exact framing for wire/JSON size-boundary regressions.
+        sys.stdout.write(message["line"] + "\n")
+        sys.stdout.flush()
     elif op == "pause":
         # Bound the amount of output needed to exercise actual pipe pressure.
         # This changes only our own stdin pipe, never the daemon's network I/O.

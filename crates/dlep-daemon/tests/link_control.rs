@@ -144,6 +144,73 @@ async fn event(
 }
 
 #[tokio::test]
+async fn response_validation_counts_inherited_metrics_and_rejects_invalid_content() {
+    let mut config = ModemConfig::default();
+    config.shared.network.use_tls = false;
+    config.shared.network.bind_addr = "127.0.0.1".parse().unwrap();
+    config.shared.network.tcp_port = 0;
+    config.shared.network.discovery_port = 0;
+    config.metrics.mtu = Some(1500);
+    let current = config.metrics.link_metrics();
+    let modem = ModemDaemon::builder().config(config).spawn().await.unwrap();
+    for mac in [
+        destination().0,
+        MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+    ] {
+        // The response inherits MTU even when its metrics omit it completely.
+        let overhead = dlep_fsm::session_common::build_link_characteristics_response(
+            mac,
+            S::SUCCESS,
+            &current,
+        )
+        .encode()
+        .unwrap()
+        .len()
+            - 4;
+        for metrics in [None, Some(LinkMetrics::default())] {
+            for status in [S::SUCCESS, S::REQUEST_DENIED] {
+                let mut response = LinkResponse {
+                    status,
+                    text: "x".repeat(usize::from(u16::MAX) - overhead),
+                    metrics,
+                };
+                modem
+                    .validate_link_response(mac.into(), &response, &current)
+                    .unwrap();
+                response.text.push('x');
+                assert!(
+                    modem
+                        .validate_link_response(mac.into(), &response, &current)
+                        .is_err()
+                );
+            }
+        }
+    }
+    for response in [
+        LinkResponse {
+            status: S::INVALID_DATA,
+            ..LinkResponse::denied()
+        },
+        LinkResponse::granted(LinkMetrics {
+            resources: Some(50),
+            ..current
+        }),
+        LinkResponse::granted(LinkMetrics {
+            latency: Duration::MAX,
+            ..current
+        }),
+    ] {
+        assert!(
+            modem
+                .validate_link_response(destination(), &response, &current)
+                .is_err()
+        );
+    }
+    assert!(modem.state().borrow().sessions.is_empty());
+    modem.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn backend_grant_reaches_router_with_applied_metrics() {
     let (seen_tx, mut seen) = mpsc::unbounded_channel();
     let backend = move |request: LinkRequest| {

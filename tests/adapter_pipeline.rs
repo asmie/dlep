@@ -842,6 +842,92 @@ async fn radio_mac_policy_preserves_valid_reports_commands_and_replay() {
 }
 
 #[tokio::test]
+async fn oversized_radio_link_replies_preserve_replay_and_allow_recovery() {
+    for (format, mac, mac_bytes) in [("eui48", MAC, 6), ("eui64", MAC64, 8)] {
+        for ip in ["127.0.0.1", "::1"] {
+            let (mut radio, addr) = Node::modem_with_format("modem-a", ip, 0, format).await;
+            report(&mut radio, mac, 700, 1).await;
+            let mut router = Node::router_with_format(&[addr], format).await;
+            let initial = router
+                .wait(|s| destination(s, "modem-a", mac).is_some())
+                .await;
+            let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+            let mut expected = defaults();
+            expected["current_data_rate_tx_bps"] = json!(700);
+            expected["rlq_tx"] = json!(0);
+            for (request, oversized, latency) in [(1, true, 321), (2, false, 322)] {
+                let wanted = json!({"latency_us":latency});
+                router
+                    .control
+                    .send(json!({"type":"link_request", "request":request,
+                        "session":sid, "mac":mac, "requested":wanted}))
+                    .await;
+                router.result(request, "accepted").await;
+                let pending = radio
+                    .wait(|s| notice(s, "link_request", |n| n["requested"] == wanted).is_some())
+                    .await;
+                let pending =
+                    notice(&pending, "link_request", |n| n["requested"] == wanted).unwrap();
+                // TLV headers plus MAC, Status, five u64 metrics, three u8
+                // metrics, and MTU. Omitted metrics still occupy wire space.
+                let overhead = (4 + mac_bytes) + (4 + 1) + 5 * (4 + 8) + 3 * (4 + 1) + (4 + 2);
+                let text = if oversized {
+                    "x".repeat(usize::from(u16::MAX) - overhead + 1)
+                } else {
+                    "applied".into()
+                };
+                let line = json!({"type":"link_response", "request":pending["request"],
+                    "status":"success", "text":text, "metrics":wanted})
+                .to_string();
+                assert!(line.len() <= 64 * 1024, "reply must pass JSON-line framing");
+                radio
+                    .control
+                    .call(json!({"op":"send_line", "line":line}))
+                    .await;
+                let code = if oversized { 2 } else { 0 };
+                let replied = router
+                    .wait(|s| {
+                        notice(s, "link_response", |n| {
+                            n["mac"] == mac && n["status"] == code
+                        })
+                        .is_some()
+                    })
+                    .await;
+                assert_eq!(session(&replied, "modem-a").unwrap()["session"], sid);
+                assert_eq!(
+                    notice(&replied, "link_response", |n| n["status"] == code).unwrap()["text"],
+                    if oversized { "" } else { "applied" }
+                );
+                if !oversized {
+                    expected["latency_us"] = json!(latency);
+                }
+                assert_eq!(
+                    destination(&replied, "modem-a", mac).unwrap()["metrics"],
+                    expected
+                );
+                let mut late = Node::router_with_format(&[addr], format).await;
+                let replay = late
+                    .wait(|s| destination(s, "modem-a", mac).is_some())
+                    .await;
+                assert_eq!(
+                    destination(&replay, "modem-a", mac).unwrap()["metrics"],
+                    expected
+                );
+                assert_eq!(
+                    destination(&replay, "modem-a", mac).unwrap()["addresses"],
+                    expected_addresses(1)
+                );
+                late.stop().await;
+                late.assert_final_empty();
+            }
+            router.stop().await;
+            router.assert_final_empty();
+            radio.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn oversized_radio_address_batches_preserve_replay_and_allow_recovery() {
     for ip in ["127.0.0.1", "::1"] {
         let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;

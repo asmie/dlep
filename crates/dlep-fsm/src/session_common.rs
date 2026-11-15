@@ -217,13 +217,20 @@ pub fn build_link_characteristics_response(
     status: StatusCode,
     metrics: &LinkMetrics,
 ) -> Message {
+    build_link_characteristics_reply(mac, status, String::new(), metrics)
+}
+
+/// Build the complete response, including application-supplied status text.
+pub fn build_link_characteristics_reply(
+    mac: MacAddress,
+    status: StatusCode,
+    text: String,
+    metrics: &LinkMetrics,
+) -> Message {
     push_metric_items(
         Message::new(MessageType::LINK_CHARACTERISTICS_RESPONSE)
             .with_item(DataItem::MacAddress(mac))
-            .with_item(DataItem::Status {
-                code: status,
-                text: String::new(),
-            }),
+            .with_item(DataItem::Status { code: status, text }),
         metrics,
     )
 }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Radio link replies validate their complete wire size, including status text
+  and inherited metrics, before changing the replay cache. Oversized replies
+  become Request Denied with unchanged metrics, so later routers cannot receive
+  a rejected grant. Embedders can use `ModemDaemon::validate_link_response`
+  for the same content checks before retaining an answer.
 - Near-limit destinations can be re-announced without closing the session when
   the required Status item makes the response larger than Destination Up.
   Successful responses carry metrics and fitting addresses; remaining addresses

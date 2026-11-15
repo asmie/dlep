@@ -172,6 +172,11 @@ Partial-reply regressions report new destination/session metrics while a request
 is pending, then check omitted fields and invalid optional metrics. Overlapping
 requests from two real routers must preserve each session's values and accumulate
 their explicit grants in the cache replayed to a third router over IPv4/IPv6.
+Link-reply size regressions include status text and inherited optional metrics,
+checking exact wire limits and one-byte overflow with ASCII and multibyte text
+under both MAC formats. The real adapter pipeline sends compact JSON that fits
+the line limit but exceeds the response limit; IPv4/IPv6 cases require unchanged
+replay to a later router and a subsequent valid grant on the original session.
 Address-cache regressions accumulate individually valid batches beyond the
 Destination Up wire limit, with and without a connected router. Rejected batches
 must preserve all addresses, later replay must work, and a batch that frees space

@@ -185,9 +185,13 @@ into this router's response. Routers already connected learn of another
 session's grant only through a `destination_update`, so send one if they should
 see it. Later routers receive the accumulated cached values.
 
-Both merged results must use declared metrics and fit the wire format. Invalid
-metrics turn the answer into Request Denied without your text, and the table
-keeps its previous values.
+Both merged results must use declared metrics and fit the wire format. The
+complete response, including the MAC, status text, and every declared metric,
+must also fit the 65,535-byte DLEP message body. Text counts in UTF-8 bytes;
+fitting the adapter's 64 KiB JSON-line limit does not guarantee that the response
+fits. Invalid metrics or an oversized response turn the answer into Request
+Denied without your text. Both the requesting router and the replay table keep
+their previous metric values.
 
 Each destination has at most one outstanding request per session; requests for
 different destinations or sessions may overlap. RFC 8175 §8 gives requests no

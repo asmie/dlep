@@ -9,10 +9,10 @@ use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
     SessionConfig, build_destination_announce_response, build_destination_announce_success,
     build_destination_down, build_destination_up, build_destination_update,
-    build_destination_updates, build_heartbeat, build_session_termination,
-    build_session_termination_response, build_session_update, build_session_update_response,
-    extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
-    extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    build_destination_updates, build_heartbeat, build_link_characteristics_reply,
+    build_session_termination, build_session_termination_response, build_session_update,
+    build_session_update_response, extract_destination_mac, extract_extensions_supported,
+    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -904,23 +904,6 @@ impl ModemSessionFsm {
             },
         ]
     }
-}
-
-fn build_link_characteristics_reply(
-    mac: MacAddress,
-    status: StatusCode,
-    text: String,
-    metrics: &LinkMetrics,
-) -> Message {
-    let mut message =
-        crate::session_common::build_link_characteristics_response(mac, status, metrics);
-    for item in &mut message.data_items {
-        if let DataItem::Status { text: slot, .. } = item {
-            *slot = text;
-            break;
-        }
-    }
-    message
 }
 
 fn build_session_initialization_response(config: &SessionConfig) -> Message {
