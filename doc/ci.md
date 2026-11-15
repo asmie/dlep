@@ -227,6 +227,13 @@ Radio withdrawal notices are checked per session over both IP families and MAC
 formats. The real adapter regression verifies continued reports to other routers,
 cached replay to a later router, and re-announcement with current metrics and
 addresses. Subsequent physical Down/Up cycles must not echo router withdrawals.
+Session Update completion tests cover both roles, status text, refused and
+unknown nonfatal statuses, transaction release, address no-ops, and completion
+before coalesced next metrics. Malformed, unsolicited, duplicate, and fatal
+replies must not emit completion. IPv4/IPv6 runtime tests check peer attribution
+and independent sessions; adapter tests preserve replay after refusal, escape
+long text, and keep notices outside complete snapshots. The real subprocess
+pipeline requires a radio notice after a session metric update.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

@@ -122,6 +122,16 @@ pub enum DaemonEvent {
         peer: PeerInfo,
         reason: StatusCode,
     },
+    /// Validated, nonfatal reply to a locally sent Session Update. One event
+    /// per wire reply, not per application call: metric updates may coalesce
+    /// and address updates may be no-ops. Local state is not rolled back on
+    /// refusal, and a queued next update may already occupy the session slot.
+    SessionUpdateResponse {
+        session_id: dlep_ext::SessionId,
+        peer: PeerInfo,
+        status: StatusCode,
+        text: String,
+    },
     Destination {
         session_id: dlep_ext::SessionId,
         peer: PeerInfo,
@@ -158,6 +168,18 @@ impl fmt::Debug for DaemonEvent {
                 .debug_struct("SessionDown")
                 .field("peer", peer)
                 .field("reason", reason)
+                .finish(),
+            Self::SessionUpdateResponse {
+                session_id,
+                peer,
+                status,
+                text,
+            } => f
+                .debug_struct("SessionUpdateResponse")
+                .field("session_id", session_id)
+                .field("peer", peer)
+                .field("status", status)
+                .field("text", text)
                 .finish(),
             Self::Destination {
                 peer,

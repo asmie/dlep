@@ -953,6 +953,14 @@ fn translate_emitted(
             peer: peer.clone(),
             reason: *reason,
         }),
+        EmittedEvent::SessionUpdateResponse { status, text } => {
+            Some(DaemonEvent::SessionUpdateResponse {
+                session_id,
+                peer: peer.clone(),
+                status: *status,
+                text: text.clone(),
+            })
+        }
         EmittedEvent::PeerDiscovered { .. } => None,
         EmittedEvent::DestinationUp {
             mac,

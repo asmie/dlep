@@ -334,6 +334,14 @@ async fn execute(daemon: &RouterDaemon, message: Inbound, last_request: &mut u64
 
 fn notice(event: DaemonEvent) -> Option<Value> {
     match event {
+        DaemonEvent::SessionUpdateResponse {
+            session_id,
+            status,
+            text,
+            ..
+        } => Some(
+            json!({"type":"session_update_response", "session":session_id.0, "status":status.0, "text":text}),
+        ),
         DaemonEvent::Destination {
             session_id,
             event: DestinationEvent::AnnounceResponse { id, status, text },

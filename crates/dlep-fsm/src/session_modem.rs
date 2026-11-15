@@ -526,10 +526,23 @@ impl ModemSessionFsm {
                 if msg.message_type == MessageType::SESSION_UPDATE_RESPONSE =>
             {
                 self.tx.close_session();
-                let mut actions = self
-                    .pending_session_metrics
-                    .take()
-                    .map_or_else(Vec::new, |metrics| self.send_session_metrics(metrics));
+                let (status, text) = msg
+                    .data_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DataItem::Status { code, text } => Some((*code, text.clone())),
+                        _ => None,
+                    })
+                    .expect("validated status");
+                // Publish this outcome even if writing the queued next update
+                // fails. Its transaction is separate from the completed one.
+                let mut actions = vec![FsmAction::Emit(EmittedEvent::SessionUpdateResponse {
+                    status,
+                    text,
+                })];
+                if let Some(metrics) = self.pending_session_metrics.take() {
+                    actions.extend(self.send_session_metrics(metrics));
+                }
                 actions.extend(heartbeat_reset_action(
                     TIMER_HEARTBEAT_MISSED,
                     self.peer_heartbeat_interval,

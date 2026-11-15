@@ -283,6 +283,11 @@ enum Outbound {
         peer: SocketAddr,
         status: u8,
     },
+    SessionUpdateResponse {
+        session: u64,
+        status: u8,
+        text: String,
+    },
     DestinationAnnounced {
         session: u64,
         mac: Mac,
@@ -1017,6 +1022,19 @@ impl Bridge<'_> {
 
     async fn event(&mut self, event: DaemonEvent) -> Result<()> {
         match event {
+            DaemonEvent::SessionUpdateResponse {
+                session_id,
+                status,
+                text,
+                ..
+            } => {
+                self.send(&Outbound::SessionUpdateResponse {
+                    session: session_id.0,
+                    status: status.0,
+                    text,
+                })
+                .await?
+            }
             DaemonEvent::Destination {
                 session_id,
                 event: DestinationEvent::Down { id, .. },
@@ -1595,6 +1613,88 @@ mod tests {
             );
             assert_eq!(bridge.destinations[&mac()].metrics, original_metrics);
             assert_eq!(bridge.destinations[&mac()].addresses, original_addresses);
+            peers.push(peer);
+        }
+        drop(peers);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_update_outcomes_reach_radio_without_changing_replay() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::channel(QUEUE_SIZE);
+        bridge.out = out;
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(321),
+                    ..Default::default()
+                },
+            })
+            .await;
+        bridge.inbound(up(Metrics::default())).await;
+        let expected = bridge.session_metrics;
+        let mut peers = Vec::new();
+        let mut sessions = Vec::new();
+        for status in [
+            StatusCode::REQUEST_DENIED,
+            StatusCode(42),
+            StatusCode::SUCCESS,
+        ] {
+            let mut peer = session(&daemon, &mut events).await;
+            let snapshot = daemon.state().borrow().clone();
+            bridge.reconcile(&snapshot).await.unwrap();
+            let update = read(&mut peer).await;
+            assert_eq!(update.message_type, MessageType::SESSION_UPDATE);
+            assert_eq!(extract_link_metrics(&update), Some(expected));
+            let replay = read(&mut peer).await;
+            assert_eq!(replay.message_type, MessageType::DESTINATION_UP);
+            assert_eq!(extract_link_metrics(&replay), Some(expected));
+            // Escaping a valid wire response may exceed the adapter input limit.
+            let text = format!("router: dostęp ✓\"{}", "\n".repeat(MAX_LINE / 2));
+            send(
+                &mut peer,
+                Message::new(MessageType::SESSION_UPDATE_RESPONSE).with_item(
+                    dlep_core::DataItem::Status {
+                        code: status,
+                        text: text.clone(),
+                    },
+                ),
+            )
+            .await;
+            let event = tokio::time::timeout(WAIT, events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let DaemonEvent::SessionUpdateResponse { session_id, .. } = &event else {
+                panic!("unexpected event: {event:?}");
+            };
+            let sid = *session_id;
+            assert!(!sessions.contains(&sid));
+            sessions.push(sid);
+            bridge.event(event).await.unwrap();
+            let value = tokio::time::timeout(WAIT, async {
+                loop {
+                    let line = notices.recv().await.unwrap();
+                    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if value["type"] == "session_update_response" {
+                        assert!(line.len() > MAX_LINE);
+                        break value;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "type":"session_update_response", "session":sid.0, "status":status.0, "text":text,
+                })
+            );
+            assert_eq!(bridge.session_metrics, expected);
+            assert_eq!(bridge.destinations[&mac()].metrics, expected);
             peers.push(peer);
         }
         drop(peers);

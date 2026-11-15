@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Both daemon roles expose validated, nonfatal Session Update replies through
+  `DaemonEvent::SessionUpdateResponse`, preserving peer status and text. Both
+  adapters forward `session_update_response` notices. Completion precedes any
+  queued next update and does not roll back local state on refusal. Events
+  correspond to wire replies; coalesced calls and address no-ops have no separate
+  outcomes. Exhaustive matches must handle the new daemon and FSM
+  `EmittedEvent::SessionUpdateResponse` variants.
 - Radio adapters receive `destination_withdrawn` notices with the session and
   MAC when a router withdraws interest. The physical destination stays cached
   for other routers, later replay, and re-announcement on the original session.

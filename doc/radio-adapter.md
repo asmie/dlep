@@ -155,6 +155,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `session_sync` | `sessions` (array of `{ "session": number, "peer": "address:port" }`) | Authoritative current session membership, sent at bridge startup and whenever membership changes. Replace the adapter's session list with this list; an empty array means no sessions. |
 | `session_up` | `session`, `peer` | A router session is established. |
 | `session_down` | `session`, `peer`, `status` (numeric RFC 8175 status code) | A router session ended. |
+| `session_update_response` | `session`, `status`, `text` | The router's validated, nonfatal reply to a Session Update, including initial replay of changed defaults. Zero means success. |
 | `destination_up_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to Destination Up. Zero means accepted; other status codes mean it declined reports for this destination. |
 | `destination_withdrawn` | `session`, `mac` | The router withdrew interest in this destination on this session. Physical destination knowledge remains cached. |
 | `destination_announced` | `session`, `mac` | The router asked about a destination it has not been told about (§12.13). The modem has already answered; send `destination_up` if the radio can reach it. |
@@ -165,11 +166,19 @@ Session IDs are unique during a modem process lifetime. Intermediate sessions
 may be omitted if they start and end before the bridge observes them.
 `session_up` accompanies replay for a newly observed established session;
 `session_down` supplies the termination reason when its event is available.
-Session termination and destination notices may be lost under event lag. Use `session_sync`
+Session termination, response, and destination notices may be lost under event lag. Use `session_sync`
 to reconcile membership; a delayed down notice for an absent ID is harmless.
 Link requests use a separate delivery path. Older adapters may ignore
 `session_sync` under the unknown-message rule, but then cannot recover missing
 lifecycle notices.
+
+`session_update_response` preserves the peer's status text, including on refusal.
+It reports one wire reply, so coalesced `session_metrics` lines do not each
+produce a notice. A queued next update may already be pending when the notice
+arrives. Refusal leaves the radio's cached metrics and destination reports intact;
+later replay uses those latest values. Membership snapshots cannot recover lost
+responses. Invalid, unsolicited, duplicate, or fatal replies terminate the
+session instead of producing this notice.
 
 `destination_up_response` reports that router's outcome, including any status
 text. A refusal stops reports on that session but preserves the modem's cached

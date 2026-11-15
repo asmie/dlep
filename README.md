@@ -251,6 +251,15 @@ reports or link answers. Routers may observe the defaults before those correctio
 The radio adapter uses this path; `update_session_metrics` still returns Busy
 when a session transaction is pending.
 
+Both roles emit `DaemonEvent::SessionUpdateResponse` with session, peer, status,
+and text for each validated, nonfatal reply to a locally sent Session Update.
+This covers metrics and address changes, including refusals. Events correspond
+to wire replies: coalesced calls do not each receive an outcome, and an address
+no-op sends no update. A refusal preserves effective local state. The modem emits
+completion before writing any queued next update, whose transaction may already
+be pending when a consumer handles the event. Fatal or invalid replies terminate
+the session instead; retained snapshots cannot recover lost response outcomes.
+
 To change a session's defaults while preserving its existing destination
 metrics, use `send_command_to(session_id, SessionCommand::SessionDefaults { metrics })`
 on the modem. The session reads its current destination values and sends the

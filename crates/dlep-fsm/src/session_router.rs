@@ -475,9 +475,23 @@ impl RouterSessionFsm {
                 if msg.message_type == MessageType::SESSION_UPDATE_RESPONSE =>
             {
                 self.tx.close_session();
-                heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
-                    .into_iter()
-                    .collect()
+                let (status, text) = msg
+                    .data_items
+                    .iter()
+                    .find_map(|item| match item {
+                        DataItem::Status { code, text } => Some((*code, text.clone())),
+                        _ => None,
+                    })
+                    .expect("validated status");
+                let mut actions = vec![FsmAction::Emit(EmittedEvent::SessionUpdateResponse {
+                    status,
+                    text,
+                })];
+                actions.extend(heartbeat_reset_action(
+                    TIMER_HEARTBEAT_MISSED,
+                    self.peer_heartbeat_interval,
+                ));
+                actions
             }
             // Modem answered our Destination_Announce (RFC 8175 §12.14) —
             // free the per-destination transaction slot.

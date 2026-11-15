@@ -135,6 +135,59 @@ async fn snapshot_frames_export_complete_values_and_empty_replacement() {
 }
 
 #[tokio::test]
+async fn session_update_notices_preserve_status_text_between_complete_snapshots() {
+    let (_state_tx, state) = watch::channel(fixture(1));
+    let (out, input) = mpsc::channel(2);
+    let (writer, reader) = tokio::io::duplex(128);
+    let task = tokio::spawn(write_output(writer, state, input));
+    let text = "peer: dostęp ✓\n\"status\"";
+    for status in [
+        dlep_core::StatusCode::REQUEST_DENIED,
+        dlep_core::StatusCode(42),
+    ] {
+        let value = notice(DaemonEvent::SessionUpdateResponse {
+            session_id: SessionId(1),
+            peer: fixture(1).sessions[&SessionId(1)].peer.clone(),
+            status,
+            text: text.into(),
+        })
+        .unwrap();
+        out.send(Output::Notice(value)).await.unwrap();
+    }
+    drop(out);
+    let mut lines = BufReader::new(reader).lines();
+    let mut snapshot_open = false;
+    let mut replies = Vec::new();
+    while let Some(line) = lines.next_line().await.unwrap() {
+        let value: Value = serde_json::from_str(&line).unwrap();
+        match value["type"].as_str().unwrap() {
+            "snapshot_begin" => {
+                assert!(!snapshot_open);
+                snapshot_open = true;
+            }
+            "snapshot_end" => {
+                assert!(snapshot_open);
+                snapshot_open = false;
+            }
+            "session_update_response" => {
+                assert!(!snapshot_open);
+                replies.push(value);
+            }
+            _ => assert!(snapshot_open),
+        }
+    }
+    task.await.unwrap().unwrap();
+    assert!(!snapshot_open);
+    assert_eq!(
+        replies,
+        vec![
+            json!({"type":"session_update_response", "session":1, "status":2, "text":text}),
+            json!({"type":"session_update_response", "session":1, "status":42, "text":text}),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn slow_writer_coalesces_state_and_resync_repeats_current_generation() {
     let (state_tx, state) = watch::channel(fixture(1));
     let (tx, rx) = mpsc::channel(2);

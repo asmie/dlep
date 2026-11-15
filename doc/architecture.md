@@ -1082,6 +1082,17 @@ The order of work was:
     Down/Up cycles must not generate extra withdrawal notices. Both MAC formats
     and IP families are covered; notices remain subject to event lag.
 
+50. Session Update completion events. **Done** — both FSMs expose validated,
+    nonfatal replies as `EmittedEvent::SessionUpdateResponse`; the daemon adds
+    session and peer attribution in `DaemonEvent::SessionUpdateResponse`.
+    Both adapters forward `session_update_response` with session, status, and
+    text. Modem completion precedes sending coalesced next metrics, preserving
+    the received outcome even if the next write fails. Refusals do not roll back
+    effective local state. Tests cover both roles, status text, refusals, unknown
+    nonfatal statuses, invalid/duplicate replies, address no-ops, queued metrics,
+    per-peer isolation, IPv4/IPv6 runtime and adapter delivery, replay after
+    refusal, and notices between complete router snapshots.
+
 ---
 
 ## 10. Open questions / risks

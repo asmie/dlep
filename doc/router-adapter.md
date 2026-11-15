@@ -139,9 +139,10 @@ Additional notices are best effort and can appear between complete snapshots:
 | `link_response` | `session`, `mac`, `status`, `text`, `metrics` | A peer Link Characteristics Response; status is the numeric DLEP code. |
 | `destination_down` | `session`, `mac`, `status` | Destination withdrawal/removal outcome. |
 | `session_down` | `session`, `peer`, `status` | Session termination reason. |
+| `session_update_response` | `session`, `status`, `text` | A validated, nonfatal reply to a locally originated Session Update. Zero means success. |
 | `event_gap` | `skipped` | Public events were lost; a current snapshot follows. |
 
-Responses identify session/MAC, not the adapter's request ID. Serialize requests
+Destination responses identify session/MAC, not the adapter's request ID. Serialize requests
 for each destination when tracking completions. After `event_gap`, outstanding
 peer-response outcomes may be unknown; snapshots recover current state but
 cannot reconstruct lost responses or reasons. Notices queued before a gap can
@@ -156,6 +157,13 @@ Success also creates the destination in retained state. Read its metrics and
 addresses from snapshots; large address sets can continue arriving in subsequent
 updates after the response. Invalid, unsolicited, duplicate, or fatal replies
 follow session termination instead of producing an announce-response notice.
+
+`session_update_response` exposes replies to address updates originated through
+the daemon API; this adapter does not currently submit session address commands.
+Each notice represents one wire reply. Repeating unchanged local addresses sends
+no update and produces no completion. Refusal preserves the daemon's local
+address state. Invalid, unsolicited, duplicate, or fatal replies terminate the
+session instead of producing this notice.
 
 [`examples/router-adapter.py`](../examples/router-adapter.py) is a runnable
 consumer that maintains replacement tables and logs their size. It does not

@@ -146,6 +146,12 @@ pub enum EmittedEvent {
         peer_extensions: Vec<dlep_core::ExtensionId>,
     },
     SessionDown(StatusCode),
+    /// Validated, nonfatal reply to a locally sent Session Update, including
+    /// denials. Emitted before sending any coalesced next update.
+    SessionUpdateResponse {
+        status: StatusCode,
+        text: String,
+    },
     PeerDiscovered {
         endpoints: Vec<crate::discovery_common::OfferEndpoint>,
         peer_description: Option<String>,

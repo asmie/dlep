@@ -445,6 +445,13 @@ async fn both_adapter_processes_exchange_complete_state_and_commands_over_ipv4_a
             .wait(|s| session(s, "modem-a").is_some_and(|m| m["metrics"] == session_expected))
             .await;
         assert!(destination(&withdrawn, "modem-a", MAC).is_none());
+        let completed = radio
+            .wait(|s| notice(s, "session_update_response", |_| true).is_some())
+            .await;
+        assert_eq!(
+            notice(&completed, "session_update_response", |_| true).unwrap(),
+            &json!({"type":"session_update_response", "session":response["session"], "status":0, "text":""})
+        );
         router
             .control
             .send(json!({"type":"destination_announce","request":5,"session":sid,"mac":MAC}))
