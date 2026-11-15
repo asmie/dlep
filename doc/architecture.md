@@ -928,6 +928,21 @@ The order of work was:
     partial writes, write failure/deadlines, queue and pending-request limits,
     cancellation, and real subprocess pause/recovery and input-failure shutdown.
 
+36. Coalesced radio command retries. **Done** — the bridge retains one retry
+    per session and operation, including MAC for destination work, and preserves
+    its first deadline while reports continue arriving. Retries use current
+    cached values. Successful commands remove superseded work, including the
+    accepted portion of a broadcast; targeted retries leave other sessions alone.
+    This prevents a stale duplicate Session Update from overwriting destination
+    metrics reported after a newer successful Session Update.
+
+    Physical withdrawal cancels deferred re-adds. A Down already awaiting its
+    response, or acknowledged before retry bookkeeping, does not create another
+    withdrawal against the replacement destination. Real-session regressions
+    cover hundreds of busy metric reports and destination flaps, latest-value
+    convergence, unchanged retry deadlines, partial acceptance across routers,
+    and preserving later per-destination values on successful sessions.
+
 ---
 
 ## 10. Open questions / risks

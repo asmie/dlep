@@ -86,6 +86,13 @@ event subscriber falls behind. It retries busy session initialization, preserves
 existing per-session destination metrics, and respects a router's withdrawal.
 Closed sessions release pending adapter requests and command retries.
 
+Busy operations share one retry per session and operation (and MAC for a
+destination operation), using the latest cached values. Further reports keep
+the first retry deadline instead of postponing it. A later accepted command
+cancels that operation's retry only for the sessions that accepted it; other
+busy sessions keep their work. Retry storage therefore follows distinct pending
+work, not the number of radio reports.
+
 Omitted fields build on the modem's current view: a new destination starts
 from the session-wide metrics, and `session_metrics` also updates every known
 destination, so a later partial `destination_update` keeps those values.
@@ -95,6 +102,9 @@ modem sends the Destination Down after the request is answered. After
 `destination_down`, the same MAC may be reported up again. The modem re-adds it
 on each router once that router has acknowledged the withdrawal, using the
 latest metrics and addresses.
+A further withdrawal cancels a deferred re-add. If the previous Down is already
+awaiting acknowledgement or has completed, the modem does not queue another
+Down that could withdraw the replacement destination.
 
 ## Modem to adapter
 

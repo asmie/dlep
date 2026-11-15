@@ -20,8 +20,8 @@ use dlep_core::{MacAddress, StatusCode};
 use dlep_daemon::link_control::LinkControlFuture;
 use dlep_daemon::{
     AddressChanges, CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs,
-    DestinationEvent, DestinationId, LinkControl, LinkMetrics, LinkRequest, LinkResponse,
-    ModemDaemon, PeerInfo, RadioConfig, SessionCommand, SessionPhase,
+    DestinationEvent, DestinationId, DestinationPhase, LinkControl, LinkMetrics, LinkRequest,
+    LinkResponse, ModemDaemon, PeerInfo, RadioConfig, SessionCommand, SessionPhase,
 };
 use dlep_ext::SessionId;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -405,7 +405,7 @@ impl Adapter {
             session_metrics: initial,
             pending: HashMap::new(),
             next_request: 1,
-            retries: Vec::new(),
+            retries: BTreeMap::new(),
             sessions: HashMap::new(),
             synced: false,
         };
@@ -418,7 +418,7 @@ impl Adapter {
                     let snapshot = state.borrow_and_update().clone();
                     bridge.reconcile(&snapshot).await?;
                 }
-                let next_retry = bridge.retries.iter().map(|r| r.0).min();
+                let next_retry = bridge.retries.values().copied().min();
                 tokio::select! {
                     changed = state.changed() => {
                         if changed.is_err() { bail!("modem state feed stopped"); }
@@ -578,7 +578,7 @@ async fn read_lines(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Retry {
     InitializeSession,
     Add(MacAddress),
@@ -605,7 +605,8 @@ struct Bridge<'a> {
     session_metrics: LinkMetrics,
     pending: HashMap<u64, Pending>,
     next_request: u64,
-    retries: Vec<(Instant, SessionId, Retry)>,
+    /// One deadline per operation and session; reports share the latest cache.
+    retries: BTreeMap<(SessionId, Retry), Instant>,
     sessions: HashMap<SessionId, PeerInfo>,
     synced: bool,
 }
@@ -645,7 +646,7 @@ impl Bridge<'_> {
                     .await;
                 if self.accepted("destination up", &result) {
                     self.destinations.insert(mac, Known { metrics, addresses });
-                    self.schedule_busy(&result, Retry::Add(mac));
+                    self.update_retries(&result, Retry::Add(mac), None);
                 }
             }
             Inbound::DestinationUpdate {
@@ -692,13 +693,16 @@ impl Bridge<'_> {
                     warn!(%mac, "radio adapter reported an unknown destination down; ignored");
                     return;
                 }
+                // A new physical withdrawal cancels any deferred re-add.
+                self.retries
+                    .retain(|(_, retry), _| *retry != Retry::Add(mac));
                 let result = self
                     .daemon
                     .drop_destination(mac.into(), StatusCode::SUCCESS)
                     .await;
                 self.accepted("destination down", &result);
                 // A pending link request holds this destination; retry after it.
-                self.schedule_busy(&result, Retry::Drop(mac));
+                self.update_retries(&result, Retry::Drop(mac), None);
             }
             Inbound::SessionMetrics { metrics } => {
                 let metrics = metrics.overlay(self.session_metrics);
@@ -711,7 +715,7 @@ impl Bridge<'_> {
                     for known in self.destinations.values_mut() {
                         known.metrics = update.overlay(known.metrics);
                     }
-                    self.schedule_busy(&result, Retry::SessionMetrics);
+                    self.update_retries(&result, Retry::SessionMetrics, None);
                 }
             }
             Inbound::LinkResponse {
@@ -811,7 +815,7 @@ impl Bridge<'_> {
             .iter()
             .map(|(id, session)| (*id, session.peer.clone()))
             .collect();
-        self.retries.retain(|(_, id, _)| {
+        self.retries.retain(|(id, _), _| {
             snapshot
                 .sessions
                 .get(id)
@@ -866,7 +870,7 @@ impl Bridge<'_> {
                 )
                 .await;
             self.accepted("session metrics replay", &result);
-            self.schedule_busy(&result, Retry::InitializeSession);
+            self.update_retries(&result, Retry::InitializeSession, Some(session_id));
             if result.is_err() {
                 return;
             }
@@ -907,7 +911,7 @@ impl Bridge<'_> {
         for (mac, command) in commands {
             let result = self.daemon.send_command_to(session_id, command).await;
             self.accepted("destination replay", &result);
-            self.schedule_busy(&result, Retry::Add(mac));
+            self.update_retries(&result, Retry::Add(mac), Some(session_id));
         }
     }
 
@@ -943,8 +947,14 @@ impl Bridge<'_> {
 
     async fn retry(&mut self) {
         let now = Instant::now();
-        let (due, later): (Vec<_>, Vec<_>) = self.retries.drain(..).partition(|r| r.0 <= now);
-        self.retries = later;
+        let mut due: Vec<_> = self
+            .retries
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(&(session, retry), &deadline)| (deadline, session, retry))
+            .collect();
+        due.sort_unstable();
+        self.retries.retain(|_, deadline| *deadline > now);
         for (_, session_id, retry) in due {
             let command = match retry {
                 Retry::InitializeSession => {
@@ -978,25 +988,68 @@ impl Bridge<'_> {
             };
             let result = self.daemon.send_command_to(session_id, command).await;
             self.accepted("retried command", &result);
-            self.schedule_busy(&result, retry);
+            self.update_retries(&result, retry, Some(session_id));
             if let (Retry::Drop(mac), Ok(())) = (retry, &result) {
                 if self.destinations.contains_key(&mac) {
                     // Re-add current state once the router acknowledges the Down.
-                    self.retries
-                        .push((Instant::now() + RETRY_DELAY, session_id, Retry::Add(mac)));
+                    self.schedule_retry(session_id, Retry::Add(mac));
                 }
             }
         }
     }
 
-    fn schedule_busy(&mut self, result: &Result<(), DaemonError>, retry: Retry) {
-        if let Err(DaemonError::CommandRejected(report)) = result {
-            for (session_id, rejection) in &report.rejected {
-                if rejection.reason == CommandError::Busy {
-                    self.retries
-                        .push((Instant::now() + RETRY_DELAY, *session_id, retry));
+    fn schedule_retry(&mut self, session: SessionId, retry: Retry) {
+        // Keep the first deadline: continuous reports must not postpone work.
+        self.retries
+            .entry((session, retry))
+            .or_insert_with(|| Instant::now() + RETRY_DELAY);
+    }
+
+    fn update_retries(
+        &mut self,
+        result: &Result<(), DaemonError>,
+        retry: Retry,
+        target: Option<SessionId>,
+    ) {
+        match result {
+            Ok(()) | Err(DaemonError::NoMatchingSession) => {
+                // Successful broadcasts supersede this operation everywhere;
+                // targeted replay must leave other sessions' work alone.
+                self.retries.retain(|(session, kind), _| {
+                    *kind != retry || target.is_some_and(|id| id != *session)
+                });
+            }
+            Err(DaemonError::CommandRejected(report)) => {
+                for session in &report.accepted {
+                    self.retries.remove(&(*session, retry));
+                }
+                for (session, rejection) in &report.rejected {
+                    if rejection.reason != CommandError::Busy {
+                        self.retries.remove(&(*session, retry));
+                        continue;
+                    }
+                    if let Retry::Drop(mac) = retry {
+                        let snapshot = self.daemon.state().borrow().clone();
+                        if snapshot
+                            .sessions
+                            .get(session)
+                            .and_then(|s| s.destinations.get(&mac.into()))
+                            .is_none_or(|d| d.phase == DestinationPhase::PendingDown)
+                        {
+                            // The old incarnation is being withdrawn, or its ACK
+                            // arrived after the Busy receipt and removed it.
+                            // Repeating Down after its ACK could remove a new Up.
+                            self.retries.remove(&(*session, retry));
+                            if self.destinations.contains_key(&mac) {
+                                self.schedule_retry(*session, Retry::Add(mac));
+                            }
+                            continue;
+                        }
+                    }
+                    self.schedule_retry(*session, retry);
                 }
             }
+            _ => {}
         }
     }
 
@@ -1104,8 +1157,8 @@ mod tests {
     }
 
     fn fire_retries(bridge: &mut Bridge<'_>) {
-        for retry in &mut bridge.retries {
-            retry.0 = Instant::now();
+        for deadline in bridge.retries.values_mut() {
+            *deadline = Instant::now();
         }
     }
 
@@ -1119,7 +1172,7 @@ mod tests {
             session_metrics: ModemConfig::default().metrics.link_metrics(),
             pending: HashMap::new(),
             next_request: 1,
-            retries: Vec::new(),
+            retries: BTreeMap::new(),
             sessions: HashMap::new(),
             synced: false,
         }
@@ -1442,7 +1495,7 @@ mod tests {
 
         bridge
             .retries
-            .push((Instant::now(), session_id, Retry::Add(mac())));
+            .insert((session_id, Retry::Add(mac())), Instant::now());
         let (answer, abandoned) = oneshot::channel();
         bridge.pending.insert(
             999,
@@ -1574,7 +1627,11 @@ mod tests {
         let snapshot = daemon.state().borrow().clone();
         bridge.reconcile(&snapshot).await.unwrap();
         assert_eq!(bridge.retries.len(), 1);
-        assert!(matches!(bridge.retries[0].2, Retry::InitializeSession));
+        assert!(
+            bridge
+                .retries
+                .contains_key(&(session_id, Retry::InitializeSession))
+        );
         send(
             &mut peer,
             dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
@@ -1725,7 +1782,13 @@ mod tests {
 
         // Hold the Down acknowledgement so the re-add is deterministically Busy.
         bridge.inbound(up(Metrics::default())).await;
-        assert!(matches!(bridge.retries.as_slice(), [(_, _, Retry::Add(m))] if *m == mac()));
+        assert_eq!(bridge.retries.len(), 1);
+        assert!(
+            bridge
+                .retries
+                .keys()
+                .any(|(_, retry)| *retry == Retry::Add(mac()))
+        );
         bridge
             .inbound(Inbound::DestinationUpdate {
                 mac: Mac(mac()),
@@ -1735,8 +1798,8 @@ mod tests {
                 },
             })
             .await;
-        for retry in &mut bridge.retries {
-            retry.0 = Instant::now();
+        for deadline in bridge.retries.values_mut() {
+            *deadline = Instant::now();
         }
         bridge.retry().await;
         assert_eq!(bridge.retries.len(), 1);
@@ -1747,8 +1810,8 @@ mod tests {
         )
         .await;
         flush_peer(&mut peer).await;
-        for retry in &mut bridge.retries {
-            retry.0 = Instant::now();
+        for deadline in bridge.retries.values_mut() {
+            *deadline = Instant::now();
         }
         bridge.retry().await;
         let readded = read(&mut peer).await;
@@ -1818,7 +1881,13 @@ mod tests {
         bridge
             .inbound(Inbound::DestinationDown { mac: Mac(mac()) })
             .await;
-        assert!(matches!(bridge.retries.as_slice(), [(_, _, Retry::Drop(m))] if *m == mac()));
+        assert_eq!(bridge.retries.len(), 1);
+        assert!(
+            bridge
+                .retries
+                .keys()
+                .any(|(_, retry)| *retry == Retry::Drop(mac()))
+        );
         bridge
             .inbound(up(Metrics {
                 latency_us: Some(1234),
@@ -1858,6 +1927,374 @@ mod tests {
             Duration::from_micros(1234)
         );
         assert!(bridge.retries.is_empty());
+        drop(peer);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_metric_reports_coalesce_into_one_retry_with_the_latest_values() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(100),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        // Keep the first transaction open while reports continue arriving.
+        let mut first_deadline = None;
+        for latency in 101..=612 {
+            bridge
+                .inbound(Inbound::SessionMetrics {
+                    metrics: Metrics {
+                        latency_us: Some(latency),
+                        ..Default::default()
+                    },
+                })
+                .await;
+            first_deadline.get_or_insert(*bridge.retries.values().next().unwrap());
+        }
+        assert_eq!(
+            bridge.retries.len(),
+            1,
+            "reports must not accumulate retry work"
+        );
+        assert_eq!(
+            bridge.retries.values().next().copied(),
+            first_deadline,
+            "new reports must not postpone the first retry"
+        );
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        let update = read(&mut peer).await;
+        assert_eq!(update.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&update).unwrap().latency,
+            Duration::from_micros(612)
+        );
+        assert!(bridge.retries.is_empty());
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        drop(peer);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_metric_report_cancels_retries_before_a_later_destination_override() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+        bridge.inbound(up(Metrics::default())).await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        for latency in [100, 200] {
+            bridge
+                .inbound(Inbound::SessionMetrics {
+                    metrics: Metrics {
+                        latency_us: Some(latency),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        assert_eq!(bridge.retries.len(), 1);
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        // A new report succeeds before the deferred retry runs.
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(300),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::SESSION_UPDATE
+        );
+        send(
+            &mut peer,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        bridge
+            .inbound(Inbound::DestinationUpdate {
+                mac: Mac(mac()),
+                metrics: Metrics {
+                    latency_us: Some(999),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UPDATE
+        );
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        let snapshot = daemon.state().borrow().clone();
+        assert_eq!(
+            snapshot.sessions.values().next().unwrap().destinations[&mac().into()]
+                .metrics
+                .latency,
+            Duration::from_micros(999),
+            "a stale retry overwrote a later destination report"
+        );
+        assert!(bridge.retries.is_empty());
+        // Also prove no redundant Session Update was emitted on the wire.
+        flush_peer(&mut peer).await;
+        drop(peer);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_metric_acceptance_preserves_only_the_busy_sessions_retry() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut a = session(&daemon, &mut events).await;
+        let mut b = session(&daemon, &mut events).await;
+        let snapshot = daemon.state().borrow().clone();
+        let id_for = |peer: &TcpStream| {
+            *snapshot
+                .sessions
+                .iter()
+                .find(|(_, state)| state.peer.addr == peer.local_addr().unwrap())
+                .unwrap()
+                .0
+        };
+        let aid = id_for(&a);
+        let bid = id_for(&b);
+        bridge.inbound(up(Metrics::default())).await;
+        for peer in [&mut a, &mut b] {
+            assert_eq!(read(peer).await.message_type, MessageType::DESTINATION_UP);
+            send(
+                peer,
+                build_destination_up_response(mac(), StatusCode::SUCCESS),
+            )
+            .await;
+            flush_peer(peer).await;
+        }
+        for latency in [100, 200] {
+            bridge
+                .inbound(Inbound::SessionMetrics {
+                    metrics: Metrics {
+                        latency_us: Some(latency),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        for peer in [&mut a, &mut b] {
+            assert_eq!(read(peer).await.message_type, MessageType::SESSION_UPDATE);
+        }
+        assert_eq!(bridge.retries.len(), 2);
+        send(
+            &mut b,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut b).await;
+        bridge
+            .inbound(Inbound::SessionMetrics {
+                metrics: Metrics {
+                    latency_us: Some(300),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(read(&mut b).await.message_type, MessageType::SESSION_UPDATE);
+        send(
+            &mut b,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut b).await;
+        assert_eq!(
+            bridge.retries.keys().copied().collect::<Vec<_>>(),
+            [(aid, Retry::SessionMetrics)]
+        );
+        // Session-specific values on the healthy router must survive retries
+        // needed only by the other router.
+        let mut metrics = bridge.destinations[&mac()].metrics;
+        metrics.latency = Duration::from_micros(999);
+        daemon
+            .send_command_to(
+                bid,
+                SessionCommand::UpdateDestination {
+                    mac: mac(),
+                    metrics,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&mut b).await.message_type,
+            MessageType::DESTINATION_UPDATE
+        );
+        send(
+            &mut a,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut a).await;
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        let update = read(&mut a).await;
+        assert_eq!(update.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            extract_link_metrics(&update).unwrap().latency,
+            Duration::from_micros(300)
+        );
+        send(
+            &mut a,
+            dlep_fsm::session_common::build_session_update_response(StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut a).await;
+        flush_peer(&mut b).await;
+        assert_eq!(
+            daemon.state().borrow().sessions[&bid].destinations[&mac().into()].metrics,
+            metrics
+        );
+        assert!(bridge.retries.is_empty());
+        drop((a, b));
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_radio_flaps_during_down_ack_keep_only_the_latest_readd() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut bridge = bridge(&daemon);
+        let mut peer = session(&daemon, &mut events).await;
+        bridge.inbound(up(Metrics::default())).await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_UP
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        bridge
+            .inbound(Inbound::DestinationDown { mac: Mac(mac()) })
+            .await;
+        assert_eq!(
+            read(&mut peer).await.message_type,
+            MessageType::DESTINATION_DOWN
+        );
+        for latency in 100..356 {
+            bridge
+                .inbound(up(Metrics {
+                    latency_us: Some(latency),
+                    ..Default::default()
+                }))
+                .await;
+            bridge
+                .inbound(Inbound::DestinationDown { mac: Mac(mac()) })
+                .await;
+        }
+        bridge
+            .inbound(up(Metrics {
+                latency_us: Some(987),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            bridge.retries.len(),
+            1,
+            "only the latest re-add should remain"
+        );
+        // An ACK can arrive between a Busy receipt and retry bookkeeping.
+        let delayed_receipt = daemon
+            .drop_destination(mac().into(), StatusCode::SUCCESS)
+            .await;
+        assert!(matches!(
+            delayed_receipt,
+            Err(DaemonError::CommandRejected(_))
+        ));
+        send(
+            &mut peer,
+            build_destination_down_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        bridge.update_retries(&delayed_receipt, Retry::Drop(mac()), None);
+        assert_eq!(
+            bridge.retries.len(),
+            1,
+            "an acknowledged Down must not be retried"
+        );
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        let readded = read(&mut peer).await;
+        assert_eq!(readded.message_type, MessageType::DESTINATION_UP);
+        assert_eq!(
+            extract_link_metrics(&readded).unwrap().latency,
+            Duration::from_micros(987)
+        );
+        send(
+            &mut peer,
+            build_destination_up_response(mac(), StatusCode::SUCCESS),
+        )
+        .await;
+        flush_peer(&mut peer).await;
+        fire_retries(&mut bridge);
+        bridge.retry().await;
+        assert!(bridge.retries.is_empty());
+        flush_peer(&mut peer).await;
+        assert_eq!(
+            daemon
+                .state()
+                .borrow()
+                .sessions
+                .values()
+                .next()
+                .unwrap()
+                .destinations[&mac().into()]
+                .phase,
+            dlep_daemon::DestinationPhase::Up
+        );
         drop(peer);
         daemon.shutdown().await.unwrap();
     }

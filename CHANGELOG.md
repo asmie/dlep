@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Radio command retries coalesce by session and operation. Successful updates
+  cancel superseded retries, preventing stale Session Updates from overwriting
+  later destination metrics. Repeated destination flaps retain the latest re-add
+  without queuing redundant withdrawals against its replacement.
 - Radio adapter queues and pending requests are bounded. Overload denies excess
   link requests with `radio adapter busy`; cancelled requests waiting for output
   capacity are discarded. A broken input pipe or a write stalled for five seconds

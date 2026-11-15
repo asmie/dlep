@@ -160,6 +160,10 @@ with Shutting Down and fail the modem process. A shorter pause must recover
 all queued notices and complete a pending link request on the original session.
 Radio bridge unit tests separately exercise bounded requests, cancellation,
 partial writes, and the output deadline using virtual time.
+They also hold protocol acknowledgements while sending hundreds of radio reports
+to check retry coalescing and latest-value convergence. Further cases cover
+partial acceptance across routers, stale retries overwriting later destination
+values, and repeated destination flaps during withdrawal acknowledgement.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:
