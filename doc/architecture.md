@@ -368,6 +368,12 @@ Only the modem can originate metric changes via `update_session_metrics`. The ro
 
 ## 8. Testing strategy
 
+The [checkpoint 60 release record](releasing.md#020-checkpoint-validation)
+collects the November 2026 archive, installation, CLI, and dependency checks.
+It distinguishes local protocol regressions from the four qualified external
+peer scenarios completed in checkpoint 59. Coverage percentages below remain
+historical; the release checkpoint does not refresh them or claim certification.
+
 The [CI coverage run for `5ce40a7`](https://github.com/asmie/dlep/actions/runs/37047900385)
 passed **427 tests** and successfully uploaded its reports. It measured
 **95.05% lines, 94.08% regions, and 94.89% functions**. Excluding inline test
@@ -1195,6 +1201,17 @@ The order of work was:
     The shared capture parser rejects gaps, conflicting retransmissions, and
     truncation, with four network-free regression tests in CI. Four external
     scenarios retain logs, PCAPs, summaries, and their existing transport limits.
+
+60. Conformance and release checkpoint. **Done** — all eight release archives
+    must retain the source workspace's Cargo targets, including examples and
+    feature-gated tests, before compilation and installation. Regression tests
+    reject missing, added, or changed targets; CI explicitly invokes both Python
+    test files so omissions fail. The current audit exposed test-only `rustix`
+    1.1.4; the lockfile updates it to patched 1.1.6 without extending the audit
+    exception or raising Rust 1.85. The [release record](releasing.md) documents
+    extracted-archive tests, three command installations, workspace/installed
+    smoke checks, and the qualified independent-peer results. Publication and
+    the final committed-artifact checks remain maintainer actions.
 
 ---
 

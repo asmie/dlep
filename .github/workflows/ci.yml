@@ -43,7 +43,9 @@ jobs:
         run: git ls-files --error-unmatch .cargo/audit.toml
       - run: cargo fmt --all -- --check
       - name: Test interoperability capture checks
-        run: python3 -B -m unittest discover -s .github/scripts -p 'test_interop_*.py'
+        run: python3 -B .github/scripts/test_interop_common.py
+      - name: Test archive target inventory checks
+        run: python3 -B .github/scripts/test_release_packages.py
 
   clippy:
     name: clippy

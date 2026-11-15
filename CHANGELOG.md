@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The lockfile updates the test-only `rustix` dependency to 1.1.6 for
+  [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
+  Rust 1.85 remains supported; the existing guarded `time` exception is unchanged.
+- Release archive checks compare every packaged library, binary, example, and
+  test target with the source workspace before compiling and installing. Missing
+  or changed targets fail validation. CI invokes its capture-parser and archive
+  inventory tests explicitly, so an omitted test file cannot silently pass as
+  an empty test suite.
 - Independent-peer checks now cover address data and Destination Announce.
   The pinned LL-DLEP modem exercises IPv4/IPv6 address and subnet replacements
   and removals, bidirectional session updates, withdrawal/re-announcement with

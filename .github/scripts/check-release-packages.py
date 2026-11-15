@@ -20,6 +20,25 @@ import tempfile
 import tomllib
 
 
+def target_inventory(package):
+    """Compare normalized archives with the source targets Cargo actually sees."""
+    root = Path(package["manifest_path"]).parent
+    return {
+        (target["name"], tuple(sorted(target["kind"])),
+         Path(target["src_path"]).relative_to(root).as_posix(),
+         tuple(sorted(target.get("required-features", []))))
+        for target in package["targets"]
+    }
+
+
+def check_target_inventory(source, archived):
+    expected, actual = target_inventory(source), target_inventory(archived)
+    assert expected == actual, (
+        source["name"], "archive target mismatch",
+        {"missing": sorted(expected - actual), "unexpected": sorted(actual - expected)},
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--install-root", type=Path, default=Path("target/release-install"))
@@ -50,6 +69,14 @@ def main():
         (root / "Cargo.toml").write_text(manifest)
         shutil.copyfile(repo / "Cargo.lock", root / "Cargo.lock")
         env = dict(os.environ, CARGO_TARGET_DIR=str(repo / "target/package-check"))
+        archived_metadata = json.loads(subprocess.check_output(
+            ["cargo", "metadata", "--no-deps", "--locked", "--offline", "--format-version", "1"],
+            cwd=root, env=env))
+        archived = {p["name"]: p for p in archived_metadata["packages"]}
+        assert set(archived) == {p["name"] for p in members}, "archive workspace member mismatch"
+        for package in members:
+            check_target_inventory(package, archived[package["name"]])
+        print(f"Verified target inventory for {len(members)} archives", flush=True)
         command = ["cargo", "test", "--workspace", "--all-features", "--offline", "--locked"]
         if not args.run_tests:
             command.append("--no-run")

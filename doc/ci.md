@@ -7,19 +7,30 @@ use the committed lockfile. Jobs have read-only repository permissions and
 deadlines; new pushes cancel obsolete runs for the same branch or pull request.
 
 The release job verifies all crates.io archives, fetches the complete locked
-dependency set (including test-only dependencies), compiles their test targets in
-an isolated extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
+dependency set (including test-only dependencies), compares archived Cargo
+targets with the source workspace, compiles their test targets in an isolated
+extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
 under `target/release-install`, then checks every CLI flag and four local
 plaintext/mutual-TLS session scenarios in a disposable network namespace.
 It does not publish packages. See [release checks](releasing.md).
 Package verification alone does not populate every development dependency;
 the explicit fetch makes subsequent offline checks independent of cache hits.
+The inventory comparison requires matching target names, kinds, relative source
+paths, and required features. A missing test or example fails before compilation.
+Its two regression tests cover relocated archives and missing, extra, or changed
+targets:
+
+```sh
+python3 -B .github/scripts/test_release_packages.py
+```
 
 The formatting job installs actionlint 1.7.12 from the official Linux x86-64
 release with a pinned SHA-256 checksum; `taiki-e/install-action` does not support
 this Go tool. Update the version and checksum together. The job also checks
 that `.cargo/audit.toml` is tracked, even on pushes that do not trigger the
 path-filtered dependency audit.
+It invokes both Python regression files explicitly, so a missing file fails
+instead of passing through test discovery with zero tests.
 
 The macOS job covers `dlep-core`, `dlep-fsm`, and `dlep-ext`. It does **not**
 validate the daemons or advertise macOS transport support. Discovery ancillary
@@ -150,7 +161,7 @@ truncation, and invalid address items. CI runs them in the formatting/workflow
 job. Run them locally with:
 
 ```sh
-python3 -B -m unittest discover -s .github/scripts -p 'test_interop_*.py'
+python3 -B .github/scripts/test_interop_common.py
 ```
 
 ## Network tests and coverage
@@ -415,3 +426,9 @@ working tree does not configure a clean CI checkout.
 The initial audit also prompted upgrades to rustls 0.23.45 and anyhow 1.0.103,
 and replacement of the archived `rustls-pemfile` wrapper with the maintained
 `rustls-pki-types::pem::PemObject` API.
+
+The November 2026 release checkpoint updates the test-only `rustix` dependency
+from 1.1.4 to 1.1.6 to resolve
+[RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
+It is reached through `tempfile` and property-test dependencies. No new audit
+exception is added, and the all-target Rust 1.85 check remains required.
