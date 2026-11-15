@@ -496,6 +496,10 @@ Each nightly AddressSanitizer job fuzzes for 30 seconds, with a five-second inpu
 deadline, 2 GiB RSS limit, and a 15-minute job deadline. Generated corpora and
 failure artifacts are uploaded for 14 days. CI verifies `fuzz/Cargo.lock` did
 not change during execution.
+The workflow explicitly selects `x86_64-unknown-linux-gnu` to match the runner's
+nightly toolchain. A prebuilt cargo-fuzz binary may default to its own musl
+platform; relying on that default caused all three jobs at `56576d0` to fail
+before fuzzing with missing `core`/`std` errors.
 
 `wire_decode` checks panic freedom and stable re-encoding of accepted messages,
 signals, and Data Items, including maximum-length bodies. `session_sequence`

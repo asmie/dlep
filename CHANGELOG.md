@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fuzz CI explicitly selects the runner's GNU target, fixing startup failures
+  when the installed cargo-fuzz binary defaults to its musl build platform.
 - Discovery offers now remove equivalent endpoints even when another candidate
   separates them, preserving TLS/IPv6 preference and within-class order.
   Omitted port 854 and explicit port 854 no longer cause duplicate connection

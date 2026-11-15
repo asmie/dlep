@@ -51,7 +51,9 @@ jobs:
       - name: Run bounded AddressSanitizer fuzzing
         env:
           CARGO_NET_OFFLINE: 'true'
-        run: cargo +nightly fuzz run '${{ matrix.target }}' -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+        # Prebuilt cargo-fuzz may default to its own musl build platform. Use
+        # the GNU target installed with nightly on this Ubuntu x86-64 runner.
+        run: cargo +nightly fuzz run '${{ matrix.target }}' --target x86_64-unknown-linux-gnu -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
       - name: Verify fuzz dependency resolution stayed locked
         if: always()
         run: git diff --exit-code -- fuzz/Cargo.lock

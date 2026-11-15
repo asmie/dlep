@@ -1277,6 +1277,15 @@ The order of work was:
     TLS settings. CI includes the new target and 184 discovery seeds. Interface
     metadata, UDP sockets, and TLS remain outside these pure-logic fuzz targets.
 
+65. Fuzz CI target selection. **Done locally** — the prebuilt cargo-fuzz tool
+    defaults to its musl build platform, while the Ubuntu runner's nightly Rust
+    installation targets GNU. All three hosted fuzz jobs at `56576d0` failed
+    before executing inputs. The workflow now explicitly selects
+    `x86_64-unknown-linux-gnu`; local instructions select the nightly compiler's
+    host. Validation reproduces the failure with the same prebuilt musl package
+    and runs all three corrected targets. Hosted confirmation requires committing
+    and pushing the workflow fix.
+
 ---
 
 ## 10. Open questions / risks

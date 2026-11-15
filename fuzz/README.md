@@ -11,10 +11,16 @@ rustup toolchain install nightly
 cargo install cargo-fuzz --version 0.13.2 --locked
 cargo fetch --manifest-path fuzz/Cargo.toml --locked
 python3 -B .github/scripts/seed-fuzz.py
-cargo +nightly fuzz run wire_decode -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
-cargo +nightly fuzz run session_sequence -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
-cargo +nightly fuzz run discovery_sequence -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+fuzz_host=$(rustc +nightly -vV | sed -n 's/^host: //p')
+cargo +nightly fuzz run wire_decode --target "$fuzz_host" -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+cargo +nightly fuzz run session_sequence --target "$fuzz_host" -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+cargo +nightly fuzz run discovery_sequence --target "$fuzz_host" -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
 ```
+
+Always pass the nightly compiler's host target explicitly. Prebuilt cargo-fuzz
+binaries can default to their own build platform (such as Linux musl) even when
+the installed Rust toolchain targets Linux GNU. CI uses
+`--target x86_64-unknown-linux-gnu` on its Ubuntu x86-64 runners.
 
 `wire_decode` tries message, signal, and individual Data Item decoding on every
 input. Accepted values must encode, decode again, and reach stable encoded bytes.
@@ -82,8 +88,8 @@ detection. No host ptrace setting needs to change.
 Reproduce and minimize a failure before fixing it:
 
 ```sh
-cargo +nightly fuzz run wire_decode fuzz/artifacts/wire_decode/crash-HASH
-cargo +nightly fuzz tmin wire_decode fuzz/artifacts/wire_decode/crash-HASH
+cargo +nightly fuzz run wire_decode --target "$fuzz_host" fuzz/artifacts/wire_decode/crash-HASH
+cargo +nightly fuzz tmin wire_decode --target "$fuzz_host" fuzz/artifacts/wire_decode/crash-HASH
 ```
 
 Use the corresponding target name for session failures. Preserve the minimized
