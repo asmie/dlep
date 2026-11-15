@@ -139,7 +139,8 @@ lifecycle notices.
 
 `requested` contains only the characteristics the router asked to change:
 `current_data_rate_rx_bps`, `current_data_rate_tx_bps` and/or `latency_us`.
-`current` holds the destination's metrics on that session.
+`current` holds the destination's metrics on that session when the request
+arrived. Reports received while the request is pending can change these values.
 
 ### Answering link requests
 
@@ -148,16 +149,24 @@ number, in any order:
 
 - `"status": "success"` means the change was applied. `"denied"` means it cannot
   be met (Request Denied).
-- `metrics` describe the link after processing, overlaid on `current`. Without
-  `metrics`, the router receives `current` unchanged, so include the new values
-  when granting. The response always carries every declared metric.
+- `metrics` describe the link after processing. Supplied fields replace the
+  destination's latest values on the requesting session; omitted fields retain
+  those latest values, including reports received after the request. Without
+  `metrics` (or with `{}`), the response reports the latest values unchanged,
+  so include the new values when granting. The response always carries every
+  declared metric.
 - `text` is sent to the router as the status text.
 
 Granted metrics update this router's view and, if the physical destination has
-not been withdrawn since the request, the modem's table. Other routers
-learn of the change only through a `destination_update`, so send one if they
-should see it. Metrics the modem cannot send, such as undeclared optional
-metrics, turn the answer into Request Denied without your text, and the table
+not been withdrawn since the request, the modem's table. Each view merges the
+supplied fields independently: a partial grant retains earlier grants from
+other sessions in the table without copying those session-specific changes
+into this router's response. Routers already connected learn of another
+session's grant only through a `destination_update`, so send one if they should
+see it. Later routers receive the accumulated cached values.
+
+Both merged results must use declared metrics and fit the wire format. Invalid
+metrics turn the answer into Request Denied without your text, and the table
 keeps its previous values.
 
 Each destination has at most one outstanding request per session; requests for

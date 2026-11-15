@@ -742,8 +742,27 @@ impl Bridge<'_> {
                     debug!(request, "radio adapter answered an expired link request");
                     return;
                 }
-                let metrics = metrics.map(|m| m.overlay(pending.current));
-                if let Some(metrics) = &metrics {
+                // `current` in the request is only a snapshot. Reports can
+                // change the destination while the radio decides its answer.
+                let current = self
+                    .daemon
+                    .state()
+                    .borrow()
+                    .sessions
+                    .get(&pending.session_id)
+                    .and_then(|session| session.destinations.get(&pending.mac.into()))
+                    .map_or(pending.current, |destination| destination.metrics);
+                // Grants on other sessions may have changed the replay cache
+                // independently. Apply only the supplied fields to each view.
+                let cached = metrics
+                    .filter(|_| status == Status::Success && pending.update_cache)
+                    .and_then(|patch| {
+                        self.destinations
+                            .get(&pending.mac)
+                            .map(|known| patch.overlay(known.metrics))
+                    });
+                let metrics = metrics.map(|patch| patch.overlay(current));
+                for metrics in metrics.iter().chain(cached.iter()) {
                     if let Err(e) = self.daemon.validate_metrics(metrics) {
                         warn!(request, "radio adapter link response rejected: {e}");
                         let _ = pending.answer.send(LinkResponse::denied());
@@ -758,9 +777,9 @@ impl Bridge<'_> {
                     text,
                     metrics,
                 });
-                if delivered.is_ok() && pending.update_cache {
-                    if let (Status::Success, Some(metrics), Some(known)) =
-                        (status, metrics, self.destinations.get_mut(&pending.mac))
+                if delivered.is_ok() {
+                    if let (Some(metrics), Some(known)) =
+                        (cached, self.destinations.get_mut(&pending.mac))
                     {
                         known.metrics = metrics;
                     }
@@ -2534,6 +2553,156 @@ mod tests {
         );
         drop(peer);
         daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_link_replies_preserve_reports_received_while_pending() {
+        for session_wide in [false, true] {
+            let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
+            let daemon = modem_with(Some(Arc::new(RadioLink {
+                asks,
+                timeout: Duration::from_secs(30),
+            })))
+            .await;
+            let mut events = daemon.subscribe();
+            let mut bridge = bridge(&daemon);
+            let mut peer = session(&daemon, &mut events).await;
+            bridge
+                .inbound(up(Metrics {
+                    max_data_rate_rx_bps: Some(1000),
+                    max_data_rate_tx_bps: Some(1000),
+                    current_data_rate_rx_bps: Some(100),
+                    current_data_rate_tx_bps: Some(700),
+                    latency_us: Some(100),
+                    ..Default::default()
+                }))
+                .await;
+            assert_eq!(
+                read(&mut peer).await.message_type,
+                MessageType::DESTINATION_UP
+            );
+            send(
+                &mut peer,
+                build_destination_up_response(mac(), StatusCode::SUCCESS),
+            )
+            .await;
+            flush_peer(&mut peer).await;
+            // Exercise partial, empty, absent, denied, and invalid replies.
+            for (index, (status, reply)) in [
+                (
+                    Status::Success,
+                    Some(Metrics {
+                        latency_us: Some(321),
+                        ..Default::default()
+                    }),
+                ),
+                (Status::Success, Some(Metrics::default())),
+                (Status::Success, None),
+                (Status::Denied, Some(Metrics::default())),
+                (
+                    Status::Success,
+                    Some(Metrics {
+                        mtu: Some(1500),
+                        ..Default::default()
+                    }),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                send(
+                    &mut peer,
+                    build_link_characteristics_request(
+                        mac(),
+                        &dlep_daemon::LinkCharacteristics {
+                            latency: Some(Duration::from_micros(321)),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await;
+                let ask = tokio::time::timeout(WAIT, queued.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                bridge.ask(ask).await.unwrap();
+                let invalid = index == 4;
+                let report = Metrics {
+                    max_data_rate_rx_bps: Some(800),
+                    max_data_rate_tx_bps: Some(800),
+                    current_data_rate_rx_bps: Some(250),
+                    current_data_rate_tx_bps: Some(400),
+                    latency_us: Some(900 + index as u64),
+                    ..Default::default()
+                };
+                bridge
+                    .inbound(if session_wide {
+                        Inbound::SessionMetrics { metrics: report }
+                    } else {
+                        Inbound::DestinationUpdate {
+                            mac: Mac(mac()),
+                            metrics: report,
+                        }
+                    })
+                    .await;
+                assert_eq!(
+                    read(&mut peer).await.message_type,
+                    if session_wide {
+                        MessageType::SESSION_UPDATE
+                    } else {
+                        MessageType::DESTINATION_UPDATE
+                    }
+                );
+                if session_wide {
+                    send(
+                        &mut peer,
+                        dlep_fsm::session_common::build_session_update_response(
+                            StatusCode::SUCCESS,
+                        ),
+                    )
+                    .await;
+                    flush_peer(&mut peer).await;
+                }
+                let reported = bridge.destinations[&mac()].metrics;
+                bridge
+                    .inbound(Inbound::LinkResponse {
+                        request: index as u64 + 1,
+                        status,
+                        text: "processed".into(),
+                        metrics: reply,
+                    })
+                    .await;
+                let response = read(&mut peer).await;
+                assert_eq!(
+                    response.message_type,
+                    MessageType::LINK_CHARACTERISTICS_RESPONSE
+                );
+                let expected = if invalid {
+                    reported
+                } else {
+                    reply.map_or(reported, |patch| patch.overlay(reported))
+                };
+                assert_eq!(extract_link_metrics(&response).unwrap(), expected);
+                assert_eq!(bridge.destinations[&mac()].metrics, expected);
+                let actual_status = response.data_items.iter().find_map(|item| match item {
+                    dlep_core::DataItem::Status { code, text } => Some((*code, text.as_str())),
+                    _ => None,
+                });
+                assert_eq!(
+                    actual_status,
+                    Some((
+                        if invalid || status == Status::Denied {
+                            StatusCode::REQUEST_DENIED
+                        } else {
+                            StatusCode::SUCCESS
+                        },
+                        if invalid { "" } else { "processed" },
+                    ))
+                );
+            }
+            drop(peer);
+            daemon.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

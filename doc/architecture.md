@@ -952,6 +952,16 @@ The order of work was:
     normal cache updates. Regressions cover both request-delivery timings and
     complete IPv4/IPv6 adapter pipelines with a later router connection.
 
+38. Partial radio replies preserve current metrics. **Done** — link responses
+    merge supplied fields into the requesting session's latest destination
+    metrics, preserving reports received while the request was pending. Grants
+    merge independently into the replay cache, retaining explicit changes from
+    other sessions without copying their session-specific values to the router.
+    Both merged views are validated before delivering a grant or changing the
+    cache. Regressions cover destination/session reports, empty and absent
+    metrics, denials, invalid optional metrics, overlapping IPv4/IPv6 router requests,
+    and replay of the accumulated grants to a later router.
+
 ---
 
 ## 10. Open questions / risks

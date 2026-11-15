@@ -656,6 +656,101 @@ fn announcements(session: &Value, count: u64) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn partial_link_grants_preserve_new_reports_and_other_sessions_cache_changes() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        let mut a = Node::router(&[addr]).await;
+        let mut b = Node::router(&[addr]).await;
+        let tx = json!({"current_data_rate_tx_bps":321});
+        let latency = json!({"latency_us":444});
+        for (router, wanted) in [(&mut a, &tx), (&mut b, &latency)] {
+            let initial = router
+                .wait(|s| destination(s, "modem-a", MAC).is_some())
+                .await;
+            let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+            router
+                .control
+                .send(json!({"type":"link_request", "request":1,
+                "session":sid, "mac":MAC, "requested":wanted}))
+                .await;
+            router.result(1, "accepted").await;
+            radio
+                .wait(|s| notice(s, "link_request", |n| n["requested"] == *wanted).is_some())
+                .await;
+        }
+        // Both requests captured the original values before this report.
+        radio
+            .control
+            .send(json!({"type":"destination_update", "mac":MAC,
+            "metrics":{"current_data_rate_rx_bps":250,"rlq_rx":0,"mtu":1400}}))
+            .await;
+        for router in [&mut a, &mut b] {
+            router
+                .wait(|s| {
+                    destination(s, "modem-a", MAC)
+                        .is_some_and(|d| d["metrics"]["current_data_rate_rx_bps"] == 250)
+                })
+                .await;
+        }
+        let mut reported = defaults();
+        reported["current_data_rate_tx_bps"] = json!(700);
+        reported["current_data_rate_rx_bps"] = json!(250);
+        reported["rlq_rx"] = json!(0);
+        reported["rlq_tx"] = json!(0);
+        reported["mtu"] = json!(1400);
+        respond(&mut radio, tx, true).await;
+        let first = a
+            .wait(|s| notice(s, "link_response", |_| true).is_some())
+            .await;
+        let mut expected_a = reported.clone();
+        expected_a["current_data_rate_tx_bps"] = json!(321);
+        assert_eq!(
+            destination(&first, "modem-a", MAC).unwrap()["metrics"],
+            expected_a
+        );
+
+        respond(&mut radio, latency, true).await;
+        let second = b
+            .wait(|s| notice(s, "link_response", |_| true).is_some())
+            .await;
+        let mut expected_b = reported;
+        expected_b["latency_us"] = json!(444);
+        assert_eq!(
+            destination(&second, "modem-a", MAC).unwrap()["metrics"],
+            expected_b
+        );
+        let unchanged = a.control.call(json!({"op":"status"})).await;
+        assert_eq!(
+            destination(&unchanged, "modem-a", MAC).unwrap()["metrics"],
+            expected_a
+        );
+
+        // The cache accumulates both explicit grants, without copying either
+        // router's older, session-specific omitted values over the other grant.
+        let mut late = Node::router(&[addr]).await;
+        let replay = late
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let mut expected_cache = expected_a;
+        expected_cache["latency_us"] = json!(444);
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["metrics"],
+            expected_cache
+        );
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["addresses"],
+            expected_addresses(1)
+        );
+        for router in [&mut a, &mut b, &mut late] {
+            router.stop().await;
+            router.assert_final_empty();
+        }
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn old_link_grant_cannot_change_a_replacement_or_its_replay() {
     for ip in ["127.0.0.1", "::1"] {
         let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;

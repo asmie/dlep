@@ -168,6 +168,10 @@ Replacement regressions hold a link request across physical Down/Up and then
 grant it: the old transaction must complete without changing the replacement's
 cache. Bridge tests cover requests already delivered and requests still queued;
 the IPv4/IPv6 subprocess case also checks replay to a later router and new grants.
+Partial-reply regressions report new destination/session metrics while a request
+is pending, then check omitted fields and invalid optional metrics. Overlapping
+requests from two real routers must preserve each session's values and accumulate
+their explicit grants in the cache replayed to a third router over IPv4/IPv6.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

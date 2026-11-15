@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Partial radio link replies preserve newer destination and session metric
+  reports. Grants merge only supplied fields into each session and the replay
+  cache, so overlapping requests on different routers retain each other's cached
+  changes without leaking session-specific values between routers.
 - Link grants for a physically withdrawn destination no longer overwrite the
   cached metrics of a replacement using the same MAC. Old transactions still
   complete, while replacement replay and subsequent grants retain their own state.
