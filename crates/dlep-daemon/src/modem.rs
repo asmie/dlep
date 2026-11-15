@@ -293,6 +293,9 @@ impl ModemBuilder {
         } else {
             TcpSocket::new_v4()?
         };
+        // Allow supervisor restarts while accepted connections from the old
+        // process remain in TIME_WAIT. A live listener still owns its port.
+        socket.set_reuseaddr(true)?;
         dlep_net::gtsm::configure_tcp(
             &socket,
             bind_addr.is_ipv6(),

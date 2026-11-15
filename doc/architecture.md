@@ -890,6 +890,29 @@ The order of work was:
     two modems, and real IPv4/IPv6 CLI sessions with a scripted adapter, plus
     failure cleanup, configuration checks, capability dropping, and ignored EOF.
 
+34. Complete adapter pipelines. **Done** — root integration tests launch
+    `dlep modem` and `dlep router`, each with a real external adapter process.
+    A separate consumer reconstructs state using only the public JSON Lines
+    records and applies snapshots only after a matching end record. Control
+    sockets operate the adapters; all protocol traffic crosses their stdio pipes
+    and the daemons' DLEP connection.
+
+    Tests check exact metrics and all four address types, grants and denials,
+    busy-command rejection, withdrawal with updates and re-announcement,
+    physical destination removal/re-addition, resync, and empty final state.
+    Two modems sharing a MAC retain independent state and command routing.
+    Radio failure followed by modem restart on the same endpoint removes old
+    state, reconnects automatically, and rejects commands for the old session.
+    The restart scenario exposed missing TCP address reuse: the modem now enables
+    it before binding so old TIME_WAIT connections do not prevent a supervisor
+    restart. A separate IPv4/IPv6 regression forces modem-initiated TCP closure
+    and verifies immediate rebinding while still excluding a second live listener.
+    A paused consumer creates real pipe backpressure and broadcast event loss;
+    after resuming it receives an explicit gap and the exact latest snapshot.
+    Command and restart scenarios run over both IPv4 and IPv6 with strict GTSM.
+    These are static plaintext integration tests of our own daemons and scripted
+    adapters, not independent protocol or radio hardware interoperability tests.
+
 ---
 
 ## 10. Open questions / risks

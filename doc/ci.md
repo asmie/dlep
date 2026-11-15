@@ -131,9 +131,9 @@ status. The script always enters a new network namespace before making network
 changes. GitHub runners use `sudo` to provide the capabilities needed by strict
 GTSM.
 
-The `dlep-modem` radio adapter tests run a Python 3 adapter script and use
-`setpriv` (util-linux) to check that the adapter does not inherit ambient
-capabilities; the capability check is skipped when `setpriv` is unavailable.
+The modem and router adapter tests run Python 3 adapter scripts and use
+`setpriv` (util-linux) to check that adapters do not inherit ambient
+capabilities; the capability checks are skipped when `setpriv` is unavailable.
 
 For local Linux runs where unprivileged user namespaces are enabled:
 
@@ -142,6 +142,36 @@ cargo build --workspace --all-targets --locked
 unshare --user --map-root-user bash .github/scripts/test-network.sh \
   cargo test --workspace --locked --offline
 ```
+
+The root `tests/adapter_pipeline.rs` suite launches both roles through the
+combined `dlep` binary, each with an external Python 3 adapter. Its consumer
+reconstructs state independently from the public JSON Lines records, rejects
+interleaved or incomplete snapshots, and checks exact metrics and addresses.
+It covers link grants/denials, command rejection, withdrawal and re-announcement,
+two modems sharing a MAC, radio failure and automatic reconnection after modem
+restart, explicit resync, and empty state before shutdown EOF. A paused consumer
+fills its real input pipe and causes broadcast lag; the test requires both an
+explicit event-gap notice and recovery of the complete latest state. Control
+sockets operate the adapters without bypassing the daemons' public protocols.
+
+These tests run automatically in the workspace and coverage jobs. To run them
+alone:
+
+```sh
+unshare --user --map-root-user bash .github/scripts/test-network.sh \
+  cargo test -p dlep --test adapter_pipeline --locked --offline
+```
+
+The command and restart scenarios cover IPv4 and IPv6 static plaintext sessions
+with strict GTSM. The fixture uses Linux pipe controls and process groups for
+bounded backpressure and subprocess cleanup. It does not use radio hardware or
+an independent DLEP implementation; the interoperability jobs above cover
+independent peers.
+
+The daemon's `review_regressions` suite also forces modem-initiated TCP closure
+over IPv4 and IPv6 before restarting on the same port. This deterministically
+checks reuse with an old connection in TIME_WAIT and verifies that a second
+live modem still cannot bind the listening endpoint.
 
 The normal workspace and coverage runs include `dlep-daemon/tests/churn.rs`.
 It keeps the same daemons alive for 100 successive sessions per address family

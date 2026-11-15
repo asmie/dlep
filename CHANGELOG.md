@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- End-to-end adapter regression tests run both daemon roles and both external
+  adapter processes, covering IPv4/IPv6 commands, exact state, multi-modem
+  isolation, restart recovery, and snapshot recovery after consumer backpressure.
+- The modem TCP listener enables address reuse so a supervisor can restart it
+  on the same port while old connections remain in TIME_WAIT. A live listener
+  still prevents another modem from binding its port.
 - Router integration adapter: `[adapter]` starts an external JSON Lines process
   that receives complete, replaceable snapshots and can submit targeted announce,
   withdrawal, and link-characteristic commands. Explicit resync, bounded queues,

@@ -10,7 +10,7 @@ rust-version.workspace = true
 readme = "README.md"
 keywords = ["dlep", "rfc8175", "network", "routing"]
 categories = ["network-programming", "command-line-utilities"]
-include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+include = ["/src/**", "/tests/adapter_pipeline.rs", "/tests/support/pipeline_adapter.py", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
 [dependencies]
 anyhow.workspace = true
@@ -18,6 +18,11 @@ clap.workspace = true
 tokio.workspace = true
 dlep-router = { path = "crates/dlep-router", version = "0.2.0" }
 dlep-modem = { path = "crates/dlep-modem", version = "0.2.0" }
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+nix = { workspace = true, features = ["signal"] }
 
 [workspace]
 resolver = "3"

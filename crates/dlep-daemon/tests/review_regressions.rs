@@ -194,6 +194,75 @@ async fn idle_tls_client_does_not_block_healthy_client() {
 }
 
 #[tokio::test]
+async fn modem_restarts_on_same_port_after_actively_closing_tcp() {
+    for ip in ["127.0.0.1", "::1"] {
+        let mut config = modem_config();
+        config.shared.network.bind_addr = ip.parse().unwrap();
+        config.shared.timers.termination_timeout_ms = Some(200);
+        let modem = ModemDaemon::builder()
+            .config(config.clone())
+            .spawn()
+            .await
+            .unwrap();
+        let addr = modem.local_addr();
+        let mut events = modem.subscribe();
+        let socket = if addr.is_ipv6() {
+            TcpSocket::new_v6().unwrap()
+        } else {
+            TcpSocket::new_v4().unwrap()
+        };
+        dlep_net::gtsm::configure_tcp(&socket, addr.is_ipv6(), true).unwrap();
+        let mut peer = timeout(WAIT, socket.connect(addr)).await.unwrap().unwrap();
+        let init = dlep_fsm::session_router::RouterSessionFsm::new()
+            .step(FsmEvent::TcpConnected)
+            .into_iter()
+            .find_map(|action| match action {
+                FsmAction::SendMessage(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        peer.write_all(&init.encode().unwrap()).await.unwrap();
+        assert_eq!(
+            read_message(&mut peer).await.message_type,
+            MessageType::SESSION_INITIALIZATION_RESPONSE
+        );
+        up(&mut events).await;
+        let shutdown = tokio::spawn(modem.shutdown());
+        assert_eq!(
+            read_message(&mut peer).await.message_type,
+            MessageType::SESSION_TERMINATION
+        );
+        peer.write_all(
+            &Message::new(MessageType::SESSION_TERMINATION_RESPONSE)
+                .encode()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        // Hold the peer open until the modem sends FIN. This makes the modem
+        // the active TCP closer, leaving its old connection in TIME_WAIT.
+        let mut remaining = Vec::new();
+        timeout(WAIT, peer.read_to_end(&mut remaining))
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(WAIT, shutdown).await.unwrap().unwrap().unwrap();
+        drop(peer);
+
+        config.shared.network.tcp_port = addr.port();
+        let restarted = ModemDaemon::builder()
+            .config(config.clone())
+            .spawn()
+            .await
+            .expect("restart while the previous connection is in TIME_WAIT");
+        assert_eq!(restarted.local_addr(), addr);
+        // Address reuse must still exclude a competing live listener.
+        assert!(ModemDaemon::builder().config(config).spawn().await.is_err());
+        restarted.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn failed_ipv6_start_releases_listening_socket() {
     let reservation = TcpListener::bind("[::1]:0").await.unwrap();
     let addr = reservation.local_addr().unwrap();

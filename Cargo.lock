@@ -225,6 +225,9 @@ dependencies = [
  "clap",
  "dlep-modem",
  "dlep-router",
+ "nix",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
