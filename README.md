@@ -294,6 +294,8 @@ partial address sets during this sequence.
 `RouterDaemon::drop_destination(session_id, destination)` withdraws interest
 from one modem. The modem acknowledges with Destination Down Response, stops
 reporting that destination on this session, and emits a `DestinationEvent::Down`.
+The radio adapter receives a `destination_withdrawn` notice with the session and
+MAC; its physical destination cache and reports to other routers are preserved.
 The router emits its own Down event when the response arrives. The session stays
 active; a later Destination Announce can restore reports using the modem's
 latest local metrics and addresses. Busy/unknown destinations and stale session

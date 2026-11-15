@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Radio adapters receive `destination_withdrawn` notices with the session and
+  MAC when a router withdraws interest. The physical destination stays cached
+  for other routers, later replay, and re-announcement on the original session.
 - Modems expose validated Destination Up replies through
   `DestinationEvent::UpResponse`, including refusals and peer status text.
   Radio adapters receive `destination_up_response` notices scoped by session

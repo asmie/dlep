@@ -491,6 +491,147 @@ async fn both_adapter_processes_exchange_complete_state_and_commands_over_ipv4_a
 }
 
 #[tokio::test]
+async fn radio_withdrawal_notices_preserve_other_routers_and_replay() {
+    for (format, mac) in [("eui48", MAC), ("eui64", MAC64)] {
+        for ip in ["127.0.0.1", "::1"] {
+            let (mut radio, addr) = Node::modem_with_format("modem-a", ip, 0, format).await;
+            report(&mut radio, mac, 700, 1).await;
+            let mut a = Node::router_with_format(&[addr], format).await;
+            let initial = a.wait(|s| destination(s, "modem-a", mac).is_some()).await;
+            let aid = session(&initial, "modem-a").unwrap()["session"].clone();
+            let accepted = radio
+                .wait(|s| notice(s, "destination_up_response", |_| true).is_some())
+                .await;
+            let radio_aid =
+                notice(&accepted, "destination_up_response", |_| true).unwrap()["session"].clone();
+
+            let mut b = Node::router_with_format(&[addr], format).await;
+            b.wait(|s| destination(s, "modem-a", mac).is_some()).await;
+            radio
+                .wait(|s| {
+                    notice(s, "destination_up_response", |n| n["session"] != radio_aid).is_some()
+                })
+                .await;
+            a.control
+                .send(json!({"type":"destination_down", "request":1, "session":aid, "mac":mac}))
+                .await;
+            a.result(1, "accepted").await;
+            a.wait(|s| destination(s, "modem-a", mac).is_none()).await;
+            let withdrawn = radio
+                .wait(|s| notice(s, "destination_withdrawn", |_| true).is_some())
+                .await;
+            let expected_notice =
+                json!({"type":"destination_withdrawn", "session":radio_aid, "mac":mac});
+            assert_eq!(
+                notice(&withdrawn, "destination_withdrawn", |_| true).unwrap(),
+                &expected_notice
+            );
+
+            // Interest changes must not remove the physical destination or
+            // suppress reports to the other router.
+            radio
+                .control
+                .batch(vec![
+                    json!({"type":"destination_update", "mac":mac,
+                    "metrics":{"current_data_rate_tx_bps":900,"latency_us":444}}),
+                    json!({"type":"destination_addresses", "mac":mac,
+                    "remove":addresses(1), "add":addresses(2)}),
+                ])
+                .await;
+            let mut expected = defaults();
+            expected["current_data_rate_tx_bps"] = json!(900);
+            expected["latency_us"] = json!(444);
+            expected["rlq_tx"] = json!(0);
+            b.wait(|s| {
+                destination(s, "modem-a", mac).is_some_and(|d| {
+                    d["metrics"] == expected && d["addresses"] == expected_addresses(2)
+                })
+            })
+            .await;
+            let unchanged = a.control.call(json!({"op":"status"})).await;
+            assert!(destination(&unchanged, "modem-a", mac).is_none());
+
+            let mut late = Node::router_with_format(&[addr], format).await;
+            let replay = late
+                .wait(|s| destination(s, "modem-a", mac).is_some())
+                .await;
+            assert_eq!(
+                destination(&replay, "modem-a", mac).unwrap()["metrics"],
+                expected
+            );
+            assert_eq!(
+                destination(&replay, "modem-a", mac).unwrap()["addresses"],
+                expected_addresses(2)
+            );
+            a.control
+                .send(json!({"type":"destination_announce", "request":2, "session":aid, "mac":mac}))
+                .await;
+            a.result(2, "accepted").await;
+            a.wait(|s| {
+                destination(s, "modem-a", mac).is_some_and(|d| {
+                    d["metrics"] == expected && d["addresses"] == expected_addresses(2)
+                })
+            })
+            .await;
+            radio
+                .wait(|s| {
+                    notice(s, "destination_announced", |n| {
+                        n["session"] == radio_aid && n["mac"] == mac
+                    })
+                    .is_some()
+                })
+                .await;
+
+            // A physical Down followed by a new Up must not be echoed back
+            // as a router withdrawal. The new Up responses are event barriers.
+            radio
+                .control
+                .send(json!({"type":"destination_down", "mac":mac}))
+                .await;
+            for consumer in [&mut a, &mut b, &mut late] {
+                consumer
+                    .wait(|s| destination(s, "modem-a", mac).is_none())
+                    .await;
+            }
+            report(&mut radio, mac, 950, 3).await;
+            for consumer in [&mut a, &mut b, &mut late] {
+                consumer
+                    .wait(|s| {
+                        destination(s, "modem-a", mac).is_some_and(|d| {
+                            d["metrics"]["current_data_rate_tx_bps"] == 950
+                                && d["addresses"] == expected_addresses(3)
+                        })
+                    })
+                    .await;
+            }
+            let completed = radio
+                .wait(|s| {
+                    s["notices"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|n| n["type"] == "destination_up_response" && n["mac"] == mac)
+                        .count()
+                        == 6
+                })
+                .await;
+            let withdrawals: Vec<_> = completed["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["type"] == "destination_withdrawn")
+                .collect();
+            assert_eq!(withdrawals, vec![&expected_notice]);
+            for consumer in [&mut a, &mut b, &mut late] {
+                consumer.stop().await;
+                consumer.assert_final_empty();
+            }
+            radio.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn two_modems_with_the_same_mac_keep_commands_metrics_and_withdrawals_isolated() {
     let (mut a, aa) = Node::modem("modem-a", "127.0.0.1", 0).await;
     let (mut b, ba) = Node::modem("modem-b", "127.0.0.1", 0).await;

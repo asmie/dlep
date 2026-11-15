@@ -1073,6 +1073,15 @@ The order of work was:
     text larger than the adapter's input-line limit. The churn test now verifies
     every Destination Up response as well as the router's corresponding arrival.
 
+49. Router withdrawal notices for radio adapters. **Done** — the radio bridge
+    forwards modem `DestinationEvent::Down` events as `destination_withdrawn`
+    notices carrying session and MAC. These report a router withdrawing interest
+    without removing the physical destination from the cache. The real adapter
+    regression checks continued updates to another router, replay to a later
+    router, and re-announcement with the latest metrics and addresses. Physical
+    Down/Up cycles must not generate extra withdrawal notices. Both MAC formats
+    and IP families are covered; notices remain subject to event lag.
+
 ---
 
 ## 10. Open questions / risks

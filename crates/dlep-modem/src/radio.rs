@@ -287,6 +287,10 @@ enum Outbound {
         session: u64,
         mac: Mac,
     },
+    DestinationWithdrawn {
+        session: u64,
+        mac: Mac,
+    },
     DestinationUpResponse {
         session: u64,
         mac: Mac,
@@ -1013,6 +1017,19 @@ impl Bridge<'_> {
 
     async fn event(&mut self, event: DaemonEvent) -> Result<()> {
         match event {
+            DaemonEvent::Destination {
+                session_id,
+                event: DestinationEvent::Down { id, .. },
+                ..
+            } => {
+                // On modems this event reports a router withdrawing interest.
+                // Retain the physical destination for other routers and replay.
+                self.send(&Outbound::DestinationWithdrawn {
+                    session: session_id.0,
+                    mac: Mac(id.0),
+                })
+                .await?
+            }
             DaemonEvent::Destination {
                 session_id,
                 event: DestinationEvent::UpResponse { id, status, text },

@@ -156,6 +156,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `session_up` | `session`, `peer` | A router session is established. |
 | `session_down` | `session`, `peer`, `status` (numeric RFC 8175 status code) | A router session ended. |
 | `destination_up_response` | `session`, `mac`, `status`, `text` | The router's validated, nonfatal reply to Destination Up. Zero means accepted; other status codes mean it declined reports for this destination. |
+| `destination_withdrawn` | `session`, `mac` | The router withdrew interest in this destination on this session. Physical destination knowledge remains cached. |
 | `destination_announced` | `session`, `mac` | The router asked about a destination it has not been told about (§12.13). The modem has already answered; send `destination_up` if the radio can reach it. |
 | `link_request` | `request`, `session`, `peer`, `mac`, `requested`, `current` | A router asks to change a destination's link. |
 
@@ -164,7 +165,7 @@ Session IDs are unique during a modem process lifetime. Intermediate sessions
 may be omitted if they start and end before the bridge observes them.
 `session_up` accompanies replay for a newly observed established session;
 `session_down` supplies the termination reason when its event is available.
-Transient down/announce/Up-response notices may be lost under event lag. Use `session_sync`
+Session termination and destination notices may be lost under event lag. Use `session_sync`
 to reconcile membership; a delayed down notice for an absent ID is harmless.
 Link requests use a separate delivery path. Older adapters may ignore
 `session_sync` under the unknown-message rule, but then cannot recover missing
@@ -178,6 +179,14 @@ or affect other routers; later routers still receive normal replay. Do not send
 membership snapshots cannot recover a lost response or its explanation.
 Invalid, unsolicited, duplicate, or fatal replies follow session termination
 instead of producing an Up-response notice.
+
+`destination_withdrawn` reports a router's later withdrawal of interest. The
+modem has acknowledged it and stopped reports on that session. Keep reporting
+physical changes: other routers still receive them, later routers receive the
+cached destination, and the withdrawing router can request reports again with
+Destination Announce. A physical `destination_down` sent by the adapter does
+not produce this notice. Session membership snapshots cannot recover lost
+destination interest notices.
 
 ```json
 {"type":"link_request","request":7,"session":1,"peer":"192.0.2.1:41000","mac":"02:00:00:00:00:01","requested":{"current_data_rate_tx_bps":2000000},"current":{"max_data_rate_rx_bps":10000000,"max_data_rate_tx_bps":10000000,"current_data_rate_rx_bps":5000000,"current_data_rate_tx_bps":5000000,"latency_us":2500}}

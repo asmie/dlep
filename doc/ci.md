@@ -223,6 +223,10 @@ peer/session attribution. Bridge tests preserve replay for a later router and
 round-trip escaped status text beyond the adapter input-line limit. The real
 adapter pipeline requires the acceptance notice, and churn checks each peer
 response without discarding unexpected modem events.
+Radio withdrawal notices are checked per session over both IP families and MAC
+formats. The real adapter regression verifies continued reports to other routers,
+cached replay to a later router, and re-announcement with current metrics and
+addresses. Subsequent physical Down/Up cycles must not echo router withdrawals.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:
