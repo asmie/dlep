@@ -1123,6 +1123,17 @@ The order of work was:
     repeated refreshes, pending answers, granted metrics, later physical replay,
     and empty membership over IPv4/IPv6 through the external adapters.
 
+54. Router adapter session address commands. **Done** — `session_addresses`
+    accepts targeted `add`/`remove` deltas for IPv4/IPv6 addresses and attached
+    subnets through the existing daemon API. Strict schema checks, value
+    validation, subnet canonicalization, request-ID deduplication, busy/stale
+    rejections, and local acceptance retain the adapter's command semantics.
+    Existing `session_update_response` notices report peer completion; unchanged
+    deltas send no update. Local address state survives nonfatal refusal but is
+    scoped to one session and absent from remote-peer snapshots. Controlled peer
+    and subprocess tests cover IPv4/IPv6, independent sessions, invalid inputs,
+    refusals, canonical add/replace/remove, and no-op behavior.
+
 ---
 
 ## 10. Open questions / risks

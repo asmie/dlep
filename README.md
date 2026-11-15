@@ -28,8 +28,9 @@ latency, link quality, MTU, …) and exchanges heartbeats.
 > directly. Busy commands return explicit acceptance errors.
 >
 > The router binary can run a [router adapter](doc/router-adapter.md) to consume
-> retained session/destination snapshots and submit targeted announce, withdrawal,
-> and link-characteristic commands. Routing policy belongs to the adapter.
+> retained session/destination snapshots and submit targeted session address,
+> announce, withdrawal, and link-characteristic commands. Routing policy belongs
+> to the adapter.
 
 ## Goals
 
@@ -272,7 +273,11 @@ Layer 3 changes use `AddressChanges { added, removed }`; each side contains a
 `ModemDaemon::add_destination_with_addresses` supplies the initial destination
 snapshot, and `update_destination_addresses` sends later changes. Both daemons
 provide `update_session_addresses(session_id, changes)` for local peer addresses
-on one session, using address-only Session Update messages.
+on one session, using address-only Session Update messages. Router adapters expose
+this API as `session_addresses` with optional `add`/`remove` address objects;
+`session_update_response` reports peer completion for each wire update. Locally
+advertised addresses are scoped to that session and must be advertised again
+after reconnecting. Router adapter snapshots contain remote modem addresses.
 
 Embedders retaining destinations for replay can use
 `ModemDaemon::validate_destination_snapshot(id, &metrics, &addresses)` before

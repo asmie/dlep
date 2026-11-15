@@ -29,7 +29,7 @@ Input command lines are limited to 64 KiB excluding the newline. Blank lines
 are ignored. Unknown message types are ignored for forward compatibility;
 unknown fields in known commands, malformed JSON, and invalid field types are
 fatal. A syntactically valid command with invalid values, such as a malformed
-MAC string or empty link request, receives a rejection.
+MAC/address string or empty link request, receives a rejection.
 
 Output records are streamed rather than placing an entire destination table on
 one line. The 64 KiB command limit does not constrain output records; for example,
@@ -95,6 +95,7 @@ Do not apply older transient notices over snapshot state.
 | `type` | Fields | Effect |
 | --- | --- | --- |
 | `resync` | none | Sends another complete current snapshot; no command-result notice. |
+| `session_addresses` | `request`, `session`, optional `add`, `remove` | Advertises changes to the router's own addresses on one modem session. |
 | `destination_announce` | `request`, `session`, `mac` | Requests information about a destination on one modem. |
 | `destination_down` | `request`, `session`, `mac` | Withdraws interest from one modem. |
 | `link_request` | `request`, `session`, `mac`, `requested` | Requests rate or latency changes for one destination. |
@@ -102,6 +103,23 @@ Do not apply older transient notices over snapshot state.
 `requested` contains at least one of `current_data_rate_rx_bps`,
 `current_data_rate_tx_bps`, and `latency_us`. Omitted fields are not requests to
 change that characteristic. All numeric command fields are unsigned integers.
+
+For `session_addresses`, `add` and `remove` are objects containing optional
+`ipv4`, `ipv6`, `ipv4_subnets`, and `ipv6_subnets` arrays of strings. Omitted
+objects and arrays are empty; subnet strings use CIDR. The daemon normalizes
+subnet host bits before comparing or sending them. Invalid addresses/prefixes,
+duplicates within an array, and adding and removing the same address or network
+in one command receive `invalid_input`. Batches that cannot fit one DLEP Session
+Update also receive `invalid_input`, even if their JSON fits the input limit.
+Unknown nested fields and incorrect JSON types remain fatal framing errors.
+
+Address commands are deltas: adding an already advertised address or removing
+an absent address has no effect. Empty or unchanged deltas are accepted without
+a wire update or completion notice, unless the session is busy. Changed deltas
+use address-only Session Update messages and preserve metrics. These locally
+advertised router addresses are not included in snapshots, whose session
+addresses belong to the remote modem. Address state is scoped to the session;
+the adapter must advertise it again on a new session after reconnecting.
 
 `request` must be positive and strictly increase for every new command during
 this adapter process lifetime. Even rejected commands consume their ID. Repeated
@@ -113,6 +131,7 @@ retry with a new ID after the preceding transaction completes.
 {"type":"resync"}
 {"type":"link_request","request":1,"session":1,"mac":"02:00:00:00:00:01","requested":{"current_data_rate_tx_bps":2000000}}
 {"type":"destination_down","request":2,"session":1,"mac":"02:00:00:00:00:01"}
+{"type":"session_addresses","request":3,"session":1,"add":{"ipv4":["192.0.2.10"],"ipv6_subnets":["2001:db8:1::/64"]}}
 ```
 
 ## Command results and transient notices
@@ -166,12 +185,15 @@ produces only `destination_down`. Invalid, unsolicited, duplicate, or fatal
 replies terminate the session instead of producing a completion notice. A later
 Announce or Up can recreate the same MAC; use snapshots for its current state.
 
-`session_update_response` exposes replies to address updates originated through
-the daemon API; this adapter does not currently submit session address commands.
-Each notice represents one wire reply. Repeating unchanged local addresses sends
-no update and produces no completion. Refusal preserves the daemon's local
-address state. Invalid, unsolicited, duplicate, or fatal replies terminate the
-session instead of producing this notice.
+`session_update_response` exposes replies to `session_addresses` commands and
+address updates originated through the daemon API. Each notice represents one
+wire reply and identifies the session, without the adapter's request ID.
+Serialize address commands per session when tracking completion; another session
+transaction returns `busy` until the peer responds. Repeating unchanged local
+addresses sends no update and produces no completion. Refusal preserves the
+daemon's local address state. Invalid, unsolicited, duplicate, or fatal replies
+terminate the session instead of producing this notice. Snapshots and `resync`
+cannot recover lost completion outcomes or the locally advertised address state.
 
 [`examples/router-adapter.py`](../examples/router-adapter.py) is a runnable
 consumer that maintains replacement tables and logs their size. It does not

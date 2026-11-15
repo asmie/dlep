@@ -30,6 +30,9 @@ if mode == 'caps':
         f.write(ambient(os.getppid()) + ' ' + ambient('self'))
 def send(message):
     print(json.dumps(message), flush=True)
+def addresses(n):
+    return {'ipv4': [f'192.0.2.{n}'], 'ipv6': [f'2001:db8::{n}'],
+            'ipv4_subnets': [f'198.51.{n}.7/24'], 'ipv6_subnets': [f'2001:db8:{n}::7/64']}
 stage = 0
 sessions, destinations = [], []
 with open(log, 'a') as out:
@@ -45,6 +48,10 @@ with open(log, 'a') as out:
         elif kind == 'destination':
             destinations.append(m)
         elif kind == 'snapshot_end' and sessions:
+            if mode == 'addresses' and stage == 0:
+                stage = 1
+                target = sessions[0]
+                send({'type': 'session_addresses', 'request': 1, 'session': target['session'], 'add': addresses(1)})
             if mode == 'exit':
                 sys.exit(3)
             if mode == 'invalid':
@@ -71,6 +78,16 @@ with open(log, 'a') as out:
         elif kind == 'link_response' and mode == 'control':
             stage = 3
             send({'type': 'destination_down', 'request': 2, 'session': m['session'], 'mac': m['mac']})
+        elif kind == 'session_update_response' and mode == 'addresses':
+            stage += 1
+            if stage == 2:
+                send({'type': 'session_addresses', 'request': 2, 'session': target['session'],
+                      'remove': addresses(1), 'add': addresses(2)})
+            elif stage == 3:
+                send({'type': 'session_addresses', 'request': 3, 'session': target['session'], 'remove': addresses(2)})
+            elif stage == 4:
+                send({'type': 'session_addresses', 'request': 4, 'session': target['session']})
+                send({'type': 'resync'})
 if mode == 'ignore_eof':
     time.sleep(60)
 "#;
@@ -214,6 +231,93 @@ fn last_snapshot(records: &[Value]) -> &[Value] {
         .rposition(|r| r["type"] == "snapshot_begin")
         .unwrap();
     &records[begin + 1..end]
+}
+
+#[tokio::test]
+async fn binary_adapter_advertises_session_addresses_over_both_families() {
+    use dlep_daemon::AddressChanges;
+    let addresses = |n| DestinationAddrs {
+        v4: vec![format!("192.0.2.{n}").parse().unwrap()],
+        v6: vec![format!("2001:db8::{n}").parse().unwrap()],
+        v4_subnets: vec![format!("198.51.{n}.0/24").parse().unwrap()],
+        v6_subnets: vec![format!("2001:db8:{n}::/64").parse().unwrap()],
+    };
+    for ip in ["127.0.0.1", "::1"] {
+        let modem = modem(ip).await;
+        let mut events = modem.subscribe();
+        let mut router = Router::start("addresses", modem.local_addr(), &[]);
+        let session = up(&mut events).await;
+        for (added, removed, expected) in [
+            (addresses(1), DestinationAddrs::default(), addresses(1)),
+            (addresses(2), addresses(1), addresses(2)),
+            (
+                DestinationAddrs::default(),
+                addresses(2),
+                DestinationAddrs::default(),
+            ),
+        ] {
+            let event = timeout(WAIT, events.recv()).await.unwrap().unwrap();
+            let DaemonEvent::SessionAddresses {
+                session_id,
+                changes,
+                addresses,
+                ..
+            } = event
+            else {
+                panic!("unexpected modem event: {event:?}");
+            };
+            assert_eq!(session_id, session);
+            assert_eq!(changes, AddressChanges { added, removed });
+            assert_eq!(addresses, expected);
+        }
+        let records = router
+            .records_until(|records| {
+                let Some(result) = records
+                    .iter()
+                    .position(|r| r["type"] == "command_result" && r["request"] == 4)
+                else {
+                    return false;
+                };
+                records[result + 1..]
+                    .iter()
+                    .any(|r| r["type"] == "snapshot_end")
+            })
+            .await;
+        for request in 1..=4 {
+            let result = records
+                .iter()
+                .find(|r| r["type"] == "command_result" && r["request"] == request)
+                .unwrap();
+            assert_eq!(result["outcome"], "accepted");
+        }
+        let sid = last_snapshot(&records)
+            .iter()
+            .find(|r| r["type"] == "session")
+            .unwrap()["session"]
+            .clone();
+        let replies: Vec<_> = records
+            .iter()
+            .filter(|r| r["type"] == "session_update_response")
+            .collect();
+        assert_eq!(replies.len(), 3, "empty changes must not send an update");
+        for reply in replies {
+            assert_eq!(reply["session"], sid);
+            assert_eq!(reply["status"], 0);
+            assert_eq!(reply["text"], "");
+        }
+        assert!(
+            !records.iter().any(|r| r["type"] == "address"),
+            "snapshots only contain remote addresses"
+        );
+        assert!(
+            modem.state().borrow().sessions[&session]
+                .peer_addresses
+                .is_empty()
+        );
+        assert!(events.try_recv().is_err());
+        router.stop().await;
+        modem.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -99,7 +99,7 @@ An optional router `[adapter]` section runs an external integration process;
 `command` is an absolute executable path and `args` defaults to `[]`.
 `--check-config` checks the section and command file without running it. The
 adapter receives complete session/destination snapshots and can issue targeted
-announce, withdrawal, and link-characteristic commands. See the
+session address, announce, withdrawal, and link-characteristic commands. See the
 [router adapter protocol](router-adapter.md) and
 [example consumer](../examples/router-adapter.py). Routing policy stays in the
 adapter. It shares the service sandbox and user, with ambient capabilities

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Router adapters can advertise local IPv4/IPv6 addresses and attached subnets
+  through targeted `session_addresses` commands with `add`/`remove` deltas.
+  Commands validate and canonicalize addresses, share request-ID deduplication,
+  and report local acceptance separately from `session_update_response` peer
+  completion. Unchanged deltas send no update; busy sessions reject commands.
+  Existing snapshots continue to expose remote peer addresses.
 - Radio adapters can send `{"type":"resync"}` to request fresh `session_sync`
   membership, even when unchanged or empty. Refresh preserves established
   sessions, router withdrawals, link grants, and pending requests without

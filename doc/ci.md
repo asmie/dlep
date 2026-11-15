@@ -245,6 +245,13 @@ replies must not emit completion. IPv4/IPv6 runtime tests check peer attribution
 and independent sessions; adapter tests preserve replay after refusal, escape
 long text, and keep notices outside complete snapshots. The real subprocess
 pipeline requires a radio notice after a session metric update.
+Router adapter session address tests with controlled IPv4/IPv6 peers verify
+targeting, concurrent sessions, busy rejection, strict JSON fields, invalid and
+conflicting addresses, oversized wire updates, shared request-ID deduplication,
+stale sessions, and nonfatal refusal without rollback. The real router binary
+and Python adapter add, replace, and remove IPv4/IPv6 addresses and attached
+subnets, checking canonical subnets, peer state, completion notices, no-op
+acceptance, and unchanged remote snapshots.
 Destination Down completion tests require removal before completion and preserve
 status text on both roles. Router `Down` events precede completion; modem replies
 must not masquerade as router withdrawals. Invalid replies emit no completion.

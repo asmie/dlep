@@ -50,6 +50,12 @@ fn parses_commands_strictly_and_leaves_unknown_messages_forward_compatible() {
         r#"{"type":"resync","typo":true}"#,
         r#"{"type":"link_request","request":1,"session":1,"mac":"02:00:00:00:00:01","requested":{"latency":1}}"#,
         r#"{"type":"destination_down","session":1,"mac":"02:00:00:00:00:01"}"#,
+        r#"{"type":"session_addresses","request":1,"session":1,"mac":"02:00:00:00:00:01"}"#,
+        r#"{"type":"session_addresses","request":1,"session":1,"add":{"ipv4_subnet":[]}}"#,
+        r#"{"type":"session_addresses","request":1,"session":1,"remove":{"ipv6":42}}"#,
+        r#"{"type":"session_addresses","request":1,"session":1,"add":{"ipv4":[7]}}"#,
+        r#"{"type":"session_addresses","request":1,"session":1,"add":null}"#,
+        r#"{"type":"session_addresses","request":1}"#,
         r#"{"type":3}"#,
         "[]",
         "bad json",
@@ -61,6 +67,10 @@ fn parses_commands_strictly_and_leaves_unknown_messages_forward_compatible() {
         Inbound::Unknown
     ));
     assert!(matches!(parse(r#"{"type":"link_request","request":1,"session":1,"mac":"02:00:00:00:00:01","requested":{"latency_us":0}}"#).unwrap(), Inbound::LinkRequest { .. }));
+    assert!(matches!(
+        parse(r#"{"type":"session_addresses","request":1,"session":1}"#).unwrap(),
+        Inbound::SessionAddresses { .. }
+    ));
     assert_eq!(
         mac("02:00:00:00:00:01").unwrap().to_string(),
         "02:00:00:00:00:01"
@@ -462,4 +472,231 @@ async fn commands_target_one_session_and_distinguish_acceptance_busy_and_stale_i
     router.shutdown().await.unwrap();
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_address_commands_validate_target_and_wait_for_peer_completion() {
+    use dlep_core::{DataItem, Message, MessageType, StatusCode};
+    use dlep_daemon::RouterConfig;
+    use dlep_fsm::{FsmAction, FsmEvent, session_modem::ModemSessionFsm};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read(peer: &mut TcpStream) -> Message {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let mut header = [0; 4];
+                peer.read_exact(&mut header).await.unwrap();
+                let mut bytes = header.to_vec();
+                bytes.resize(
+                    4 + usize::from(u16::from_be_bytes([header[2], header[3]])),
+                    0,
+                );
+                peer.read_exact(&mut bytes[4..]).await.unwrap();
+                let message = Message::decode(bytes.into()).unwrap();
+                if message.message_type != MessageType::HEARTBEAT {
+                    return message;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    async fn submit(
+        router: &RouterDaemon,
+        last: &mut u64,
+        session: SessionId,
+        mut changes: Value,
+    ) -> Value {
+        changes["type"] = json!("session_addresses");
+        changes["request"] = json!(*last + 1);
+        changes["session"] = json!(session.0);
+        let line = changes.to_string();
+        assert!(line.len() <= MAX_LINE);
+        execute(router, parse(&line).unwrap(), last).await
+    }
+    async fn reply(
+        peer: &mut TcpStream,
+        events: &mut broadcast::Receiver<DaemonEvent>,
+        session: SessionId,
+        status: StatusCode,
+    ) {
+        let text = "peer says \"done\"\nzażółć";
+        let response =
+            Message::new(MessageType::SESSION_UPDATE_RESPONSE).with_item(DataItem::Status {
+                code: status,
+                text: text.into(),
+            });
+        peer.write_all(&response.encode().unwrap()).await.unwrap();
+        let value = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(value) = notice(events.recv().await.unwrap()) {
+                    return value;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({"type":"session_update_response","session":session.0,"status":status.0,"text":text})
+        );
+    }
+
+    let mut config = RouterConfig::default();
+    config.shared.network.use_tls = false;
+    let router = RouterDaemon::builder()
+        .config(config)
+        .spawn()
+        .await
+        .unwrap();
+    let mut peers = Vec::new();
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        let listener = TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        dlep_net::gtsm::configure_tcp(&listener, addr.is_ipv6(), true).unwrap();
+        router.connect_static(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut modem = ModemSessionFsm::new();
+        modem.step(FsmEvent::TcpAccepted);
+        let init = read(&mut peer).await;
+        let response = modem
+            .step(FsmEvent::RecvMessage(init))
+            .into_iter()
+            .find_map(|action| match action {
+                FsmAction::SendMessage(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        peer.write_all(&response.encode().unwrap()).await.unwrap();
+        let snapshot = wait_state(&router, |s| {
+            s.sessions.values().any(|s| s.peer.addr == addr)
+        })
+        .await;
+        let session = *snapshot
+            .sessions
+            .iter()
+            .find(|(_, s)| s.peer.addr == addr)
+            .unwrap()
+            .0;
+        peers.push((peer, session));
+    }
+    let mut events = router.subscribe();
+    let mut last = 0;
+    let sid = peers[0].1;
+    for invalid in [
+        json!({"add":{"ipv4":["::1"]}}),
+        json!({"remove":{"ipv6":["192.0.2.1"]}}),
+        json!({"add":{"ipv4_subnets":["192.0.2.1/33"]}}),
+        json!({"remove":{"ipv6_subnets":["2001:db8::/129"]}}),
+        json!({"add":{"ipv4":["192.0.2.1","192.0.2.1"]}}),
+        json!({"remove":{"ipv6":["2001:db8::1","2001:db8::1"]}}),
+        json!({"add":{"ipv4_subnets":["198.51.100.1/24","198.51.100.2/24"]}}),
+        json!({"add":{"ipv6_subnets":["2001:db8::1/64"]},"remove":{"ipv6_subnets":["2001:db8::2/64"]}}),
+        // Compact JSON fits the input cap while its DLEP encoding exceeds
+        // one Session Update. Reject before mutating either peer's state.
+        json!({"add":{"ipv6":(1..=3300).map(|n| format!("::{n:x}")).collect::<Vec<_>>()}}),
+    ] {
+        let result = submit(&router, &mut last, sid, invalid).await;
+        assert_eq!(result, command_result(last, "rejected", "invalid_input"));
+        // The high-water mark is shared with destination commands, even after
+        // invalid address input. Check deduplication before MAC validation.
+        let duplicate = parse(
+            &json!({"type":"destination_down","request":last,"session":sid.0,"mac":"invalid"})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            execute(&router, duplicate, &mut last).await["code"],
+            "request_id_not_increasing"
+        );
+    }
+    assert_eq!(
+        submit(&router, &mut last, SessionId(u64::MAX), json!({})).await["code"],
+        "stale_session"
+    );
+
+    let input = |n| {
+        json!({"ipv4":[format!("192.0.2.{n}")],"ipv6":[format!("2001:db8::{n}")],
+        "ipv4_subnets":[format!("198.51.{n}.7/24")],"ipv6_subnets":[format!("2001:db8:{n}::7/64")]})
+    };
+    let expected = |n| DestinationAddrs {
+        v4: vec![format!("192.0.2.{n}").parse().unwrap()],
+        v6: vec![format!("2001:db8::{n}").parse().unwrap()],
+        v4_subnets: vec![format!("198.51.{n}.0/24").parse().unwrap()],
+        v6_subnets: vec![format!("2001:db8:{n}::/64").parse().unwrap()],
+    };
+    for (n, (peer, session)) in peers.iter_mut().enumerate() {
+        assert_eq!(
+            submit(&router, &mut last, *session, json!({"add":input(n + 1)})).await["outcome"],
+            "accepted"
+        );
+        let message = read(peer).await;
+        assert_eq!(message.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            AddressChanges::from_message(&message),
+            AddressChanges {
+                added: expected(n + 1),
+                removed: Default::default()
+            }
+        );
+        // Withhold the reply. A second session still accepts its own update,
+        // while even an empty change on this busy session must be rejected.
+        assert_eq!(
+            submit(&router, &mut last, *session, json!({})).await["code"],
+            "busy"
+        );
+    }
+    while let Ok(event) = events.try_recv() {
+        // Retained SessionUp state can become visible before its public event
+        // and initial metrics. Neither should produce a completion notice.
+        assert!(
+            notice(event).is_none(),
+            "local acceptance is not completion"
+        );
+    }
+    for (n, (peer, session)) in peers.iter_mut().enumerate() {
+        reply(
+            peer,
+            &mut events,
+            *session,
+            [StatusCode::REQUEST_DENIED, StatusCode(42)][n],
+        )
+        .await;
+        // Nonfatal refusal preserves local state: repeating the same add is
+        // a no-op. The next wire message must contain only the removal.
+        assert_eq!(
+            submit(&router, &mut last, *session, json!({"add":input(n + 1)})).await["outcome"],
+            "accepted"
+        );
+        assert_eq!(
+            submit(&router, &mut last, *session, json!({"remove":input(n + 1)})).await["outcome"],
+            "accepted"
+        );
+        let message = read(peer).await;
+        assert_eq!(message.message_type, MessageType::SESSION_UPDATE);
+        assert_eq!(
+            AddressChanges::from_message(&message),
+            AddressChanges {
+                added: Default::default(),
+                removed: expected(n + 1)
+            }
+        );
+        reply(peer, &mut events, *session, StatusCode::SUCCESS).await;
+    }
+    assert!(events.try_recv().is_err());
+    assert!(
+        router
+            .state()
+            .borrow()
+            .sessions
+            .values()
+            .all(|s| s.peer_addresses.is_empty())
+    );
+    drop(peers);
+    wait_state(&router, |s| s.sessions.is_empty()).await;
+    assert_eq!(
+        submit(&router, &mut last, sid, json!({})).await["code"],
+        "stale_session"
+    );
+    router.shutdown().await.unwrap();
 }

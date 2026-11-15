@@ -7,9 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use dlep_core::MacAddress;
 use dlep_daemon::{
-    CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs, DestinationEvent,
-    DestinationPhase, LinkCharacteristics, LinkMetrics, RouterAdapterConfig, RouterDaemon,
-    SessionCommand, SessionPhase,
+    AddressChanges, CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs,
+    DestinationEvent, DestinationPhase, LinkCharacteristics, LinkMetrics, RouterAdapterConfig,
+    RouterDaemon, SessionCommand, SessionPhase,
 };
 use dlep_ext::SessionId;
 use serde::Deserialize;
@@ -29,6 +29,14 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Inbound {
     Resync,
+    SessionAddresses {
+        request: u64,
+        session: u64,
+        #[serde(default)]
+        add: Addresses,
+        #[serde(default)]
+        remove: Addresses,
+    },
     DestinationAnnounce {
         request: u64,
         session: u64,
@@ -49,6 +57,42 @@ enum Inbound {
     Unknown,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Addresses {
+    ipv4: Vec<String>,
+    ipv6: Vec<String>,
+    ipv4_subnets: Vec<String>,
+    ipv6_subnets: Vec<String>,
+}
+
+impl Addresses {
+    fn parse(&self) -> Result<DestinationAddrs> {
+        Ok(DestinationAddrs {
+            v4: self
+                .ipv4
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<_, _>>()?,
+            v6: self
+                .ipv6
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<_, _>>()?,
+            v4_subnets: self
+                .ipv4_subnets
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<_, _>>()?,
+            v6_subnets: self
+                .ipv6_subnets
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Requested {
@@ -66,6 +110,7 @@ fn parse(line: &str) -> Result<Inbound> {
         .context("message needs a string type")?;
     let fields: &[&str] = match kind {
         "resync" => &["type"],
+        "session_addresses" => &["type", "request", "session", "add", "remove"],
         "destination_announce" | "destination_down" => &["type", "request", "session", "mac"],
         "link_request" => &["type", "request", "session", "mac", "requested"],
         _ => return Ok(Inbound::Unknown),
@@ -258,23 +303,19 @@ fn rejection(reason: CommandError) -> &'static str {
 }
 
 async fn execute(daemon: &RouterDaemon, message: Inbound, last_request: &mut u64) -> Value {
-    let (request, session, address, requested, announce) = match message {
-        Inbound::DestinationAnnounce {
-            request,
-            session,
-            mac,
-        } => (request, session, mac, None, true),
-        Inbound::DestinationDown {
-            request,
-            session,
-            mac,
-        } => (request, session, mac, None, false),
-        Inbound::LinkRequest {
-            request,
-            session,
-            mac,
-            requested,
-        } => (request, session, mac, Some(requested), false),
+    let (request, session) = match &message {
+        Inbound::SessionAddresses {
+            request, session, ..
+        }
+        | Inbound::DestinationAnnounce {
+            request, session, ..
+        }
+        | Inbound::DestinationDown {
+            request, session, ..
+        }
+        | Inbound::LinkRequest {
+            request, session, ..
+        } => (*request, SessionId(*session)),
         _ => unreachable!("only commands are executed"),
     };
     // A single high-water mark prevents re-execution without an ever-growing
@@ -283,32 +324,51 @@ async fn execute(daemon: &RouterDaemon, message: Inbound, last_request: &mut u64
         return command_result(request, "rejected", "request_id_not_increasing");
     }
     *last_request = request;
-    let Ok(mac) = mac(&address) else {
-        return command_result(request, "rejected", "invalid_mac");
-    };
-    let session = SessionId(session);
-    let result = tokio::time::timeout(ACCEPT_TIMEOUT, async {
-        if let Some(requested) = requested {
-            daemon
-                .request_link_characteristics(
-                    session,
-                    mac.into(),
-                    LinkCharacteristics {
-                        current_data_rate_rx_bps: requested.current_data_rate_rx_bps,
-                        current_data_rate_tx_bps: requested.current_data_rate_tx_bps,
-                        latency: requested.latency_us.map(Duration::from_micros),
-                    },
-                )
-                .await
-        } else if announce {
-            daemon
-                .send_command_to(session, SessionCommand::AnnounceDestination { mac })
-                .await
-        } else {
-            daemon.drop_destination(session, mac.into()).await
+    let result = match message {
+        Inbound::SessionAddresses { add, remove, .. } => {
+            let (Ok(added), Ok(removed)) = (add.parse(), remove.parse()) else {
+                return command_result(request, "rejected", "invalid_input");
+            };
+            tokio::time::timeout(
+                ACCEPT_TIMEOUT,
+                daemon.update_session_addresses(session, AddressChanges { added, removed }),
+            )
+            .await
         }
-    })
-    .await;
+        command => {
+            let (address, requested, announce) = match command {
+                Inbound::DestinationAnnounce { mac, .. } => (mac, None, true),
+                Inbound::DestinationDown { mac, .. } => (mac, None, false),
+                Inbound::LinkRequest { mac, requested, .. } => (mac, Some(requested), false),
+                _ => unreachable!("only destination commands remain"),
+            };
+            let Ok(mac) = mac(&address) else {
+                return command_result(request, "rejected", "invalid_mac");
+            };
+            tokio::time::timeout(ACCEPT_TIMEOUT, async {
+                if let Some(requested) = requested {
+                    daemon
+                        .request_link_characteristics(
+                            session,
+                            mac.into(),
+                            LinkCharacteristics {
+                                current_data_rate_rx_bps: requested.current_data_rate_rx_bps,
+                                current_data_rate_tx_bps: requested.current_data_rate_tx_bps,
+                                latency: requested.latency_us.map(Duration::from_micros),
+                            },
+                        )
+                        .await
+                } else if announce {
+                    daemon
+                        .send_command_to(session, SessionCommand::AnnounceDestination { mac })
+                        .await
+                } else {
+                    daemon.drop_destination(session, mac.into()).await
+                }
+            })
+            .await
+        }
+    };
     match result {
         Ok(Ok(())) => command_result(request, "accepted", "accepted"),
         Err(_) => command_result(request, "unknown", "acceptance_timeout"),
