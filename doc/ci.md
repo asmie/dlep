@@ -100,10 +100,20 @@ TTL to 255 because dlepard's TCP proxy does not set a socket TTL. The host's
 setting is unaffected, and our modem retains strict GTSM enforcement. The Python
 runner checks the namespace, TTL setting, source revision, and tracked-file
 cleanliness before starting either peer.
+For discovery cases, the harness also sets multicast TTL 255 and enables
+multicast loopback on dlepard's UDP socket. Its upstream defaults are TTL 1 and
+loopback disabled. These are socket settings for this isolated local fixture;
+the upstream session, codec, and UDP proxy source files are unchanged.
 
-Two scenarios verify initialization and exact session metrics, Destination
+Four scenarios verify initialization and exact session metrics, Destination
 Up/Update/Down and their metrics, bidirectional heartbeats, and termination
-initiated by each participant. Address checks cover a router-advertised IPv4
+initiated by each participant: two use static endpoints and two use multicast
+discovery. Discovery cases provide no TCP address or port to dlepard. It must
+learn the modem's dynamically allocated TCP port from the Peer Offer and then
+complete the same session checks. UDP PCAPs verify the multicast group, ephemeral
+request source, offer source/destination ports, TTL 255, and exact advertised
+connection point. Discovery artifacts use the `discovery-` prefix, with a
+separate `-discovery.pcap` for UDP. Address checks cover a router-advertised IPv4
 subnet during initialization and a modem-advertised IPv4 address and subnet in
 Destination Up. Assertions inspect dlepard's information base, our modem's
 address/lifecycle events, and the address items in the reassembled capture.
@@ -113,10 +123,12 @@ make failures fail the job. Logs, loopback Ethernet PCAP files, and a successful
 run's `summary.json` are saved in `target/interop-dlepard/` and uploaded even if
 the scenario fails (a failed run has no success summary).
 
-This is evidence for static IPv4 TCP sessions with TLS disabled and extensions
-disabled. It does not establish discovery, IPv6 transport, TLS, our router's compatibility
+This is evidence for static and multicast-discovered IPv4 TCP sessions with TLS
+and extensions disabled. It does not establish IPv6 transport, TLS, our router's compatibility
 with an independent modem, or arbitrary implementations. The namespace TTL
-setting is necessary for this peer; this is not an out-of-box deployment test.
+setting and explicit multicast socket options are necessary for this peer;
+this is not an out-of-box deployment test. Each scenario uses a separate asyncio
+event loop because the upstream UDP proxy stops its loop when closed.
 The pinned dlepard session has no Session Update or Destination Announce
 handler. Its information base stores only IPv4 address data, ignores removal
 flags, and replaces the entire destination entry on Destination Update. The
@@ -148,13 +160,16 @@ rebuilding in a compatible environment.
 
 The runtime container has no external network, a read-only repository mount,
 and a writable `target/interop-ll-dlep/` artifact mount. It drops capabilities
-except NET_RAW (strict GTSM and capture), NET_ADMIN (loopback address setup), and
+except NET_RAW (strict GTSM and capture), NET_ADMIN (isolated interface setup), and
 DAC_OVERRIDE (writing the mounted artifact directory). It adds `fe80::1/64` to
 the container's loopback interface and uses its numeric scope ID in the router
 endpoint. The pinned peer requires a link-local address for IPv6 sessions.
 It sets IPv4 TTL and the IPv6 loopback hop limit to 255 only in the container:
 LL-DLEP configures TCP hops after acceptance, so its SYN-ACK otherwise uses the
 system default. Rebuild an older image to include `iproute2` for address setup.
+Discovery diagnostics additionally create a multicast-capable `dlep-interop`
+dummy interface with `192.0.2.1` and scoped `fe80::2`. All interfaces and routes
+remain inside the networkless container.
 The host's network settings are unaffected. Artifacts can be root-owned locally;
 CI returns their ownership before upload.
 
@@ -196,8 +211,8 @@ behaviors required explicit configuration, without relaxing our validation:
   Capture assertions require the actual termination request and response in
   all four scenarios, so a TCP disconnect alone cannot pass the test.
 
-Discovery, TLS, extension negotiation, and interoperability with arbitrary
-peers remain outside these scenarios. This is not a stock-configuration
+Successful discovery, TLS, extension negotiation, and interoperability with
+arbitrary peers remain outside these four session scenarios. This is not a stock-configuration
 deployment test; the TTL/hop-limit settings, corrected core profile, and explicit link
 reply matter. The PCAP checks reconstruct each direction's TCP payload, reject
 gaps/conflicting retransmissions and truncated messages/data items, and require
@@ -210,10 +225,31 @@ these fixtures generate and rejects IPv4 fragments and IPv6 extension headers.
 The IPv6 scenarios use loopback link-local addresses; global IPv6 addresses and
 operation across physical interfaces remain outside this check.
 
-The shared capture parser has twelve network-free regression tests for segmented
+Two additional discovery diagnostics run our real router's discovery API against
+the same pinned modem over IPv4 and IPv6. Both reproduce an upstream limitation:
+LL-DLEP sends the Peer Offer **to the configured discovery port**, from an
+ephemeral source port, instead of returning it to the requesting socket from
+the discovery port. See the
+[pinned send implementation](https://github.com/mit-ll/LL-DLEP/blob/184e148ae4747dee11263a7ccedf952e36861ec0/PeerDiscovery.cpp#L591)
+and [verified RFC erratum 6472](https://www.rfc-editor.org/errata/eid6472).
+
+The diagnostics require captured requests and replies with those exact port
+properties, a valid connection point, TTL/hop limit 255, `NO_OFFER` from our
+router, and no TCP packets. A silent or broken fixture cannot satisfy them.
+`summary.json` records them under `discovery_probes` with `result: incompatible`,
+separately from successful sessions. Artifacts use `ipv4-discovery` and
+`ipv6-discovery` prefixes. UDP captures include outgoing multicast and may
+contain loopback copies, so request/offer counts are capture records rather than
+unique transmissions. No relay, peer source patch, or alternate router bind port
+is used to turn these failures into a compatibility claim.
+
+The shared capture parser has twenty network-free regression tests for segmented
 and retransmitted TCP data, missing peers/SYNs, gaps, conflicting retransmissions,
 truncation, malformed IP/TCP headers, low TTL/hop limits, mismatched IP endpoints,
-and invalid address items across both IP families. CI runs them in the formatting/workflow
+and invalid address items across both IP families. UDP cases cover malformed
+signal/UDP lengths and TLVs, missing requests/offers, wrong multicast/reply
+endpoints, incorrect connection points, and legacy-port diagnostics that must
+fail the successful-exchange validator. CI runs them in the formatting/workflow
 job. Run them locally with:
 
 ```sh

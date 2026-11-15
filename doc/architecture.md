@@ -448,12 +448,16 @@ recollected for these checkpoints.
 | CLI | binary unit tests and `crates/dlep-{router,modem}/tests/` | Configuration checks, overrides, signals, reconnection/backoff, event-loss recovery, and concurrent connection scheduling. |
 
 A separate CI job now checks our modem against the pinned, unmodified session
-and codec from Rohde & Schwarz dlepard. Two static IPv4 plaintext scenarios
+and codec from Rohde & Schwarz dlepard. Four IPv4 plaintext scenarios, two static
+and two multicast-discovered,
 cover initialization metrics and router IPv4 subnets, Destination Up IPv4
 addresses/subnets, Destination Up/Update/Down metrics, heartbeats, and
 termination initiated by either side. Loopback PCAPs and both peers' logs are
 retained. Strict GTSM stays enabled; the disposable namespace's default TTL is
 set to 255 because the independent router does not configure it itself.
+Discovery cases configure its UDP socket for multicast TTL 255 and local
+loopback. The modem TCP endpoint must come from the offer, and independent UDP
+capture checks verify the reply ports and advertised endpoint.
 See [reproduction and limits](ci.md#independent-router-interoperability).
 An additional pinned MIT LL-DLEP job checks our router against an independent
 modem in a networkless container. Four scenarios exercise IPv4 and scoped
@@ -469,13 +473,17 @@ experimental items and adds the standard Shutting Down status omitted upstream;
 complete link replies are supplied through the peer's documented CLI. TCP
 capture checks require actual termination responses and bidirectional
 heartbeats. See [setup and qualifications](ci.md#independent-modem-interoperability).
-Neither peer check establishes discovery, TLS, extension
+Neither peer check establishes TLS, extension
 negotiation, or stock-configuration compatibility. The pinned dlepard does not
 implement Session Update or Announce handlers and has limited IPv4 address
 state; those gaps are explicit in the harness summary and CI documentation.
 LL-DLEP's IPv6 sessions use a container-local loopback address, requiring a scope
 ID and namespace hop-limit configuration. Global IPv6 and physical interfaces
 remain unverified by these scenarios.
+Separate LL-DLEP IPv4/IPv6 discovery diagnostics capture its incompatible offer
+ports and require our router to report no offer without opening TCP. They are
+recorded as limitations, not successful interoperability sessions. See the
+[diagnostic details](ci.md#independent-modem-interoperability).
 
 A bounded churn regression now keeps each pair of daemons alive through 100
 IPv4 and 100 IPv6 sessions, alternating termination initiators with strict GTSM
@@ -1231,6 +1239,18 @@ The order of work was:
     scenarios pass. Release commands now live in the tracked CI guide.
     Discovery, TLS, global IPv6, and physical-link
     interoperability remain outside this evidence.
+
+62. Independent discovery coverage and diagnostics. **Done** — dlepard now
+    discovers our modem over IPv4 multicast before completing the destination
+    lifecycle and both termination directions. No TCP endpoint is preconfigured;
+    the upstream socket receives explicit multicast TTL/loopback settings.
+    Independent UDP captures verify signal framing, reply ports, and advertised
+    connection points. LL-DLEP probes over IPv4/IPv6 confirm incompatible reply
+    ports, no delivered offer, and no TCP session; summaries keep these expected
+    limitations separate from passing session scenarios. Twenty capture-parser
+    regressions exercise both IP families. No production protocol changes or
+    peer source patches were needed. IPv6 discovery interoperability and TLS
+    interoperability remain unverified.
 
 ---
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Independent dlepard checks now discover our modem over IPv4 multicast and
+  complete both termination directions without a configured TCP endpoint.
+  The harness configures multicast TTL 255 and local loopback on the upstream
+  socket. UDP captures verify reply ports and the advertised connection point.
+  Separate IPv4/IPv6 probes document the pinned LL-DLEP modem's incompatible
+  discovery reply ports; those probes are not successful session scenarios.
 - Independent LL-DLEP modem checks now run over IPv4 and scoped link-local IPv6
   TCP, including both termination directions, address changes, and Announce
   success/denial. The capture parser verifies both IP families, TTL/hop limits,

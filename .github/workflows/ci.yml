@@ -88,7 +88,7 @@ jobs:
           git clone --no-checkout https://github.com/Rohde-Schwarz/dlepard.git "$RUNNER_TEMP/dlepard"
           git -C "$RUNNER_TEMP/dlepard" checkout --detach 9300773a566290897839b845c4ec9f2feba3e93b
       - run: cargo build -p dlep-daemon --example interop_modem --locked
-      - name: Exercise destination lifecycle, heartbeats, and both termination directions
+      - name: Exercise static and discovered sessions with both termination directions
         run: |
           sudo bash .github/scripts/interop-dlepard.sh --peer-source "$RUNNER_TEMP/dlepard"
       - name: Return interoperability artifacts to the runner user
@@ -117,7 +117,7 @@ jobs:
       - run: cargo build -p dlep-daemon --example interop_router --locked
       - name: Build pinned independent modem
         run: docker build -t dlep-interop-ll:184e148 .github/interop/ll-dlep
-      - name: Exercise router against independent modem over IPv4 and IPv6
+      - name: Exercise IPv4/IPv6 sessions and diagnose discovery reply ports
         run: bash .github/scripts/interop-ll-dlep.sh
       - name: Return interoperability artifacts to the runner user
         if: always()

@@ -10,7 +10,7 @@ import socket
 import subprocess
 import xml.etree.ElementTree as ET
 
-from interop_common import address_items, capture, until, wire_records
+from interop_common import address_items, capture, discovery_exchange, discovery_records, until, wire_records
 
 REVISION = "184e148ae4747dee11263a7ccedf952e36861ec0"
 PEER = pathlib.Path("/opt/ll-dlep")
@@ -266,6 +266,60 @@ async def scenario(output, initiator, ip_version):
             await packet_task
 
 
+async def discovery_probe(output, ip_version):
+    """Record the pinned peer's incompatible UDP reply ports without a relay."""
+    name = f"ipv{ip_version}-discovery"
+    address = "192.0.2.1" if ip_version == 4 else "fe80::2"
+    group = "224.0.0.117" if ip_version == 4 else "ff02::1:7"
+    counts = {"udp_packets": 0, "wrong_ttl": 0}
+    tcp_counts = {"tcp_packets": 0, "wrong_ttl": 0}
+    tasks = [asyncio.create_task(capture(output / f"{name}.pcap", counts, ip_version,
+                                        protocol=17, interface=None, outgoing=True)),
+             asyncio.create_task(capture(output / f"{name}-tcp.pcap", tcp_counts, ip_version))]
+    await asyncio.sleep(0)
+    for task in tasks:
+        if task.done():
+            task.result()
+    modem = router = None
+    try:
+        modem = await Process.start([
+            "/opt/ll-dlep-build/Dlep", "local-type", "modem", "discovery-enable", "1",
+            "discovery-iface", "dlep-interop", "discovery-mcast-address", group,
+            "discovery-port", "49854", "discovery-ttl", "255",
+            "session-address", address, "session-port", "4854", "session-ttl", "255",
+            "protocol-config-file", str(output / "core-protocol.xml"),
+            "protocol-config-schema", str(PEER / "config/protocol/protocol-config.xsd"),
+            "log-file", str(output / f"{name}-peer.log"), "log-level", "1",
+        ], output / f"{name}-modem.log")
+        await modem.expect("DlepInit succeeded")
+        router = await Process.start([
+            "/work/target/debug/examples/interop_router", "--discover", address, "dlep-interop",
+        ], output / f"{name}-router.log")
+        await router.expect("NO_OFFER\n")
+        await router.finished()
+        assert "UP\n" not in router.text() and "DISCOVERED " not in router.text()
+        await modem.command("quit")
+        await modem.finished()
+        for task in tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        signals = discovery_records(output / f"{name}.pcap", ip_version)
+        exchange = discovery_exchange(signals, address, 4854, legacy_ports=True)
+        assert counts["wrong_ttl"] == 0 and tcp_counts["tcp_packets"] == 0
+        return {"ip_version": ip_version, "result": "incompatible", **exchange,
+                "reason": "Peer Offer sent from an ephemeral port to the discovery port",
+                "router_result": "NO_OFFER", **counts, "tcp_packets": tcp_counts["tcp_packets"]}
+    finally:
+        for peer in [router, modem]:
+            if peer:
+                await peer.close()
+        for task in tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
 async def run(output):
     # Upstream's example profile includes experimental extensions, whose metric
     # defaults are emitted even when they were not negotiated. Select core only
@@ -283,8 +337,10 @@ async def run(output):
     for ip_version in [4, 6]:
         for initiator in ["router", "modem"]:
             results.append(await scenario(output, initiator, ip_version))
+    probes = [await discovery_probe(output, ip_version) for ip_version in [4, 6]]
     summary = {"peer": "mit-ll/LL-DLEP", "revision": REVISION,
-               "transport": "static IPv4/IPv6 TCP, strict GTSM, no TLS", "scenarios": results}
+               "transport": "static IPv4/IPv6 TCP, strict GTSM, no TLS", "scenarios": results,
+               "discovery_probes": probes}
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 
@@ -309,6 +365,14 @@ def main():
     # Pinned LL-DLEP rejects non-link-local IPv6 session addresses. This runs
     # only after the networkless-container check, never on a host interface.
     subprocess.run(["ip", "-6", "addr", "replace", "fe80::1/64", "dev", "lo", "nodad"], check=True)
+    # A disposable multicast-capable interface exercises real discovery egress.
+    for command in [
+        ["link", "add", "dlep-interop", "type", "dummy"],
+        ["addr", "add", "192.0.2.1/24", "dev", "dlep-interop"],
+        ["link", "set", "dlep-interop", "up", "multicast", "on"],
+        ["-6", "addr", "add", "fe80::2/64", "dev", "dlep-interop", "nodad"],
+    ]:
+        subprocess.run(["ip", *command], check=True)
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "summary.json").unlink(missing_ok=True)
     asyncio.run(run(args.output))

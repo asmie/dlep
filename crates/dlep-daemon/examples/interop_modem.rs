@@ -19,6 +19,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.shared.network.bind_addr = "127.0.0.1".parse()?;
     config.shared.network.tcp_port = 0;
     config.shared.network.discovery_port = 0;
+    if let Some(mode) = std::env::args().nth(1) {
+        if mode != "--discovery" {
+            return Err(format!("unknown fixture mode: {mode}").into());
+        }
+        config.shared.network.discovery_port = 49854;
+        config.shared.network.interface = Some("lo".into());
+    }
     config.shared.network.use_tls = false;
     // Strict GTSM remains enabled, including the privileged packet monitor.
     config.shared.timers.heartbeat_interval_ms = 1_000;

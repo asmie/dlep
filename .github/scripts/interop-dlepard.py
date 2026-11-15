@@ -11,10 +11,11 @@ import json
 import logging
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 
-from interop_common import address_items, capture, until, wire_records
+from interop_common import address_items, capture, discovery_exchange, discovery_records, until, wire_records
 
 REVISION = "9300773a566290897839b845c4ec9f2feba3e93b"
 
@@ -31,18 +32,25 @@ class Heartbeats(logging.Handler):
         self.received += message == "-> received Heartbeat Message"
 
 
-async def scenario(args, initiator):
+async def scenario(args, initiator, discovery):
     from dlepard.dlepsession import DLEPSession, DlepSessionState
 
     lines = []
+    name = f"discovery-{initiator}" if discovery else initiator
     counts = {"tcp_packets": 0, "wrong_ttl": 0}
-    capture_task = asyncio.create_task(capture(args.output / f"{initiator}.pcap", counts))
+    capture_task = asyncio.create_task(capture(args.output / f"{name}.pcap", counts))
+    udp_counts = {"udp_packets": 0, "wrong_ttl": 0}
+    udp_task = (asyncio.create_task(capture(args.output / f"{name}-discovery.pcap", udp_counts,
+                                          protocol=17, outgoing=True)) if discovery else None)
     await asyncio.sleep(0)  # Bind the capture socket before either peer starts.
     if capture_task.done():
         capture_task.result()
-    stderr = (args.output / f"{initiator}-modem.stderr").open("w")
+    if udp_task and udp_task.done():
+        udp_task.result()
+    stderr = (args.output / f"{name}-modem.stderr").open("w")
     process = await asyncio.create_subprocess_exec(
-        str(args.modem), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        str(args.modem), *(["--discovery"] if discovery else []),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=stderr,
     )
     session = None
@@ -50,7 +58,7 @@ async def scenario(args, initiator):
     logging.getLogger("DLEPard").addHandler(beats)
 
     async def read_output():
-        with (args.output / f"{initiator}-modem.stdout").open("w") as output:
+        with (args.output / f"{name}-modem.stdout").open("w") as output:
             async for line in process.stdout:
                 line = line.decode().strip()
                 lines.append(line)
@@ -69,17 +77,29 @@ async def scenario(args, initiator):
         await until(lambda: any(line.startswith("READY ") for line in lines), "modem listener")
         endpoint = next(line.split()[1] for line in lines if line.startswith("READY "))
         host, port = endpoint.rsplit(":", 1)
+        tcp = {"ipv4subnets": ["198.51.100.0/24"]}
+        if not discovery:
+            tcp.update(ipv4addr=host, port=int(port))
         session = DLEPSession({
             "local_ipv4addr": ["127.0.0.1"],
-            "discovery": {"disabled": True},
-            "tcp": {"127.0.0.1": {"ipv4addr": host, "port": int(port),
-                                  "ipv4subnets": ["198.51.100.0/24"]}},
+            "discovery": ({"ipv4addr": "224.0.0.117", "port": 49854}
+                          if discovery else {"disabled": True}),
+            "tcp": {"127.0.0.1": tcp},
             "heartbeat_interval_ms": 6000,
             "enable_lid_ext": False,
         }, "127.0.0.1", loop=asyncio.get_running_loop())
+        if discovery:
+            assert session.tcp_proxy is None and session.peer_tcp_port is None
+            # Configure the upstream socket for strict GTSM and a local fixture.
+            # Its defaults are multicast TTL 1 and loopback disabled. Session
+            # and codec sources remain unchanged; the endpoint must come from UDP.
+            session.udp_proxy.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+            session.udp_proxy.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
         await session.start()
         await until(lambda: session.state == DlepSessionState.IN_SESSION_STATE and "UP" in lines,
                     "both peers completing initialization")
+        assert str(session.peer_information_base.ipv4_address) == host
+        assert session.peer_tcp_port == int(port)
         peer = session.peer_information_base
         assert (peer.max_datarate_rx, peer.max_datarate_tx, peer.curr_datarate_rx,
                 peer.curr_datarate_tx, peer.latency) == (10_000_000, 20_000_000, 5_000_000, 7_000_000, 2500)
@@ -124,19 +144,29 @@ async def scenario(args, initiator):
         capture_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await capture_task
-        records = wire_records(args.output / f"{initiator}.pcap", int(port))
+        records = wire_records(args.output / f"{name}.pcap", int(port))
         initialization = [m for m in records["router"] if m["type"] == 1]
         destinations = [m for m in records["modem"] if m["type"] == 7]
         assert len(initialization) == len(destinations) == 1
         assert address_items(initialization[0]) == [(10, 1, "198.51.100.0/24")]
         assert address_items(destinations[0]) == [(8, 1, "192.0.2.10"), (10, 1, "198.51.10.0/24")]
-        return {"initiator": initiator, "heartbeats_sent": beats.sent,
+        discovery_result = None
+        if udp_task:
+            udp_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await udp_task
+            discovery_result = discovery_exchange(
+                discovery_records(args.output / f"{name}-discovery.pcap"), host, int(port))
+            assert udp_counts["udp_packets"] > 0 and udp_counts["wrong_ttl"] == 0
+        return {"mode": "discovery" if discovery else "static", "discovery": discovery_result,
+                "initiator": initiator, "heartbeats_sent": beats.sent,
                 "address_checks": ["router initialization IPv4 subnet",
                                    "Destination Up IPv4 address and subnet"],
                 "heartbeats_received": beats.received, **counts, "result": "passed"}
     finally:
         logging.getLogger("DLEPard").removeHandler(beats)
         if session:
+            session.running = False
             for timer in [session.heartbeat_timer, session.heartbeat_watchdog]:
                 if timer:
                     timer.stop()
@@ -150,9 +180,17 @@ async def scenario(args, initiator):
         capture_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await capture_task
+        if udp_task:
+            udp_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await udp_task
+        # Upstream connection_lost stops its event loop. Each scenario therefore
+        # owns an asyncio.run loop, and this is deliberately its final operation.
+        if session and session.udp_proxy and session.udp_proxy.transport:
+            session.udp_proxy.transport.close()
 
 
-async def run(args):
+async def checked_scenario(args, initiator, discovery):
     errors = []
     loop = asyncio.get_running_loop()
 
@@ -161,12 +199,16 @@ async def run(args):
         event_loop.default_exception_handler(context)
 
     loop.set_exception_handler(failed_callback)
-    results = []
-    for initiator in ["modem", "router"]:
-        results.append(await scenario(args, initiator))
+    result = await scenario(args, initiator, discovery)
     assert not errors, f"independent peer raised asynchronous errors: {errors}"
+    return result
+
+
+def run(args):
+    results = [asyncio.run(checked_scenario(args, initiator, discovery))
+               for discovery in [False, True] for initiator in ["modem", "router"]]
     report = {"peer": "Rohde-Schwarz/dlepard", "revision": REVISION,
-              "transport": "static IPv4 TCP, strict GTSM, no TLS", "scenarios": results,
+              "transport": "static and discovered IPv4 TCP, strict GTSM, no TLS", "scenarios": results,
               "limitations": ["no Session Update or Destination Announce handler",
                               "IPv4-only address information base; removal flags are not applied",
                               "Destination Update replaces the information-base entry"]}
@@ -199,7 +241,7 @@ def main():
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(args.peer_source / "src"))
     logging.basicConfig(filename=args.output / "router.log", filemode="w", level=logging.DEBUG)
-    asyncio.run(run(args))
+    run(args)
 
 
 if __name__ == "__main__":

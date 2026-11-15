@@ -7,6 +7,7 @@ exec docker run --rm --network none --cap-drop ALL \
     --security-opt no-new-privileges --sysctl net.ipv4.ip_default_ttl=255 \
     --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
     --sysctl net.ipv6.conf.lo.hop_limit=255 \
+    --sysctl net.ipv6.conf.default.hop_limit=255 \
     --mount "type=bind,src=$PWD,dst=/work,readonly" \
     --mount "type=bind,src=$PWD/target/interop-ll-dlep,dst=/artifacts" \
     dlep-interop-ll:184e148 \

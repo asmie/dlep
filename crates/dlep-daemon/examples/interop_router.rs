@@ -55,23 +55,41 @@ fn address_set(n: u8) -> DestinationAddrs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = std::env::args()
-        .nth(1)
-        .ok_or("missing modem endpoint")?
-        .parse()?;
     let mut config = RouterConfig::default();
+    let mut args = std::env::args().skip(1);
+    let mode = args.next().ok_or("missing modem endpoint or --discover")?;
+    let endpoint = if mode == "--discover" {
+        config.shared.network.bind_addr =
+            args.next().ok_or("missing discovery address")?.parse()?;
+        config.shared.network.interface = Some(args.next().ok_or("missing discovery interface")?);
+        config.shared.network.discovery_port = 49854;
+        config.shared.timers.discovery_interval_ms = 1_000;
+        None
+    } else {
+        Some(mode.parse()?)
+    };
+    if args.next().is_some() {
+        return Err("unexpected fixture argument".into());
+    }
     config.shared.network.use_tls = false;
     config.shared.timers.heartbeat_interval_ms = 1_000;
     config.shared.timers.termination_timeout_ms = Some(2_000);
     let router = RouterDaemon::builder().config(config).spawn().await?;
     let mut events = router.subscribe();
     let (up_tx, up_rx) = tokio::sync::oneshot::channel();
+    let (offer_tx, offer_rx) = tokio::sync::oneshot::channel();
     let destination = DestinationId(MacAddress::new_eui48([2, 0, 0, 0, 0, 1]));
     let unknown = DestinationId(MacAddress::new_eui48([2, 0, 0, 0, 0, 2]));
     let event_task = tokio::spawn(async move {
         let mut up_tx = Some(up_tx);
+        let mut offer_tx = Some(offer_tx);
         while let Ok(event) = events.recv().await {
             match event {
+                DaemonEvent::PeerDiscovered(offer) => {
+                    if let Some(tx) = offer_tx.take() {
+                        let _ = tx.send(offer);
+                    }
+                }
                 DaemonEvent::SessionUp { session_id, .. } => {
                     up_tx.take().expect("one session").send(session_id).unwrap();
                     report("UP");
@@ -130,7 +148,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    router.connect_static(endpoint).await?;
+    if let Some(endpoint) = endpoint {
+        router.connect_static(endpoint).await?;
+    } else {
+        router.start_discovery().await?;
+        match tokio::time::timeout(Duration::from_secs(3), offer_rx).await {
+            Ok(offer) => {
+                let connected = router.connect_discovered(&offer?).await?;
+                report(&format!("DISCOVERED {connected}"));
+            }
+            Err(_) => {
+                router.shutdown().await?;
+                event_task.await?;
+                report("NO_OFFER");
+                return Ok(());
+            }
+        }
+    }
     let session_id = tokio::time::timeout(Duration::from_secs(10), up_rx).await??;
     let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
