@@ -312,7 +312,8 @@ async fn adapter_destination_reaches_router_and_grants_link_request() {
         .unwrap();
     assert_eq!(
         sync["sessions"],
-        serde_json::json!([{ "session": 1, "peer": up["peer"] }])
+        serde_json::json!([{ "session": 1, "peer": up["peer"],
+            "addresses":{"ipv4":[],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]} }])
     );
     let request = messages
         .iter()

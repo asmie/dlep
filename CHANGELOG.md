@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Radio `session_sync` entries include each router's complete IPv4/IPv6 address
+  and subnet sets. Address changes refresh the snapshot even when membership
+  is unchanged. Retained state restores addresses after event loss and on
+  `resync`, without replaying destinations or applying stale address events.
 - Router adapters can advertise local IPv4/IPv6 addresses and attached subnets
   through targeted `session_addresses` commands with `add`/`remove` deltas.
   Commands validate and canonicalize addresses, share request-ID deduplication,

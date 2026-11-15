@@ -27,7 +27,8 @@ a file. It does not run the adapter.
   line with a `"type"` field. Adapter output sent to the modem is limited to
   64 KiB per line, excluding the newline; blank lines are ignored. Flush standard
   output after each line. Modem notices can exceed this limit when JSON escaping
-  expands a peer's status text, so do not apply it to the adapter's stdin.
+  expands a peer's status text or a session snapshot contains many addresses,
+  so do not apply it to the adapter's stdin.
 - The adapter must exit when its standard input closes. On shutdown the modem
   terminates its DLEP sessions, closes the adapter's input, and kills the
   adapter if it is still running two seconds later.
@@ -43,7 +44,8 @@ a file. It does not run the adapter.
   running. Keep reading stdin while applying slow radio changes so ordinary
   notices do not fill the pipe.
 - Unknown message types are ignored in both directions, so adapters must ignore
-  types they do not recognize. Unknown fields in known messages are errors.
+  types they do not recognize. Unknown fields in known messages sent by the
+  adapter are errors. Adapters should tolerate added fields in modem notices.
 
 ## Values
 
@@ -67,7 +69,7 @@ a file. It does not run the adapter.
 
 | `type` | Fields | Effect |
 | --- | --- | --- |
-| `resync` | none | Requests a fresh `session_sync` membership notice, including unchanged or empty membership. |
+| `resync` | none | Requests a fresh `session_sync` with membership and router addresses, even when unchanged or empty. |
 | `destination_up` | `mac`, optional `metrics`, `addresses` | Reports a new destination to every router. Omitted metrics take the current session-wide values. |
 | `destination_update` | `mac`, `metrics` | Sends changed metrics for a known destination. |
 | `destination_addresses` | `mac`, optional `add`, `remove` (addresses) | Sends address and subnet changes. |
@@ -109,13 +111,13 @@ Replay uses retained daemon session state and recovers even if the internal
 event subscriber falls behind. It retries busy session initialization, preserves
 existing per-session destination metrics, and respects a router's withdrawal.
 Closed sessions release pending adapter requests and command retries.
-Send `{"type":"resync"}` whenever the adapter needs a fresh session list. Each
-request produces `session_sync` even if membership is unchanged or empty, and
-takes no additional fields. It does not create an `event_gap` or re-announce
-destinations to existing sessions. Keep answering pending link requests during
-refresh; it does not cancel them. Newly observed sessions still receive normal
-replay. Membership cannot reconstruct lost responses or destination interest
-history.
+Send `{"type":"resync"}` whenever the adapter needs a fresh session list and
+router address snapshot. Each request produces `session_sync` even if membership
+is unchanged or empty, and takes no additional fields. It does not create an
+`event_gap` or re-announce destinations to existing sessions. Keep answering
+pending link requests during refresh; it does not cancel them. Newly observed
+sessions still receive normal replay. Membership cannot reconstruct lost
+responses or destination interest history.
 Default replay preserves the session's live destination values within one
 command; it does not restore metrics from the earlier membership snapshot.
 A link grant completed after that snapshot therefore remains in effect.
@@ -161,7 +163,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
-| `session_sync` | `sessions` (array of `{ "session": number, "peer": "address:port" }`) | Authoritative current session membership, sent at bridge startup, whenever membership changes, after an event gap, and on `resync`. Replace the adapter's session list with this list; an empty array means no sessions. |
+| `session_sync` | `sessions` (array of objects with `session`, `peer`, `addresses`) | Authoritative current session membership and router addresses, sent at bridge startup, whenever either changes, after an event gap, and on `resync`. Replace the adapter's session list and address sets; an empty array means no sessions. |
 | `event_gap` | `skipped` | Daemon broadcast events were lost. A fresh `session_sync` follows, even if membership is unchanged. |
 | `session_up` | `session`, `peer` | A router session is established. |
 | `session_down` | `session`, `peer`, `status` (numeric RFC 8175 status code) | A router session ended. |
@@ -172,6 +174,20 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `destination_announced` | `session`, `mac` | The router asked about a destination it has not been told about (§12.13). The modem has already answered; send `destination_up` if the radio can reach it. |
 | `link_request` | `request`, `session`, `peer`, `mac`, `requested`, `current` | A router asks to change a destination's link. |
 
+Each `session_sync` entry contains the numeric session ID, the peer's socket
+address, and the complete addresses advertised by that router. `addresses`
+always contains `ipv4`, `ipv6`, `ipv4_subnets`, and `ipv6_subnets` arrays, including
+empty arrays; subnets use canonical CIDR notation. Replace these sets on every
+snapshot, including removals and a return to empty sets. These are remote router
+addresses, separate from the modem's own addresses and destination addresses.
+Initialization addresses are included in the first snapshot. Updates can
+coalesce; the bridge uses retained state so delayed address events cannot
+overwrite newer values. Address changes do not replay destinations or defaults.
+
+```json
+{"type":"session_sync","sessions":[{"session":1,"peer":"192.0.2.1:41000","addresses":{"ipv4":["192.0.2.10"],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":["2001:db8:1::/64"]}}]}
+```
+
 Sessions remain in `session_sync` while terminating and disappear when they end.
 Session IDs are unique during a modem process lifetime. Intermediate sessions
 may be omitted if they start and end before the bridge observes them.
@@ -181,9 +197,11 @@ Session termination, response, and destination notices may be lost under event
 lag. The bridge sends `event_gap` and then refreshes `session_sync` from retained
 state. `skipped` counts lost daemon events, including events that would not have
 produced adapter notices. Further gaps can occur while recovery is in progress.
-Use `session_sync` to reconcile membership; a delayed down notice for an absent
-ID is harmless. Older adapters may ignore `session_sync` under the unknown-message
-rule, but then cannot recover missing lifecycle notices.
+Use `session_sync` to reconcile membership and router addresses; a delayed down
+notice for an absent ID is harmless. Older adapters may ignore `session_sync`
+under the unknown-message rule, but then cannot recover missing lifecycle notices.
+Older versions of the modem omit `addresses`; treat an absent field as unavailable
+address information.
 
 Recovery does not replay destinations or defaults to existing sessions, so a
 router's withdrawal or session-specific link grant remains intact. Newly

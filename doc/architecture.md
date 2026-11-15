@@ -1134,6 +1134,16 @@ The order of work was:
     and subprocess tests cover IPv4/IPv6, independent sessions, invalid inputs,
     refusals, canonical add/replace/remove, and no-op behavior.
 
+55. Router addresses in radio snapshots. **Done** — `session_sync` entries carry
+    complete remote-router IPv4/IPv6 address and subnet sets. Reconciliation
+    detects address changes independently of membership and reads retained state,
+    so coalesced or delayed address events cannot overwrite current values.
+    Explicit refresh and event-gap recovery include addresses while preserving
+    destination withdrawals and grants. Tests cover initialization, canonical
+    subnets, coalescing, delayed events, real broadcast loss, address changes
+    behind output backpressure, and IPv4/IPv6 pipelines with multiple routers,
+    complete removals, refreshed snapshots, and clean address state on reconnect.
+
 ---
 
 ## 10. Open questions / risks

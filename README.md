@@ -277,7 +277,9 @@ on one session, using address-only Session Update messages. Router adapters expo
 this API as `session_addresses` with optional `add`/`remove` address objects;
 `session_update_response` reports peer completion for each wire update. Locally
 advertised addresses are scoped to that session and must be advertised again
-after reconnecting. Router adapter snapshots contain remote modem addresses.
+after reconnecting. Router adapter snapshots contain remote modem addresses;
+radio `session_sync` snapshots contain remote router addresses and refresh when
+those addresses change.
 
 Embedders retaining destinations for replay can use
 `ModemDaemon::validate_destination_snapshot(id, &metrics, &addresses)` before
@@ -385,12 +387,13 @@ configured and denies requests otherwise. Either way, the modem application rece
 
 When the radio bridge loses daemon events, it sends `event_gap` followed by a
 fresh `session_sync`, including when membership is unchanged. This recovers the
-session list while preserving existing withdrawals and link grants. Lost
-completion outcomes and destination interest notices remain unknown. Link
-requests use a separate delivery path; continue answering outstanding requests.
+session list and router addresses while preserving existing withdrawals and
+link grants. Lost completion outcomes and destination interest notices remain
+unknown. Link requests use a separate delivery path; continue answering
+outstanding requests.
 Adapters can also send `{"type":"resync"}` to request current session membership
-at any time. This refresh preserves existing session state and does not recover
-lost completion or destination interest history.
+and router addresses at any time. This refresh preserves existing session state
+and does not recover lost completion or destination interest history.
 
 Command methods now await local acceptance by the session task. `Ok(())` means
 the command was applied, sent, or retained as a pending Up or queued session

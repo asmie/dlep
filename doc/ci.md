@@ -171,6 +171,13 @@ Explicit radio `resync` cases reject extra fields and require a fresh membership
 notice for each request without inventing event loss. The IPv4/IPv6 adapter
 pipeline checks repeated unchanged and empty membership, a pending link answer,
 preserved withdrawals and grants, and physical replay to a later router.
+Radio session snapshots also include remote router addresses. Unit tests cover
+initialization addresses, canonical subnets, coalesced changes, delayed events,
+real broadcast loss, updates while a gap marker waits for output capacity, and
+complete address snapshots larger than the adapter's input-line limit.
+An IPv4/IPv6 pipeline sends session address commands through both real adapters
+and checks per-router isolation, additions/removals, explicit refresh, session
+removal, reconnect state, and preservation of a withdrawn destination.
 They also hold protocol acknowledgements while sending hundreds of radio reports
 to check session metric coalescing and latest-value convergence. Queued metrics
 must preserve later destination reports, optional values, and link answers;

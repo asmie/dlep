@@ -154,7 +154,7 @@ struct Requested {
     latency_us: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct Addresses {
     ipv4: Vec<Ipv4Addr>,
@@ -185,6 +185,25 @@ impl Addresses {
                 })
                 .collect::<Result<_>>()?,
         })
+    }
+}
+
+impl From<&DestinationAddrs> for Addresses {
+    fn from(addresses: &DestinationAddrs) -> Self {
+        Self {
+            ipv4: addresses.v4.clone(),
+            ipv6: addresses.v6.clone(),
+            ipv4_subnets: addresses
+                .v4_subnets
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            ipv6_subnets: addresses
+                .v6_subnets
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
     }
 }
 
@@ -275,7 +294,7 @@ enum Outbound {
     EventGap {
         skipped: u64,
     },
-    /// Authoritative session membership, including after lost lifecycle events.
+    /// Authoritative membership and remote addresses, including after event loss.
     SessionSync {
         sessions: Vec<SessionPeer>,
     },
@@ -327,6 +346,7 @@ enum Outbound {
 struct SessionPeer {
     session: u64,
     peer: SocketAddr,
+    addresses: Addresses,
 }
 
 type Ask = (LinkRequest, oneshot::Sender<LinkControlReply>);
@@ -643,7 +663,7 @@ struct Bridge<'a> {
     next_request: u64,
     /// One deadline per operation and session; reports share the latest cache.
     retries: BTreeMap<(SessionId, Retry), Instant>,
-    sessions: HashMap<SessionId, PeerInfo>,
+    sessions: HashMap<SessionId, (PeerInfo, DestinationAddrs)>,
     synced: bool,
 }
 
@@ -937,14 +957,15 @@ impl Bridge<'_> {
         Ok(())
     }
 
-    /// Reconcile membership from retained runtime state, never lifecycle events.
+    /// Reconcile membership and peer addresses from retained runtime state,
+    /// never transient events that can lag behind this snapshot.
     /// Replay only for a new session; replaying existing sessions would undo a
     /// router's withdrawal or overwrite a session-specific link-control grant.
     async fn reconcile(&mut self, snapshot: &DaemonSnapshot) -> Result<()> {
         let sessions: HashMap<_, _> = snapshot
             .sessions
             .iter()
-            .map(|(id, session)| (*id, session.peer.clone()))
+            .map(|(id, session)| (*id, (session.peer.clone(), session.peer_addresses.clone())))
             .collect();
         self.retries.retain(|(id, _), _| {
             snapshot
@@ -972,9 +993,10 @@ impl Bridge<'_> {
         }
         let mut peers: Vec<_> = sessions
             .iter()
-            .map(|(id, peer)| SessionPeer {
+            .map(|(id, (peer, addresses))| SessionPeer {
                 session: id.0,
                 peer: peer.addr,
+                addresses: addresses.into(),
             })
             .collect();
         peers.sort_by_key(|peer| peer.session);
@@ -988,7 +1010,7 @@ impl Bridge<'_> {
     async fn event_gap(&mut self, skipped: u64) -> Result<()> {
         warn!(
             skipped,
-            "radio bridge missed transient notices; refreshing adapter membership"
+            "radio bridge missed transient notices; refreshing adapter membership and addresses"
         );
         self.send(&Outbound::EventGap { skipped }).await?;
         // Force a membership notice even if it has not changed, retaining our
@@ -1318,13 +1340,25 @@ mod tests {
         daemon: &ModemDaemon,
         events: &mut broadcast::Receiver<DaemonEvent>,
     ) -> TcpStream {
+        session_with_addresses(daemon, events, DestinationAddrs::default()).await
+    }
+
+    async fn session_with_addresses(
+        daemon: &ModemDaemon,
+        events: &mut broadcast::Receiver<DaemonEvent>,
+        addresses: DestinationAddrs,
+    ) -> TcpStream {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         dlep_net::gtsm::configure_tcp(&socket, false, true).unwrap();
         let mut peer = socket.connect(daemon.local_addr()).await.unwrap();
         let mut router = dlep_fsm::session_router::RouterSessionFsm::new();
         for action in router.step(dlep_fsm::FsmEvent::TcpConnected) {
             if let dlep_fsm::FsmAction::SendMessage(message) = action {
-                send(&mut peer, message).await;
+                let changes = AddressChanges {
+                    added: addresses.clone(),
+                    removed: Default::default(),
+                };
+                send(&mut peer, changes.append_to(message)).await;
             }
         }
         assert_eq!(
@@ -1764,7 +1798,7 @@ mod tests {
         // Lose SessionUp in a real daemon broadcast, without feeding any
         // lifecycle event to the bridge. Each alternating address update emits
         // a public event; its response is a deterministic processing barrier.
-        for i in 0..300 {
+        for i in 0..301 {
             let addresses = DestinationAddrs {
                 v4: vec!["192.0.2.2".parse().unwrap()],
                 ..Default::default()
@@ -1790,6 +1824,7 @@ mod tests {
                 MessageType::SESSION_UPDATE_RESPONSE
             );
         }
+        flush_peer(&mut peer).await;
         let Err(broadcast::error::RecvError::Lagged(skipped)) = lagged.recv().await else {
             panic!("expected real event loss");
         };
@@ -1827,6 +1862,12 @@ mod tests {
         let sync: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
         assert_eq!(sync["type"], "session_sync");
         assert_eq!(sync["sessions"][0]["session"], session_id.0);
+        assert_eq!(
+            sync["sessions"][0]["addresses"],
+            serde_json::json!({
+                "ipv4":["192.0.2.2"],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]
+            })
+        );
 
         // Further snapshots must not re-add a destination the router withdrew.
         send(
@@ -1938,6 +1979,149 @@ mod tests {
         );
         drop(peer);
         drop(bridge);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_sync_recovers_peer_addresses_without_replaying_stale_events() {
+        let addresses = |n| DestinationAddrs {
+            v4: vec![format!("192.0.2.{n}").parse().unwrap()],
+            v6: vec![format!("2001:db8::{n}").parse().unwrap()],
+            v4_subnets: vec![format!("198.51.{n}.7/24").parse().unwrap()],
+            v6_subnets: vec![format!("2001:db8:{n}::7/64").parse().unwrap()],
+        };
+        let expected = |n| {
+            serde_json::json!({"ipv4":[format!("192.0.2.{n}")], "ipv6":[format!("2001:db8::{n}")],
+            "ipv4_subnets":[format!("198.51.{n}.0/24")], "ipv6_subnets":[format!("2001:db8:{n}::/64")]})
+        };
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let mut peer = session_with_addresses(&daemon, &mut events, addresses(1)).await;
+        let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::channel(QUEUE_SIZE);
+        bridge.out = out;
+        let initial = daemon.state().borrow().clone();
+        let sid = *initial.sessions.keys().next().unwrap();
+        bridge.reconcile(&initial).await.unwrap();
+        let up: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(up["type"], "session_up");
+        let sync: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            sync,
+            serde_json::json!({"type":"session_sync","sessions":[{
+            "session":sid.0,"peer":peer.local_addr().unwrap(),"addresses":expected(1)}]})
+        );
+        bridge.reconcile(&initial).await.unwrap();
+        assert!(notices.try_recv().is_err());
+
+        // Coalesce multiple real updates while the bridge does not consume its
+        // event stream. The retained state, not older events, determines output.
+        let mut stale = daemon.subscribe();
+        for (added, removed) in [
+            (addresses(2), addresses(1)),
+            (DestinationAddrs::default(), addresses(2)),
+        ] {
+            send(
+                &mut peer,
+                AddressChanges { added, removed }
+                    .append_to(Message::new(MessageType::SESSION_UPDATE)),
+            )
+            .await;
+            assert_eq!(
+                read(&mut peer).await.message_type,
+                MessageType::SESSION_UPDATE_RESPONSE
+            );
+        }
+        flush_peer(&mut peer).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let cleared: serde_json::Value =
+            serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            cleared["sessions"][0]["addresses"],
+            serde_json::json!({"ipv4":[],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]})
+        );
+        assert!(notices.try_recv().is_err());
+        while let Ok(event) = stale.try_recv() {
+            bridge.event(event).await.unwrap();
+        }
+        assert!(
+            notices.try_recv().is_err(),
+            "old address events cannot overwrite a newer snapshot"
+        );
+
+        // A gap marker blocked on output must refresh addresses after capacity
+        // becomes available, even though membership stays unchanged.
+        let (out, mut notices) = mpsc::channel(1);
+        out.send("occupied".into()).await.unwrap();
+        bridge.out = out;
+        let (result, refreshed) = tokio::time::timeout(WAIT, async {
+            tokio::join!(biased;
+                bridge.event_gap(9),
+                async {
+                    send(&mut peer, AddressChanges { added: addresses(3), removed: Default::default() }.append_to(Message::new(MessageType::SESSION_UPDATE))).await;
+                    assert_eq!(read(&mut peer).await.message_type, MessageType::SESSION_UPDATE_RESPONSE);
+                    flush_peer(&mut peer).await;
+                    assert_eq!(notices.recv().await.unwrap(), "occupied");
+                    let gap: serde_json::Value = serde_json::from_str(&notices.recv().await.unwrap()).unwrap();
+                    assert_eq!(gap, serde_json::json!({"type":"event_gap","skipped":9}));
+                    serde_json::from_str::<serde_json::Value>(&notices.recv().await.unwrap()).unwrap()
+                }
+            )
+        }).await.unwrap();
+        result.unwrap();
+        assert_eq!(refreshed["sessions"][0]["addresses"], expected(3));
+        bridge.inbound(Inbound::Resync).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let repeated: serde_json::Value =
+            serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(repeated, refreshed);
+        assert!(notices.try_recv().is_err());
+
+        // Multiple legal wire updates can accumulate a snapshot larger than
+        // the adapter input-line cap. Modem output must preserve it in full.
+        let large: Vec<Ipv6Addr> = (1..=3600)
+            .map(|n| {
+                format!("2001:db8:aaaa:bbbb:cccc:dddd:eeee:{n:x}")
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        for chunk in large.chunks(1800) {
+            send(
+                &mut peer,
+                AddressChanges {
+                    added: DestinationAddrs {
+                        v6: chunk.to_vec(),
+                        ..Default::default()
+                    },
+                    removed: Default::default(),
+                }
+                .append_to(Message::new(MessageType::SESSION_UPDATE)),
+            )
+            .await;
+            assert_eq!(
+                read(&mut peer).await.message_type,
+                MessageType::SESSION_UPDATE_RESPONSE
+            );
+        }
+        flush_peer(&mut peer).await;
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let line = notices.try_recv().unwrap();
+        assert!(line.len() > MAX_LINE);
+        let sync: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let expected: Vec<_> = std::iter::once("2001:db8::3".to_string())
+            .chain(large.iter().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            sync["sessions"][0]["addresses"]["ipv6"],
+            serde_json::json!(expected)
+        );
+        // No replay writes should precede the acknowledgement used as a barrier.
+        flush_peer(&mut peer).await;
+        drop(peer);
         daemon.shutdown().await.unwrap();
     }
 

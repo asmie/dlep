@@ -1550,6 +1550,177 @@ async fn radio_input_failure_stops_the_modem_and_clears_router_state() {
 }
 
 #[tokio::test]
+async fn radio_session_sync_tracks_router_addresses_and_removals() {
+    fn members(status: &Value) -> &[Value] {
+        notice(status, "session_sync", |_| true).unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+    }
+    fn has_addresses(status: &Value, session: &Value, addresses: &Value) -> bool {
+        members(status)
+            .iter()
+            .any(|s| s["session"] == *session && s["addresses"] == *addresses)
+    }
+    let empty = json!({"ipv4":[],"ipv6":[],"ipv4_subnets":[],"ipv6_subnets":[]});
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        let mut first = Node::router(&[addr]).await;
+        let initial = first
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let first_id = session(&initial, "modem-a").unwrap()["session"].clone();
+        let state = radio
+            .wait(|s| {
+                notice(s, "session_sync", |n| {
+                    n["sessions"].as_array().unwrap().len() == 1
+                })
+                .is_some()
+            })
+            .await;
+        let first_peer = members(&state)[0]["session"].clone();
+        let mut second = Node::router(&[addr]).await;
+        let initial = second
+            .wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let second_id = session(&initial, "modem-a").unwrap()["session"].clone();
+        let state = radio
+            .wait(|s| {
+                notice(s, "session_sync", |n| {
+                    n["sessions"].as_array().unwrap().len() == 2
+                })
+                .is_some()
+            })
+            .await;
+        let second_peer = members(&state)
+            .iter()
+            .find(|s| s["session"] != first_peer)
+            .unwrap()["session"]
+            .clone();
+        assert!(members(&state).iter().all(|s| s["addresses"] == empty));
+
+        // Learning router addresses must not replay a withdrawn destination.
+        first
+            .control
+            .send(json!({"type":"destination_down","request":1,"session":first_id,"mac":MAC}))
+            .await;
+        first.result(1, "accepted").await;
+        first
+            .wait(|s| destination(s, "modem-a", MAC).is_none())
+            .await;
+        let mut with_host_bits = addresses(1);
+        with_host_bits["ipv4_subnets"] = json!(["198.51.1.7/24"]);
+        with_host_bits["ipv6_subnets"] = json!(["2001:db8:1::7/64"]);
+        first.control.send(json!({"type":"session_addresses","request":2,"session":first_id,"add":with_host_bits})).await;
+        first.result(2, "accepted").await;
+        let state = radio
+            .wait(|s| has_addresses(s, &first_peer, &addresses(1)))
+            .await;
+        assert_eq!(
+            members(&state)
+                .iter()
+                .find(|s| s["session"] == second_peer)
+                .unwrap()["addresses"],
+            empty
+        );
+        first
+            .wait(|s| notice(s, "session_update_response", |_| true).is_some())
+            .await;
+
+        second.control.send(json!({"type":"session_addresses","request":1,"session":second_id,"add":addresses(2)})).await;
+        second.result(1, "accepted").await;
+        radio
+            .wait(|s| has_addresses(s, &second_peer, &addresses(2)))
+            .await;
+        first.control.send(json!({"type":"session_addresses","request":3,"session":first_id,"remove":addresses(1),"add":addresses(3)})).await;
+        first.result(3, "accepted").await;
+        let state = radio
+            .wait(|s| has_addresses(s, &first_peer, &addresses(3)))
+            .await;
+        assert_eq!(
+            members(&state)
+                .iter()
+                .find(|s| s["session"] == second_peer)
+                .unwrap()["addresses"],
+            addresses(2)
+        );
+        first
+            .wait(|s| {
+                s["notices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|n| n["type"] == "session_update_response")
+                    .count()
+                    == 2
+            })
+            .await;
+        first.control.send(json!({"type":"session_addresses","request":4,"session":first_id,"remove":addresses(3)})).await;
+        first.result(4, "accepted").await;
+        let cleared = radio.wait(|s| has_addresses(s, &first_peer, &empty)).await;
+        let count = cleared["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["type"] == "session_sync")
+            .count();
+        radio.control.send(json!({"type":"resync"})).await;
+        let refreshed = radio
+            .wait(|s| {
+                s["notices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|n| n["type"] == "session_sync")
+                    .count()
+                    > count
+            })
+            .await;
+        assert_eq!(members(&refreshed), members(&cleared));
+        assert!(notice(&refreshed, "event_gap", |_| true).is_none());
+        assert_eq!(
+            refreshed["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["type"] == "session_up")
+                .count(),
+            2
+        );
+        let state = first.control.call(json!({"op":"status"})).await;
+        assert!(destination(&state, "modem-a", MAC).is_none());
+        assert_eq!(session(&state, "modem-a").unwrap()["addresses"], json!([]));
+        let state = second.control.call(json!({"op":"status"})).await;
+        assert_eq!(
+            destination(&state, "modem-a", MAC).unwrap()["metrics"]["current_data_rate_tx_bps"],
+            700
+        );
+
+        first.stop().await;
+        first.assert_final_empty();
+        let state = radio.wait(|s| members(s).len() == 1).await;
+        assert_eq!(members(&state)[0]["session"], second_peer);
+        assert_eq!(members(&state)[0]["addresses"], addresses(2));
+        let mut late = Node::router(&[addr]).await;
+        late.wait(|s| destination(s, "modem-a", MAC).is_some())
+            .await;
+        let state = radio.wait(|s| members(s).len() == 2).await;
+        let fresh = members(&state)
+            .iter()
+            .find(|s| s["session"] != second_peer)
+            .unwrap();
+        assert_ne!(fresh["session"], first_peer);
+        assert_eq!(fresh["addresses"], empty);
+        second.stop().await;
+        second.assert_final_empty();
+        late.stop().await;
+        late.assert_final_empty();
+        radio.wait(|s| members(s).is_empty()).await;
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn radio_resync_refreshes_membership_without_replaying_existing_sessions() {
     for ip in ["127.0.0.1", "::1"] {
         let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
