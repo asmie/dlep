@@ -1103,6 +1103,17 @@ The order of work was:
     isolation, both MAC formats and IP families, and delayed completion after
     replacement with preserved replay. Churn now checks every Down response.
 
+52. Radio adapter event-gap notices. **Done** — lost public events produce an
+    `event_gap` marker with the broadcast's skipped count, followed by a forced
+    `session_sync` even when membership is unchanged. The bridge reads retained
+    state after queuing the marker and preserves its known sessions so recovery
+    cannot replay over withdrawals or link grants. Completion and destination
+    interest history remain unrecoverable; link requests retain their separate
+    delivery path. Tests cover real IPv4/IPv6 adapter backpressure, pending link
+    requests, withdrawn destinations and later replay, loss of SessionUp,
+    unchanged membership, repeated empty syncs, and session removal while output
+    capacity blocks the marker.
+
 ---
 
 ## 10. Open questions / risks

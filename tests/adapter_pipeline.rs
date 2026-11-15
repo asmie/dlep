@@ -1550,6 +1550,119 @@ async fn radio_input_failure_stops_the_modem_and_clears_router_state() {
 }
 
 #[tokio::test]
+async fn paused_radio_reports_event_loss_and_resyncs_without_replaying_withdrawals() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        report(&mut radio, OTHER_MAC, 800, 2).await;
+        let mut router = Node::router(&[addr]).await;
+        let initial = router
+            .wait(|s| {
+                destination(s, "modem-a", MAC).is_some()
+                    && destination(s, "modem-a", OTHER_MAC).is_some()
+            })
+            .await;
+        let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+        router
+            .control
+            .send(json!({"type":"destination_down", "request":1,
+            "session":sid, "mac":OTHER_MAC}))
+            .await;
+        router.result(1, "accepted").await;
+        router
+            .wait(|s| destination(s, "modem-a", OTHER_MAC).is_none())
+            .await;
+        let before = radio
+            .wait(|s| notice(s, "destination_withdrawn", |_| true).is_some())
+            .await;
+        let members = notice(&before, "session_sync", |n| {
+            !n["sessions"].as_array().unwrap().is_empty()
+        })
+        .unwrap()["sessions"]
+            .clone();
+
+        radio.control.call(json!({"op":"pause"})).await;
+        // Overflow the real broadcast behind the blocked radio output. Each
+        // peer response proves the modem processed the corresponding request.
+        let mut requests = announcements(&sid, 768);
+        for request in &mut requests {
+            request["request"] = json!(request["request"].as_u64().unwrap() + 1);
+        }
+        router.control.batch(requests).await;
+        router.result(769, "accepted").await;
+        // The router can lose intermediate notices too. The final reply on
+        // this ordered TCP stream proves the entire burst reached the modem.
+        router
+            .wait(|s| notice(s, "announce_response", |n| n["mac"] == "02:00:00:01:03:00").is_some())
+            .await;
+        router
+            .control
+            .send(json!({"type":"link_request", "request":770,
+            "session":sid, "mac":MAC, "requested":{"current_data_rate_tx_bps":444}}))
+            .await;
+        router.result(770, "accepted").await;
+        radio.control.call(json!({"op":"resume"})).await;
+        respond(&mut radio, json!({"current_data_rate_tx_bps":444}), true).await;
+        let live = router
+            .wait(|s| {
+                destination(s, "modem-a", MAC)
+                    .is_some_and(|d| d["metrics"]["current_data_rate_tx_bps"] == 444)
+            })
+            .await;
+        assert_eq!(session(&live, "modem-a").unwrap()["session"], sid);
+        assert!(destination(&live, "modem-a", OTHER_MAC).is_none());
+
+        let recovered = radio
+            .wait(|s| {
+                let notices = s["notices"].as_array().unwrap();
+                notices
+                    .windows(2)
+                    .any(|pair| pair[0]["type"] == "event_gap" && pair[1]["type"] == "session_sync")
+            })
+            .await;
+        let notices = recovered["notices"].as_array().unwrap();
+        let pair = notices
+            .windows(2)
+            .find(|pair| pair[0]["type"] == "event_gap")
+            .unwrap();
+        assert!(pair[0]["skipped"].as_u64().unwrap() > 0);
+        assert_eq!(pair[1], json!({"type":"session_sync", "sessions":members}));
+        assert!(
+            notices
+                .iter()
+                .filter(|n| n["type"] == "destination_announced")
+                .count()
+                < 768
+        );
+
+        // Recovery preserves physical knowledge after a router withdraws
+        // interest and caches the link grant for later replay.
+        let mut late = Node::router(&[addr]).await;
+        let replay = late
+            .wait(|s| {
+                destination(s, "modem-a", MAC).is_some()
+                    && destination(s, "modem-a", OTHER_MAC).is_some()
+            })
+            .await;
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["metrics"]["current_data_rate_tx_bps"],
+            444
+        );
+        assert_eq!(
+            destination(&replay, "modem-a", OTHER_MAC).unwrap()["addresses"],
+            expected_addresses(2)
+        );
+        let unchanged = router.control.call(json!({"op":"status"})).await;
+        assert!(destination(&unchanged, "modem-a", OTHER_MAC).is_none());
+        router.stop().await;
+        router.assert_final_empty();
+        late.stop().await;
+        late.assert_final_empty();
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn temporarily_paused_radio_recovers_notices_and_answers_a_pending_request() {
     let (mut radio, addr) = Node::modem("modem-a", "127.0.0.1", 0).await;
     report(&mut radio, MAC, 700, 1).await;

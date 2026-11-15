@@ -158,8 +158,15 @@ The same suite pauses radio input long enough to block writes and closes it
 while keeping the adapter alive. Both cases must terminate the modem sessions
 with Shutting Down and fail the modem process. A shorter pause must recover
 all queued notices and complete a pending link request on the original session.
+An IPv4/IPv6 case overflows the radio broadcast during a pause and requires an
+`event_gap` followed by unchanged session membership. A pending link request
+must still complete, withdrawn destinations must stay withdrawn, and later
+routers must receive the cached physical destinations and granted metrics.
 Radio bridge unit tests separately exercise bounded requests, cancellation,
 partial writes, and the output deadline using virtual time.
+Gap recovery tests also remove a session while the marker waits for output
+capacity, check exact skipped counts, and require fresh and repeated empty
+membership notices without replaying existing sessions.
 They also hold protocol acknowledgements while sending hundreds of radio reports
 to check session metric coalescing and latest-value convergence. Queued metrics
 must preserve later destination reports, optional values, and link answers;

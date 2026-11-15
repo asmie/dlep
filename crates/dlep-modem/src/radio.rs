@@ -270,6 +270,9 @@ fn parse_inbound(line: &str) -> Result<Inbound> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Outbound {
+    EventGap {
+        skipped: u64,
+    },
     /// Authoritative session membership, including after lost lifecycle events.
     SessionSync {
         sessions: Vec<SessionPeer>,
@@ -470,10 +473,7 @@ impl Adapter {
                     Some(ask) = self.asks.recv() => bridge.ask(ask).await?,
                     event = events.recv() => match event {
                         Ok(event) => bridge.event(event).await?,
-                        Err(broadcast::error::RecvError::Lagged(missed)) => warn!(
-                            missed,
-                            "radio bridge missed transient notices; session state is reconciled separately"
-                        ),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => bridge.event_gap(skipped).await?,
                         Err(broadcast::error::RecvError::Closed) => bail!("modem daemon stopped"),
                     },
                     () = sleep_until(next_retry), if next_retry.is_some() => bridge.retry().await,
@@ -977,6 +977,20 @@ impl Bridge<'_> {
         self.sessions = sessions;
         self.synced = true;
         Ok(())
+    }
+
+    async fn event_gap(&mut self, skipped: u64) -> Result<()> {
+        warn!(
+            skipped,
+            "radio bridge missed transient notices; refreshing adapter membership"
+        );
+        self.send(&Outbound::EventGap { skipped }).await?;
+        // Force a membership notice even if it has not changed, retaining our
+        // known sessions so recovery cannot replay over withdrawals or grants.
+        // Read after sending the marker: output pressure can delay this step.
+        self.synced = false;
+        let snapshot = self.daemon.state().borrow().clone();
+        self.reconcile(&snapshot).await
     }
 
     async fn replay_session(
@@ -1770,13 +1784,12 @@ mod tests {
                 MessageType::SESSION_UPDATE_RESPONSE
             );
         }
-        assert!(matches!(
-            lagged.recv().await,
-            Err(broadcast::error::RecvError::Lagged(_))
-        ));
+        let Err(broadcast::error::RecvError::Lagged(skipped)) = lagged.recv().await else {
+            panic!("expected real event loss");
+        };
         let snapshot = daemon.state().borrow().clone();
         let session_id = *snapshot.sessions.keys().next().unwrap();
-        bridge.reconcile(&snapshot).await.unwrap();
+        bridge.event_gap(skipped).await.unwrap();
         assert_eq!(
             read(&mut peer).await.message_type,
             MessageType::SESSION_UPDATE
@@ -1798,6 +1811,11 @@ mod tests {
         )
         .await;
         flush_peer(&mut peer).await;
+        let gap: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            gap,
+            serde_json::json!({"type":"event_gap", "skipped":skipped})
+        );
         let notice: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
         assert_eq!(notice["type"], "session_up");
         let sync: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
@@ -1822,6 +1840,16 @@ mod tests {
         );
         bridge.reconcile(&snapshot).await.unwrap();
         assert!(notices.try_recv().is_err());
+        // A gap forces the same membership to be sent again without replay.
+        bridge.event_gap(7).await.unwrap();
+        let gap: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(gap, serde_json::json!({"type":"event_gap", "skipped":7}));
+        let repeated: serde_json::Value =
+            serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(repeated, sync);
+        assert!(notices.try_recv().is_err());
+        // Any replay sent to the withdrawn destination would precede this ACK.
+        flush_peer(&mut peer).await;
         bridge
             .inbound(Inbound::DestinationUpdate {
                 mac: Mac(mac()),
@@ -1892,6 +1920,57 @@ mod tests {
         );
         drop(peer);
         drop(bridge);
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_gap_refreshes_membership_after_output_backpressure() {
+        let daemon = modem().await;
+        let mut events = daemon.subscribe();
+        let peer = session(&daemon, &mut events).await;
+        let mut bridge = bridge(&daemon);
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        assert_eq!(bridge.sessions.len(), 1);
+        let (out, mut notices) = mpsc::channel(1);
+        out.send("occupied".into()).await.unwrap();
+        bridge.out = out;
+        let mut state = daemon.state();
+        let (result, refreshed) = tokio::time::timeout(WAIT, async {
+            tokio::join!(biased;
+                bridge.event_gap(17),
+                async {
+                    // The gap marker is now blocked behind the occupied slot.
+                    // Remove the session before letting the writer proceed.
+                    drop(peer);
+                    while !state.borrow_and_update().sessions.is_empty() {
+                        state.changed().await.unwrap();
+                    }
+                    assert_eq!(notices.recv().await.unwrap(), "occupied");
+                    let gap: serde_json::Value = serde_json::from_str(&notices.recv().await.unwrap()).unwrap();
+                    assert_eq!(gap, serde_json::json!({"type":"event_gap", "skipped":17}));
+                    serde_json::from_str::<serde_json::Value>(&notices.recv().await.unwrap()).unwrap()
+                }
+            )
+        }).await.unwrap();
+        result.unwrap();
+        assert_eq!(
+            refreshed,
+            serde_json::json!({"type":"session_sync", "sessions":[]})
+        );
+        assert!(bridge.sessions.is_empty());
+        assert!(bridge.synced);
+        assert!(notices.try_recv().is_err());
+        // Consecutive gaps still delimit unknown outcomes with an empty sync.
+        let (out, mut notices) = mpsc::channel(2);
+        bridge.out = out;
+        bridge.event_gap(1).await.unwrap();
+        let gap: serde_json::Value = serde_json::from_str(&notices.recv().await.unwrap()).unwrap();
+        assert_eq!(gap, serde_json::json!({"type":"event_gap", "skipped":1}));
+        let sync: serde_json::Value = serde_json::from_str(&notices.recv().await.unwrap()).unwrap();
+        assert_eq!(sync, refreshed);
+        drop(notices);
+        assert!(bridge.event_gap(2).await.is_err());
         daemon.shutdown().await.unwrap();
     }
 

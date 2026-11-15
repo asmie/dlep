@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Radio adapters receive `event_gap` with the number of lost daemon events,
+  followed by `session_sync` even when membership is unchanged. Recovery reads
+  retained membership after output backpressure and preserves existing router
+  withdrawals, cached destinations, and link requests. Lost command outcomes
+  remain unknown; the membership notice does not reconstruct their history.
 - Both daemon roles expose validated, nonfatal Destination Down replies through
   `DestinationEvent::DownResponse`, including peer status text. Routers retain
   their preceding `Down` event and forward `down_response` adapter notices;
