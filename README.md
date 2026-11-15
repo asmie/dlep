@@ -383,6 +383,9 @@ fresh `session_sync`, including when membership is unchanged. This recovers the
 session list while preserving existing withdrawals and link grants. Lost
 completion outcomes and destination interest notices remain unknown. Link
 requests use a separate delivery path; continue answering outstanding requests.
+Adapters can also send `{"type":"resync"}` to request current session membership
+at any time. This refresh preserves existing session state and does not recover
+lost completion or destination interest history.
 
 Command methods now await local acceptance by the session task. `Ok(())` means
 the command was applied, sent, or retained as a pending Up or queued session

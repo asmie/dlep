@@ -1550,6 +1550,135 @@ async fn radio_input_failure_stops_the_modem_and_clears_router_state() {
 }
 
 #[tokio::test]
+async fn radio_resync_refreshes_membership_without_replaying_existing_sessions() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;
+        report(&mut radio, MAC, 700, 1).await;
+        report(&mut radio, OTHER_MAC, 800, 2).await;
+        let mut router = Node::router(&[addr]).await;
+        let initial = router
+            .wait(|s| {
+                destination(s, "modem-a", MAC).is_some()
+                    && destination(s, "modem-a", OTHER_MAC).is_some()
+            })
+            .await;
+        let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+        router
+            .control
+            .send(json!({"type":"destination_down", "request":1,
+            "session":sid, "mac":OTHER_MAC}))
+            .await;
+        router.result(1, "accepted").await;
+        router
+            .wait(|s| destination(s, "modem-a", OTHER_MAC).is_none())
+            .await;
+        router
+            .control
+            .send(json!({"type":"link_request", "request":2,
+            "session":sid, "mac":MAC, "requested":{"current_data_rate_tx_bps":444}}))
+            .await;
+        router.result(2, "accepted").await;
+        let before = radio
+            .wait(|s| notice(s, "link_request", |_| true).is_some())
+            .await;
+        let members = notice(&before, "session_sync", |n| {
+            !n["sessions"].as_array().unwrap().is_empty()
+        })
+        .unwrap()["sessions"]
+            .clone();
+        let sync_count = |s: &Value| {
+            s["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["type"] == "session_sync")
+                .count()
+        };
+        let count = sync_count(&before);
+        radio.control.batch(vec![json!({"type":"resync"}); 3]).await;
+        let refreshed = radio.wait(|s| sync_count(s) == count + 3).await;
+        for record in refreshed["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["type"] == "session_sync")
+            .skip(count)
+        {
+            assert_eq!(record, &json!({"type":"session_sync", "sessions":members}));
+        }
+        assert!(notice(&refreshed, "event_gap", |_| true).is_none());
+        assert_eq!(
+            refreshed["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["type"] == "session_up")
+                .count(),
+            1
+        );
+        respond(&mut radio, json!({"current_data_rate_tx_bps":444}), true).await;
+        let granted = router
+            .wait(|s| {
+                destination(s, "modem-a", MAC)
+                    .is_some_and(|d| d["metrics"]["current_data_rate_tx_bps"] == 444)
+            })
+            .await;
+        assert!(destination(&granted, "modem-a", OTHER_MAC).is_none());
+
+        // A refresh after the grant must not reset the session's metrics or
+        // reintroduce the withdrawn destination. A later router still replays both.
+        radio.control.send(json!({"type":"resync"})).await;
+        radio.wait(|s| sync_count(s) == count + 4).await;
+        let mut late = Node::router(&[addr]).await;
+        let replay = late
+            .wait(|s| {
+                destination(s, "modem-a", MAC).is_some()
+                    && destination(s, "modem-a", OTHER_MAC).is_some()
+            })
+            .await;
+        assert_eq!(
+            destination(&replay, "modem-a", MAC).unwrap()["metrics"]["current_data_rate_tx_bps"],
+            444
+        );
+        assert_eq!(
+            destination(&replay, "modem-a", OTHER_MAC).unwrap()["addresses"],
+            expected_addresses(2)
+        );
+        let current = router.control.call(json!({"op":"status"})).await;
+        assert_eq!(current["state"], granted["state"]);
+        router.stop().await;
+        router.assert_final_empty();
+        late.stop().await;
+        late.assert_final_empty();
+        let empty = radio
+            .wait(|s| {
+                s["notices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|n| n["type"] == "session_sync")
+                    .is_some_and(|n| n["sessions"] == json!([]))
+            })
+            .await;
+        let count = sync_count(&empty);
+        radio.control.send(json!({"type":"resync"})).await;
+        let empty = radio.wait(|s| sync_count(s) == count + 1).await;
+        assert_eq!(
+            empty["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|n| n["type"] == "session_sync")
+                .unwrap(),
+            &json!({"type":"session_sync", "sessions":[]})
+        );
+        radio.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn paused_radio_reports_event_loss_and_resyncs_without_replaying_withdrawals() {
     for ip in ["127.0.0.1", "::1"] {
         let (mut radio, addr) = Node::modem("modem-a", ip, 0).await;

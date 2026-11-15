@@ -1114,6 +1114,15 @@ The order of work was:
     unchanged membership, repeated empty syncs, and session removal while output
     capacity blocks the marker.
 
+53. Explicit radio membership refresh. **Done** — adapters can send
+    `{"type":"resync"}` to request `session_sync`, including unchanged or empty
+    membership. The bridge forces reconciliation before processing the next
+    input line while retaining known sessions, preserving withdrawals and link
+    grants. Refresh does not manufacture a gap marker or cancel pending link
+    requests. Tests cover strict parsing, withdrawn state without replay,
+    repeated refreshes, pending answers, granted metrics, later physical replay,
+    and empty membership over IPv4/IPv6 through the external adapters.
+
 ---
 
 ## 10. Open questions / risks

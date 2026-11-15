@@ -67,6 +67,7 @@ a file. It does not run the adapter.
 
 | `type` | Fields | Effect |
 | --- | --- | --- |
+| `resync` | none | Requests a fresh `session_sync` membership notice, including unchanged or empty membership. |
 | `destination_up` | `mac`, optional `metrics`, `addresses` | Reports a new destination to every router. Omitted metrics take the current session-wide values. |
 | `destination_update` | `mac`, `metrics` | Sends changed metrics for a known destination. |
 | `destination_addresses` | `mac`, optional `add`, `remove` (addresses) | Sends address and subnet changes. |
@@ -75,6 +76,7 @@ a file. It does not run the adapter.
 | `link_response` | `request`, `status`, optional `text`, `metrics` | Answers a `link_request`. |
 
 ```json
+{"type":"resync"}
 {"type":"destination_up","mac":"02:00:00:00:00:01","metrics":{"current_data_rate_tx_bps":5000000},"addresses":{"ipv4":["192.0.2.10"]}}
 {"type":"link_response","request":7,"status":"success","text":"applied","metrics":{"current_data_rate_tx_bps":2000000}}
 ```
@@ -107,6 +109,13 @@ Replay uses retained daemon session state and recovers even if the internal
 event subscriber falls behind. It retries busy session initialization, preserves
 existing per-session destination metrics, and respects a router's withdrawal.
 Closed sessions release pending adapter requests and command retries.
+Send `{"type":"resync"}` whenever the adapter needs a fresh session list. Each
+request produces `session_sync` even if membership is unchanged or empty, and
+takes no additional fields. It does not create an `event_gap` or re-announce
+destinations to existing sessions. Keep answering pending link requests during
+refresh; it does not cancel them. Newly observed sessions still receive normal
+replay. Membership cannot reconstruct lost responses or destination interest
+history.
 Default replay preserves the session's live destination values within one
 command; it does not restore metrics from the earlier membership snapshot.
 A link grant completed after that snapshot therefore remains in effect.
@@ -152,7 +161,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
-| `session_sync` | `sessions` (array of `{ "session": number, "peer": "address:port" }`) | Authoritative current session membership, sent at bridge startup, whenever membership changes, and after an event gap. Replace the adapter's session list with this list; an empty array means no sessions. |
+| `session_sync` | `sessions` (array of `{ "session": number, "peer": "address:port" }`) | Authoritative current session membership, sent at bridge startup, whenever membership changes, after an event gap, and on `resync`. Replace the adapter's session list with this list; an empty array means no sessions. |
 | `event_gap` | `skipped` | Daemon broadcast events were lost. A fresh `session_sync` follows, even if membership is unchanged. |
 | `session_up` | `session`, `peer` | A router session is established. |
 | `session_down` | `session`, `peer`, `status` (numeric RFC 8175 status code) | A router session ended. |

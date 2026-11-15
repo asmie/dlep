@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Radio adapters can send `{"type":"resync"}` to request fresh `session_sync`
+  membership, even when unchanged or empty. Refresh preserves established
+  sessions, router withdrawals, link grants, and pending requests without
+  producing a synthetic event-gap notice or replaying existing destinations.
 - Radio adapters receive `event_gap` with the number of lost daemon events,
   followed by `session_sync` even when membership is unchanged. Recovery reads
   retained membership after output backpressure and preserves existing router

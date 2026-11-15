@@ -200,6 +200,7 @@ enum Status {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Inbound {
+    Resync,
     DestinationUp {
         mac: Mac,
         #[serde(default)]
@@ -236,6 +237,7 @@ enum Inbound {
 }
 
 const INBOUND_FIELDS: &[(&str, &[&str])] = &[
+    ("resync", &[]),
     ("destination_up", &["mac", "metrics", "addresses"]),
     ("destination_update", &["mac", "metrics"]),
     ("destination_addresses", &["mac", "add", "remove"]),
@@ -656,6 +658,10 @@ impl Bridge<'_> {
 
     async fn inbound(&mut self, message: Inbound) {
         match message {
+            // The loop reconciles retained state before reading the next line.
+            // Keep known sessions so refreshing membership cannot replay over
+            // a withdrawal or session-specific link grant.
+            Inbound::Resync => self.synced = false,
             Inbound::DestinationUp {
                 mac: Mac(mac),
                 metrics,
@@ -1849,6 +1855,18 @@ mod tests {
         assert_eq!(repeated, sync);
         assert!(notices.try_recv().is_err());
         // Any replay sent to the withdrawn destination would precede this ACK.
+        flush_peer(&mut peer).await;
+        // Explicit refresh uses the same reconciliation without reporting loss.
+        bridge
+            .inbound(parse_inbound(r#"{"type":"resync"}"#).unwrap())
+            .await;
+        assert!(!bridge.synced);
+        let snapshot = daemon.state().borrow().clone();
+        bridge.reconcile(&snapshot).await.unwrap();
+        let repeated: serde_json::Value =
+            serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
+        assert_eq!(repeated, sync);
+        assert!(notices.try_recv().is_err());
         flush_peer(&mut peer).await;
         bridge
             .inbound(Inbound::DestinationUpdate {
@@ -3993,6 +4011,10 @@ mod tests {
 
     #[test]
     fn inbound_messages_parse_strictly_but_ignore_unknown_types() {
+        assert!(matches!(
+            parse_inbound(r#"{"type":"resync"}"#).unwrap(),
+            Inbound::Resync
+        ));
         let up = parse_inbound(
             r#"{"type":"destination_up","mac":"02:00:00:00:00:01","metrics":{"latency_us":5},"addresses":{"ipv4":["192.0.2.1"],"ipv6_subnets":["2001:db8::/32"]}}"#,
         )
@@ -4027,6 +4049,8 @@ mod tests {
         for bad in [
             "not json",
             "[1]",
+            r#"{"type":"resync","request":1}"#,
+            r#"{"type":"resync","sessions":[]}"#,
             r#"{"mac":"02:00:00:00:00:01"}"#,
             r#"{"type":"destination_down","mac":"02:00:00:00:00:01","reason":1}"#,
             r#"{"type":"destination_update","mac":"02:00:00:00:00:01","metrics":{"latency":5}}"#,

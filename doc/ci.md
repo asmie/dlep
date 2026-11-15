@@ -167,6 +167,10 @@ partial writes, and the output deadline using virtual time.
 Gap recovery tests also remove a session while the marker waits for output
 capacity, check exact skipped counts, and require fresh and repeated empty
 membership notices without replaying existing sessions.
+Explicit radio `resync` cases reject extra fields and require a fresh membership
+notice for each request without inventing event loss. The IPv4/IPv6 adapter
+pipeline checks repeated unchanged and empty membership, a pending link answer,
+preserved withdrawals and grants, and physical replay to a later router.
 They also hold protocol acknowledgements while sending hundreds of radio reports
 to check session metric coalescing and latest-value convergence. Queued metrics
 must preserve later destination reports, optional values, and link answers;
