@@ -186,6 +186,10 @@ each resulting chunk, and apply them to a router to check exact addresses and
 metrics. Runtime command tests cover accumulated changes and live batches whose
 MAC overhead crosses the message limit. Both MAC formats and transport families
 must deliver every chunk and keep the original session usable.
+Near-limit Announce tests include the required Status item, restore all four
+address families and current metrics after withdrawal, and check subsequent
+updates. The real adapter regression requires the same session ID throughout
+for both MAC formats over IPv4/IPv6, so reconnection cannot mask an encoding failure.
 
 These tests run automatically in the workspace and coverage jobs. To run them
 alone:

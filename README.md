@@ -261,6 +261,9 @@ Update messages when necessary. Each carries the destination MAC; removals prece
 additions across messages, and deferred metrics are included once. Receivers can
 observe intermediate address snapshots as these messages arrive. Individual API
 batches and complete destination snapshots still undergo normal validation.
+Near-limit Destination Announce responses similarly carry remaining addresses
+in follow-up updates after the successful response. Consumers can observe
+partial address sets during this sequence.
 
 `RouterDaemon::drop_destination(session_id, destination)` withdraws interest
 from one modem. The modem acknowledges with Destination Down Response, stops

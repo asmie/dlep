@@ -247,6 +247,28 @@ pub fn build_destination_announce_response(mac: MacAddress, status: StatusCode) 
         })
 }
 
+/// Announce current metrics and addresses, following the successful response
+/// with Destination Updates if its required Status item leaves too little room
+/// for every address. Address items are optional in the response (§12.14).
+pub(crate) fn build_destination_announce_success(
+    mac: MacAddress,
+    metrics: &LinkMetrics,
+    addresses: &DestinationAddrs,
+) -> Vec<Message> {
+    let response = push_metric_items(
+        build_destination_announce_response(mac, StatusCode::SUCCESS),
+        metrics,
+    );
+    split_destination_addresses(
+        mac,
+        response,
+        &crate::AddressChanges {
+            added: addresses.clone(),
+            removed: DestinationAddrs::default(),
+        },
+    )
+}
+
 pub fn extract_status(msg: &Message) -> Option<StatusCode> {
     msg.data_items.iter().find_map(|item| match item {
         DataItem::Status { code, .. } => Some(*code),
@@ -379,15 +401,25 @@ pub(crate) fn build_destination_updates(
     metrics: Option<&LinkMetrics>,
     changes: &crate::AddressChanges,
 ) -> Vec<Message> {
-    let base = Message::new(MessageType::DESTINATION_UPDATE).with_item(DataItem::MacAddress(mac));
-    let mac_size = base.encode().expect("MAC item encodes").len() - 4;
-    let mut message = metrics.map_or_else(
-        || base.clone(),
+    let message = metrics.map_or_else(
+        || Message::new(MessageType::DESTINATION_UPDATE).with_item(DataItem::MacAddress(mac)),
         |metrics| build_destination_update(mac, metrics),
     );
+    split_destination_addresses(mac, message, changes)
+}
+
+/// Fill the initial message, then carry remaining address items in Updates.
+/// Every message includes the MAC; only the initial one has metrics or Status.
+fn split_destination_addresses(
+    mac: MacAddress,
+    mut message: Message,
+    changes: &crate::AddressChanges,
+) -> Vec<Message> {
+    let base = Message::new(MessageType::DESTINATION_UPDATE).with_item(DataItem::MacAddress(mac));
+    let mac_size = base.encode().expect("MAC item encodes").len() - 4;
     let mut size = message
         .encode()
-        .expect("validated destination metrics")
+        .expect("validated destination message fields")
         .len()
         - 4;
     let mut messages = Vec::new();

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Near-limit destinations can be re-announced without closing the session when
+  the required Status item makes the response larger than Destination Up.
+  Successful responses carry metrics and fitting addresses; remaining addresses
+  follow in Destination Updates on the same session.
 - Destination address updates split across wire-sized messages when accumulated
   changes exceed one message, including updates coalesced before Up is acknowledged.
   MAC and metric overhead count toward the limit. This prevents session closure

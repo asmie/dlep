@@ -96,6 +96,10 @@ Effective address changes may span multiple Destination Update messages,
 especially when several reports coalesce while Up awaits acknowledgement.
 Removals precede additions across messages, and any coalesced metrics appear
 once. Routers can observe intermediate address snapshots before all changes arrive.
+Re-announcing a large destination also accounts for the response's required
+Status item. A successful response includes its metrics and fitting addresses;
+any remaining addresses follow in updates on the same session. The complete
+cached destination is preserved.
 
 Replay uses retained daemon session state and recovers even if the internal
 event subscriber falls behind. It retries busy session initialization, preserves

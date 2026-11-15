@@ -670,6 +670,102 @@ fn announcements(session: &Value, count: u64) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn near_limit_destinations_reannounce_on_the_original_session() {
+    for (format, mac) in [("eui48", MAC), ("eui64", MAC64)] {
+        for ip in ["127.0.0.1", "::1"] {
+            let (mut radio, addr) = Node::modem_with_format("modem-a", ip, 0, format).await;
+            let ipv4: Vec<_> = (1..=4).map(|n| format!("192.0.2.{n}")).collect();
+            let ipv6: Vec<_> = (1..=3113).map(|n| format!("2001:db8:1::{n:x}")).collect();
+            radio
+                .control
+                .send(json!({"type":"destination_up", "mac":mac,
+                "metrics":{"latency_us":321,"rlq_rx":0},
+                "addresses":{"ipv4":ipv4,"ipv6":ipv6,
+                    "ipv4_subnets":["198.51.100.0/24"],"ipv6_subnets":["2001:db8:2::/64"]}}))
+                .await;
+            let mut expected_addresses: Vec<_> = ipv4
+                .iter()
+                .map(|address| json!({"kind":"ipv4", "address":address}))
+                .collect();
+            expected_addresses.extend(
+                ipv6.iter()
+                    .map(|address| json!({"kind":"ipv6", "address":address})),
+            );
+            expected_addresses.extend([
+                json!({"kind":"ipv4_subnet", "address":"198.51.100.0/24"}),
+                json!({"kind":"ipv6_subnet", "address":"2001:db8:2::/64"}),
+            ]);
+            let mut expected_metrics = defaults();
+            expected_metrics["latency_us"] = json!(321);
+            expected_metrics["rlq_rx"] = json!(0);
+            let mut router = Node::router_with_format(&[addr], format).await;
+            let initial = router
+                .wait(|s| destination(s, "modem-a", mac).is_some())
+                .await;
+            assert_eq!(
+                destination(&initial, "modem-a", mac).unwrap()["addresses"],
+                json!(expected_addresses)
+            );
+            assert_eq!(
+                destination(&initial, "modem-a", mac).unwrap()["metrics"],
+                expected_metrics
+            );
+            let sid = session(&initial, "modem-a").unwrap()["session"].clone();
+            router
+                .control
+                .send(json!({"type":"destination_down", "request":1, "session":sid,"mac":mac}))
+                .await;
+            router.result(1, "accepted").await;
+            router
+                .wait(|s| {
+                    session(s, "modem-a").is_some() && destination(s, "modem-a", mac).is_none()
+                })
+                .await;
+            router
+                .control
+                .send(json!({"type":"destination_announce", "request":2, "session":sid,"mac":mac}))
+                .await;
+            router.result(2, "accepted").await;
+            // An encoding failure must not masquerade as success via automatic
+            // reconnect and a fresh Up. Require every address on the same session.
+            let restored = router
+                .wait(|s| {
+                    session(s, "modem-a").is_some_and(|p| p["session"] == sid)
+                        && destination(s, "modem-a", mac)
+                            .is_some_and(|d| d["addresses"] == json!(expected_addresses))
+                })
+                .await;
+            assert_eq!(
+                destination(&restored, "modem-a", mac).unwrap()["metrics"],
+                expected_metrics
+            );
+            radio.control.batch(vec![
+                json!({"type":"destination_addresses", "mac":mac,"remove":{"ipv6_subnets":["2001:db8:2::/64"]}}),
+                json!({"type":"destination_update", "mac":mac,"metrics":{"latency_us":654}}),
+            ]).await;
+            expected_addresses.pop();
+            let updated = router
+                .wait(|s| {
+                    destination(s, "modem-a", mac).is_some_and(|d| {
+                        d["addresses"] == json!(expected_addresses)
+                            && d["metrics"]["latency_us"] == 654
+                    })
+                })
+                .await;
+            assert_eq!(session(&updated, "modem-a").unwrap()["session"], sid);
+            expected_metrics["latency_us"] = json!(654);
+            assert_eq!(
+                destination(&updated, "modem-a", mac).unwrap()["metrics"],
+                expected_metrics
+            );
+            router.stop().await;
+            router.assert_final_empty();
+            radio.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn radio_mac_policy_preserves_valid_reports_commands_and_replay() {
     for (format, valid, invalid) in [("eui48", MAC, MAC64), ("eui64", MAC64, MAC)] {
         for ip in ["127.0.0.1", "::1"] {

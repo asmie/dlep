@@ -988,6 +988,17 @@ The order of work was:
     Runtime tests hold Up acknowledgements and exercise live MAC-overhead
     boundaries over IPv4/IPv6 with both EUI-48 and EUI-64.
 
+42. Bounded Destination Announce responses. **Done** — a snapshot that fits
+    Destination Up can exceed the response limit once Status is included. The
+    shared address packer now starts with a successful response containing the
+    metrics, then uses Destination Updates for remaining addresses. This follows
+    the optional address fields and post-success updates described in
+    [RFC 8175 §12.14](https://www.rfc-editor.org/rfc/rfc8175.html#section-12.14).
+    Regressions retain near-limit destinations across withdrawal, restore their
+    exact addresses and metrics, and accept later changes. Real adapter tests
+    cover both MAC formats over IPv4/IPv6 and require the original session ID,
+    preventing reconnect-and-replay from masking a failed re-announcement.
+
 ---
 
 ## 10. Open questions / risks

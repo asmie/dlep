@@ -465,6 +465,148 @@ fn large_coalesced_address_replacements_keep_every_update_encodable() {
 }
 
 #[test]
+fn near_limit_destinations_reannounce_without_overflowing_the_status_item() {
+    for format in [MacAddressFormat::Eui48, MacAddressFormat::Eui64] {
+        let destination = match format {
+            MacAddressFormat::Eui48 => mac(1),
+            MacAddressFormat::Eui64 => MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 1]),
+        };
+        let metrics = LinkMetrics {
+            resources: Some(80),
+            rlq_rx: Some(60),
+            rlq_tx: Some(70),
+            mtu: Some(1500),
+            ..Default::default()
+        };
+        let config = dlep_fsm::SessionConfig {
+            mac_address_format: format,
+            initial_metrics: metrics,
+            ..Default::default()
+        };
+        let mut r = RouterSessionFsm::with_config(config.clone());
+        let mut m = ModemSessionFsm::with_config(config);
+        m.step(E::TcpAccepted);
+        let init = sent(&r.step(E::TcpConnected), M::SESSION_INITIALIZATION);
+        let response = sent(
+            &m.step(E::RecvMessage(init)),
+            M::SESSION_INITIALIZATION_RESPONSE,
+        );
+        r.step(E::RecvMessage(response));
+        // Address items total 65,441 bytes. With all declared metrics and the
+        // MAC, Up fits with just 3 (EUI-48) or 1 (EUI-64) body bytes to spare.
+        let mut expected = DestinationAddrs {
+            v4: (1..=4)
+                .map(|n| std::net::Ipv4Addr::new(192, 0, 2, n))
+                .collect(),
+            v6: (1..=3113)
+                .map(|n| std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, n))
+                .collect(),
+            v4_subnets: vec!["198.51.100.0/24".parse().unwrap()],
+            v6_subnets: vec!["2001:db8:2::/64".parse().unwrap()],
+        };
+        let up = sent(
+            &m.step(E::AppAddDestination {
+                mac: destination,
+                metrics,
+                addrs: expected.clone(),
+            }),
+            M::DESTINATION_UP,
+        );
+        let up = Message::decode(up.encode().unwrap().freeze()).unwrap();
+        let ack = sent(&r.step(E::RecvMessage(up)), M::DESTINATION_UP_RESPONSE);
+        m.step(E::RecvMessage(ack));
+        let down = sent(
+            &r.step(E::AppDropDestination {
+                mac: destination,
+                reason: S::SUCCESS,
+            }),
+            M::DESTINATION_DOWN,
+        );
+        let ack = sent(&m.step(E::RecvMessage(down)), M::DESTINATION_DOWN_RESPONSE);
+        r.step(E::RecvMessage(ack));
+        assert!(!r.destinations.contains_key(&destination));
+        let latest = LinkMetrics {
+            latency: Duration::from_micros(900),
+            resources: Some(0),
+            ..metrics
+        };
+        assert!(
+            m.step(E::AppUpdateMetrics {
+                mac: destination,
+                metrics: latest
+            })
+            .is_empty()
+        );
+        let announce = sent(
+            &r.step(E::AppAnnounceDestination { mac: destination }),
+            M::DESTINATION_ANNOUNCE,
+        );
+        let mut observed = DestinationAddrs::default();
+        let mut count = 0;
+        for action in m.step(E::RecvMessage(announce)) {
+            let A::SendMessage(message) = action else {
+                continue;
+            };
+            let encoded = message
+                .encode()
+                .expect("Announce must include Status without exceeding the wire limit");
+            assert!(encoded.len() <= usize::from(u16::MAX) + 4);
+            let message = Message::decode(encoded.freeze()).unwrap();
+            if count == 0 {
+                assert_eq!(message.message_type, M::DESTINATION_ANNOUNCE_RESPONSE);
+                assert_eq!(status(&message), S::SUCCESS);
+                assert_eq!(
+                    dlep_fsm::session_common::extract_link_metrics(&message),
+                    Some(latest)
+                );
+            } else {
+                assert_eq!(message.message_type, M::DESTINATION_UPDATE);
+                assert!(dlep_fsm::session_common::extract_link_metrics(&message).is_none());
+                assert!(dlep_fsm::session_common::extract_status(&message).is_none());
+            }
+            assert_eq!(
+                dlep_fsm::session_common::extract_destination_mac(&message),
+                Some(destination)
+            );
+            AddressChanges::from_message(&message)
+                .apply_strict(&mut observed)
+                .unwrap();
+            r.step(E::RecvMessage(message));
+            assert_eq!(r.state(), RouterSessionState::InSession);
+            count += 1;
+        }
+        assert_eq!(count, 2);
+        assert_eq!(observed, expected);
+        assert_eq!(r.destinations[&destination].addrs, expected);
+        assert_eq!(r.destinations[&destination].metrics, latest);
+        assert_eq!(m.destinations[&destination].advertised_addrs, expected);
+        assert!(m.destinations[&destination].announced);
+        assert!(!m.destinations[&destination].pending_metrics);
+        // Later updates use the completed advertisement, including addresses
+        // delivered after the response, without duplicating the full snapshot.
+        let removed = DestinationAddrs {
+            v6_subnets: expected.v6_subnets.clone(),
+            ..Default::default()
+        };
+        let update = sent(
+            &m.step(E::AppUpdateAddresses {
+                mac: destination,
+                changes: AddressChanges {
+                    added: DestinationAddrs::default(),
+                    removed: removed.clone(),
+                },
+            }),
+            M::DESTINATION_UPDATE,
+        );
+        assert_eq!(AddressChanges::from_message(&update).removed, removed);
+        r.step(E::RecvMessage(update));
+        expected.v6_subnets.clear();
+        assert_eq!(r.destinations[&destination].addrs, expected);
+        assert_eq!(m.state(), ModemSessionState::InSession);
+    }
+}
+
+#[test]
 fn withdrawn_destinations_reannounce_current_addresses_and_preserve_request_hints() {
     let (mut r, mut m) = sessions();
     announce_up(&mut r, &mut m, 1, addresses(1));

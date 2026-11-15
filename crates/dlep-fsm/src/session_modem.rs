@@ -7,11 +7,12 @@ use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 
 use crate::events::{EmittedEvent, FsmAction, FsmEvent};
 use crate::session_common::{
-    SessionConfig, build_destination_announce_response, build_destination_down,
-    build_destination_up, build_destination_update, build_destination_updates, build_heartbeat,
-    build_session_termination, build_session_termination_response, build_session_update,
-    build_session_update_response, extract_destination_mac, extract_extensions_supported,
-    extract_heartbeat_interval, extract_status, heartbeat_reset_action, local_heartbeat_interval,
+    SessionConfig, build_destination_announce_response, build_destination_announce_success,
+    build_destination_down, build_destination_up, build_destination_update,
+    build_destination_updates, build_heartbeat, build_session_termination,
+    build_session_termination_response, build_session_update, build_session_update_response,
+    extract_destination_mac, extract_extensions_supported, extract_heartbeat_interval,
+    extract_status, heartbeat_reset_action, local_heartbeat_interval,
 };
 use crate::session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
@@ -523,26 +524,28 @@ impl ModemSessionFsm {
                 if msg.message_type == MessageType::DESTINATION_ANNOUNCE =>
             {
                 let mac = extract_destination_mac(&msg).expect("validated MAC");
-                let mut response =
-                    build_destination_announce_response(mac, StatusCode::REQUEST_DENIED);
-                if let Some(destination) = self.destinations.get_mut(&mac) {
-                    response = build_destination_up(mac, &destination.metrics, &destination.addrs);
-                    response.message_type = MessageType::DESTINATION_ANNOUNCE_RESPONSE;
-                    response.data_items.push(DataItem::Status {
-                        code: StatusCode::SUCCESS,
-                        text: String::new(),
-                    });
+                let responses = if let Some(destination) = self.destinations.get_mut(&mac) {
+                    let responses = build_destination_announce_success(
+                        mac,
+                        &destination.metrics,
+                        &destination.addrs,
+                    );
                     destination.announced = true;
                     destination.pending_metrics = false;
                     destination.advertised_addrs = destination.addrs.clone();
-                }
-                let mut actions = vec![
-                    FsmAction::SendMessage(response),
-                    FsmAction::Emit(EmittedEvent::DestinationAnnounced {
+                    responses
+                } else {
+                    vec![build_destination_announce_response(
                         mac,
-                        requested_addresses: AddressChanges::from_message(&msg),
-                    }),
-                ];
+                        StatusCode::REQUEST_DENIED,
+                    )]
+                };
+                let mut actions: Vec<_> =
+                    responses.into_iter().map(FsmAction::SendMessage).collect();
+                actions.push(FsmAction::Emit(EmittedEvent::DestinationAnnounced {
+                    mac,
+                    requested_addresses: AddressChanges::from_message(&msg),
+                }));
                 if let Some(reset) =
                     heartbeat_reset_action(TIMER_HEARTBEAT_MISSED, self.peer_heartbeat_interval)
                 {
