@@ -231,6 +231,12 @@ over IPv4 and IPv6 before restarting on the same port. This deterministically
 checks reuse with an old connection in TIME_WAIT and verifies that a second
 live modem still cannot bind the listening endpoint.
 
+The TCP monitor's filter-setup failure test binds a process-specific abstract
+Unix socket name, verifies it cannot be rebound while owned, then locks its BPF
+filter to force setup failure. Rebinding after the error proves the socket was
+released without competing with parallel tests for an ephemeral TCP port. The
+test also checks that a new packet monitor can still start afterward.
+
 The normal workspace and coverage runs include `dlep-daemon/tests/churn.rs`.
 It keeps the same daemons alive for 100 successive sessions per address family
 (200 total), alternates termination initiators, and reuses destination MACs

@@ -464,37 +464,44 @@ mod platform {
 
         #[tokio::test]
         async fn filter_setup_failure_releases_socket_and_allows_retry() {
-            for bind in ["127.0.0.1:0", "[::1]:0"] {
-                let addr: SocketAddr = bind.parse().unwrap();
-                // Use a TCP listener so rebinding its port proves that failed
-                // setup closed the owned socket, without fd-reuse races.
-                let socket =
-                    Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
-                        .unwrap();
-                socket.bind(&addr.into()).unwrap();
-                socket.listen(1).unwrap();
-                let addr = socket.local_addr().unwrap().as_socket().unwrap();
-                filter_low_ttl(&socket).unwrap();
-                let locked: libc::c_int = 1;
-                // SAFETY: locked is a live integer of the size SO_LOCK_FILTER
-                // expects. The kernel forbids subsequent filter replacement.
-                let result = unsafe {
-                    libc::setsockopt(
-                        socket.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_LOCK_FILTER,
-                        (&locked as *const libc::c_int).cast(),
-                        std::mem::size_of_val(&locked) as libc::socklen_t,
-                    )
-                };
-                assert_eq!(result, 0, "{}", io::Error::last_os_error());
-                let error = Monitor::from_socket(socket)
-                    .err()
-                    .expect("locked filter must reject monitor setup");
-                assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-                let _rebound = TcpListener::bind(addr).await.unwrap();
-                assert!(Monitor::new().is_ok());
-            }
+            // An abstract Unix name is released when its socket closes. This
+            // test owns the name, so parallel TCP tests cannot claim it between
+            // failed setup and rebinding, as they could with an ephemeral port.
+            let addr = socket2::SockAddr::unix(format!(
+                "\0dlep-filter-setup-failure-{}",
+                std::process::id()
+            ))
+            .unwrap();
+            let socket = Socket::new(Domain::UNIX, Type::DGRAM, None).unwrap();
+            socket.bind(&addr).unwrap();
+            let rebound = Socket::new(Domain::UNIX, Type::DGRAM, None).unwrap();
+            assert_eq!(
+                rebound.bind(&addr).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse,
+                "a live socket must keep the name reserved"
+            );
+            filter_low_ttl(&socket).unwrap();
+            let locked: libc::c_int = 1;
+            // SAFETY: locked is a live integer of the size SO_LOCK_FILTER
+            // expects. The kernel forbids subsequent filter replacement.
+            let result = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LOCK_FILTER,
+                    (&locked as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&locked) as libc::socklen_t,
+                )
+            };
+            assert_eq!(result, 0, "{}", io::Error::last_os_error());
+            let error = Monitor::from_socket(socket)
+                .err()
+                .expect("locked filter must reject monitor setup");
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            rebound
+                .bind(&addr)
+                .expect("failed setup must release the owned socket's name");
+            assert!(Monitor::new().is_ok());
         }
 
         #[tokio::test]

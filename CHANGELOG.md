@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The TCP monitor cleanup test uses an owned abstract Unix socket name to verify
+  failed setup releases its socket, avoiding ephemeral-port races with parallel
+  network tests.
 - Radio link grants enter the replay cache only after the session accepts and
   writes the response. Replies rejected during termination or cancelled before
   acceptance leave the cache unchanged, and later radio reports wait for the
