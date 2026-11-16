@@ -13,11 +13,39 @@ use dlep_core::{
 use crate::events::{DestinationAddrs, FsmAction, LinkMetrics};
 use crate::timers::TimerId;
 
+/// Admission of unsolicited Destination Up announcements. Explicit router
+/// Announce requests express interest independently of this startup policy.
+#[derive(Clone, Debug)]
+pub struct DestinationPolicy {
+    pub default_accept: bool,
+    pub allow: std::collections::HashSet<MacAddress>,
+    pub deny: std::collections::HashSet<MacAddress>,
+}
+
+impl Default for DestinationPolicy {
+    fn default() -> Self {
+        Self {
+            default_accept: true,
+            allow: Default::default(),
+            deny: Default::default(),
+        }
+    }
+}
+
+impl DestinationPolicy {
+    /// Explicit denials take precedence if a library caller supplies both.
+    pub fn accepts(&self, mac: MacAddress) -> bool {
+        !self.deny.contains(&mac) && (self.default_accept || self.allow.contains(&mac))
+    }
+}
+
 /// FSM-side configuration. The runtime hydrates this from `TimersConfig` and
 /// the per-role config (router or modem) before constructing the FSM, so the
 /// state handlers themselves never reach into config files or environment.
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
+    /// Router-only admission policy, fixed for this session.
+    pub destination_policy: DestinationPolicy,
     /// Fixed for the session lifetime; must match the modem's link-layer format.
     pub mac_address_format: dlep_core::MacAddressFormat,
     pub peer_description: String,
@@ -52,6 +80,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            destination_policy: DestinationPolicy::default(),
             mac_address_format: Default::default(),
             peer_description: "dlep-router".into(),
             initial_metrics: LinkMetrics::default(),

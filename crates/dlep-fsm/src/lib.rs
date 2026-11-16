@@ -26,7 +26,7 @@ pub use commands::{CommandError, CommandInfo, CommandKind, CommandRejection};
 pub use events::{
     DestinationAddrs, FsmAction, FsmEvent, LinkCharacteristics, LinkMetrics, SendTarget,
 };
-pub use session_common::SessionConfig;
+pub use session_common::{DestinationPolicy, SessionConfig};
 pub use session_router::{
     TIMER_HEARTBEAT, TIMER_HEARTBEAT_MISSED, TIMER_SESSION_INIT, TIMER_TERMINATION,
 };

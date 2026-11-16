@@ -230,6 +230,8 @@ pub enum DiscoveryMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(from = "RouterConfigFile")]
 pub struct RouterConfig {
+    #[serde(default)]
+    pub destinations: DestinationPolicyConfig,
     /// Used by the router binary; library embedders integrate directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<RouterAdapterConfig>,
@@ -248,6 +250,7 @@ pub struct RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
+            destinations: DestinationPolicyConfig::default(),
             adapter: None,
             limits: RouterLimits::default(),
             shared: SharedConfig::default(),
@@ -255,6 +258,79 @@ impl Default for RouterConfig {
             static_peers: Vec::new(),
             peer_description: default_router_peer_description(),
         }
+    }
+}
+
+/// Startup policy for unsolicited Destination Up announcements.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DestinationPolicyConfig {
+    pub default_accept: bool,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl Default for DestinationPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default_accept: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+impl DestinationPolicyConfig {
+    pub fn policy(
+        &self,
+        format: dlep_core::MacAddressFormat,
+    ) -> Result<dlep_fsm::DestinationPolicy, String> {
+        fn parse(text: &str) -> Result<dlep_core::MacAddress, String> {
+            let parts: Vec<_> = text.split(':').collect();
+            if !matches!(parts.len(), 6 | 8)
+                || parts
+                    .iter()
+                    .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err(format!(
+                    "invalid destination MAC {text:?}: expected 6 or 8 colon-separated hex octets"
+                ));
+            }
+            let octets = parts
+                .iter()
+                .map(|p| u8::from_str_radix(p, 16))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| format!("invalid destination MAC {text:?}"))?;
+            Ok(if octets.len() == 6 {
+                dlep_core::MacAddress::Eui48(octets.try_into().unwrap())
+            } else {
+                dlep_core::MacAddress::Eui64(octets.try_into().unwrap())
+            })
+        }
+        let mut policy = dlep_fsm::DestinationPolicy {
+            default_accept: self.default_accept,
+            ..Default::default()
+        };
+        let mut seen = std::collections::HashSet::new();
+        for (entries, accepted) in [(&self.allow, true), (&self.deny, false)] {
+            for text in entries {
+                let mac = parse(text)?;
+                if !format.accepts(mac) {
+                    return Err(format!(
+                        "destination {text} does not match network.mac_address_format"
+                    ));
+                }
+                if !seen.insert(mac) {
+                    return Err(format!("duplicate or conflicting destination {text}"));
+                }
+                if accepted {
+                    policy.allow.insert(mac);
+                } else {
+                    policy.deny.insert(mac);
+                }
+            }
+        }
+        Ok(policy)
     }
 }
 
@@ -433,6 +509,8 @@ impl Default for ModemConfig {
 #[serde(deny_unknown_fields)]
 struct RouterConfigFile {
     #[serde(default)]
+    destinations: DestinationPolicyConfig,
+    #[serde(default)]
     adapter: Option<RouterAdapterConfig>,
     #[serde(default)]
     limits: RouterLimits,
@@ -453,6 +531,7 @@ struct RouterConfigFile {
 impl From<RouterConfigFile> for RouterConfig {
     fn from(file: RouterConfigFile) -> Self {
         Self {
+            destinations: file.destinations,
             adapter: file.adapter,
             limits: file.limits,
             shared: SharedConfig {

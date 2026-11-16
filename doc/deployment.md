@@ -125,6 +125,40 @@ session address, announce, withdrawal, and link-characteristic commands. See the
 adapter. It shares the service sandbox and user, with ambient capabilities
 cleared; provision access to your routing service explicitly.
 
+### Destination admission
+
+Routers accept all unsolicited Destination Up announcements by default. A
+router-only `[destinations]` section can select which MAC addresses to accept:
+
+```toml
+[destinations]
+default_accept = false
+allow = ["02:00:00:00:00:01", "02:00:00:00:00:02"]
+```
+
+Alternatively, use `default_accept = true` with `deny = ["02:00:00:00:00:03"]`
+to accept everything except listed destinations. An empty allow list with
+`default_accept = false` declines every unsolicited destination. MACs must use
+six or eight colon-separated hexadecimal octets matching
+`network.mac_address_format`; duplicates, conflicting entries, and unknown
+fields fail `--check-config` and library startup.
+
+A declined Up receives Not Interested, as permitted by
+[RFC 8175 §12.12](https://www.rfc-editor.org/rfc/rfc8175.html#section-12.12).
+The router publishes no Destination Up event or retained destination for it.
+The modem retains its physical data and reports the refusal through its normal
+Up-response event. Explicit router Announce commands still express interest and
+can retrieve such a destination, including later metric/address changes. This
+is unsolicited-announcement admission, not an access-control boundary.
+
+Policy is fixed at daemon startup, applies to all modem sessions, and takes
+effect again on reconnect. Existing accepted destinations retain their normal
+update/withdrawal behavior. Restart the router to change the configured policy.
+Library users can set `RouterConfig.destinations` using `DestinationPolicyConfig`;
+direct FSM users can set the typed `SessionConfig.destination_policy` using
+`DestinationPolicy`. Typed policies give explicit denials precedence if a caller
+includes an address in both sets; TOML configuration rejects that conflict.
+
 | Section | Field | Default | Meaning |
 |---|---|---|---|
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |

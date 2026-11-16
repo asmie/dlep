@@ -46,6 +46,8 @@ where
 /// Errors surfaced by `--check-config` style validation.
 #[derive(Debug, Error)]
 pub enum ConfigCheckError {
+    #[error("invalid [destinations] policy: {0}")]
+    DestinationPolicy(String),
     #[error("invalid router limits: {0}")]
     Limits(String),
     #[error("invalid timers: {0}")]
@@ -67,6 +69,9 @@ pub enum ConfigCheckError {
 /// Validate a router configuration without starting the daemon: TLS
 /// material must load when `use_tls` is on, and static mode needs peers.
 pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
+    cfg.destinations
+        .policy(cfg.shared.network.mac_address_format)
+        .map_err(ConfigCheckError::DestinationPolicy)?;
     if let Some(adapter) = &cfg.adapter {
         adapter
             .validate()

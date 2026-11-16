@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Routers support a startup `[destinations]` admission policy with default
+  acceptance and MAC allow/deny lists. Declined Destination Up announcements
+  receive Not Interested and do not enter router state. Explicit Announce
+  requests can still express interest in a previously declined destination.
+  Configuration checks reject invalid, conflicting, or wrong-format entries.
 - Both CLIs now accept `--bind-addr` and `--discovery-port` overrides; the modem
   also accepts `--tcp-port`, including zero for an allocated listen port. These
   override TOML for startup and `--check-config`, including through `dlep router`

@@ -108,6 +108,9 @@ and the modem's `--tcp-port`; see the [deployment guide](doc/deployment.md#3-con
 See the [feature backlog](doc/architecture.md#feature-backlog) for remaining
 product work and its scope.
 
+Routers can filter unsolicited destinations with a `[destinations]` allow/deny
+policy; see [destination admission](doc/deployment.md#destination-admission).
+
 CLI flags shared by both binaries:
 
 | Flag           | Purpose                                                  |

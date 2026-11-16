@@ -325,6 +325,17 @@ impl RouterSessionFsm {
                 if msg.message_type == MessageType::DESTINATION_UP =>
             {
                 let mac = extract_destination_mac(&msg).expect("validated MAC");
+                if !self.config.destination_policy.accepts(mac) {
+                    let mut actions = vec![FsmAction::SendMessage(build_destination_up_response(
+                        mac,
+                        StatusCode::NOT_INTERESTED,
+                    ))];
+                    actions.extend(heartbeat_reset_action(
+                        TIMER_HEARTBEAT_MISSED,
+                        self.peer_heartbeat_interval,
+                    ));
+                    return actions;
+                }
                 let mut metrics = self.session_metrics;
                 merge_link_metrics(&msg, &mut metrics);
                 let mut addrs = DestinationAddrs::default();

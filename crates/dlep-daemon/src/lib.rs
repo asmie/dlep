@@ -22,8 +22,8 @@ pub use cli::{
     ConfigCheckError, ConfigLoadError, check_modem_config, check_router_config, load_toml_config,
 };
 pub use config::{
-    DiscoveryMode, MetricsConfig, ModemConfig, NetworkConfig, RadioConfig, RouterAdapterConfig,
-    RouterConfig, RouterLimits, SharedConfig, TimersConfig, TlsConfig,
+    DestinationPolicyConfig, DiscoveryMode, MetricsConfig, ModemConfig, NetworkConfig, RadioConfig,
+    RouterAdapterConfig, RouterConfig, RouterLimits, SharedConfig, TimersConfig, TlsConfig,
 };
 pub use connections::PeerConnectionState;
 pub use events::{
@@ -38,5 +38,5 @@ pub use state::{
 };
 pub use tls::TlsSetupError;
 
-pub use dlep_fsm::{CommandError, CommandInfo, CommandKind, CommandRejection};
+pub use dlep_fsm::{CommandError, CommandInfo, CommandKind, CommandRejection, DestinationPolicy};
 pub use runtime::{CommandReport, DaemonError, SessionCommand};

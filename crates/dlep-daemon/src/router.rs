@@ -26,6 +26,7 @@ type SessionTaskHandle = JoinHandle<Result<(), DaemonError>>;
 /// Public router handle. Holds channel senders, the timers config, and
 /// background task handles.
 pub struct RouterDaemon {
+    destination_policy: dlep_fsm::DestinationPolicy,
     events_tx: EventTx,
     state: Arc<crate::state::StateRegistry>,
     connections: Arc<ConnectionRegistry>,
@@ -189,6 +190,7 @@ impl RouterDaemon {
         let mut session_cfg =
             session_config_from_timers(&self.timers, self.peer_description.clone(), advertised);
         session_cfg.mac_address_format = self.network.mac_address_format;
+        session_cfg.destination_policy = self.destination_policy.clone();
         let fsm = RouterSessionFsm::with_config(session_cfg);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
@@ -423,6 +425,10 @@ impl RouterBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("RouterConfig required".into()))?;
+        let destination_policy = cfg
+            .destinations
+            .policy(cfg.shared.network.mac_address_format)
+            .map_err(DaemonError::Config)?;
         cfg.shared
             .timers
             .validate()
@@ -436,6 +442,7 @@ impl RouterBuilder {
         let reaper = connections.reap_periodically();
         let (events_tx, _events_rx) = new_event_channel();
         Ok(RouterDaemon {
+            destination_policy,
             events_tx,
             state: crate::state::StateRegistry::new(),
             connections,

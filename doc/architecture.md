@@ -520,16 +520,16 @@ section records the limits of the available evidence.
 
 ### Feature backlog
 
-The current practical feature scope has five areas, one completed in chunk 69.
-The four remaining areas are the next product priorities. Roughly 6–10 focused
+The current practical feature scope has five areas, two completed in chunks 69–70.
+The three remaining areas are the next product priorities. Roughly 6–10 focused
 implementation chunks for the whole group is a planning estimate, including
-chunk 69; it is not an RFC-completeness percentage or a release prerequisite.
+chunks 69–70; it is not an RFC-completeness percentage or a release prerequisite.
 Validation should accompany features rather than become an open-ended queue.
 
 | Feature | Status / next behavior |
 | --- | --- |
 | Network CLI overrides | Done in chunk 69: bind/discovery options for both roles and TCP listen port for the modem |
-| Router destination acceptance policy | Pending: configurable refusal with Not Interested instead of always accepting Destination Up |
+| Router destination acceptance policy | Done in chunk 70: startup allow/deny lists and default acceptance, with Not Interested replies for declined Up announcements |
 | Secured-medium Peer Type flag | Pending: configure and expose the flag through library and adapter metadata |
 | DNS endpoints and TLS server names | Pending: resolve named peers while retaining the intended certificate identity |
 | Shell completions | Pending: generate completions for standalone commands and the combined launcher |
@@ -1368,6 +1368,16 @@ The order of work was:
     parsing. Release smoke sessions exercise override precedence over incorrect
     TOML addresses/ports across IPv4, IPv6, TLS, static peers, and discovery.
     The feature backlog above separates remaining product work from validation.
+
+70. Router destination admission. **Done** — router `[destinations]` defaults
+    to accepting all unsolicited Up announcements and supports allow/deny lists
+    with a configurable default. Startup/config checks reject malformed MACs,
+    format mismatches, duplicates, conflicting entries, and unknown fields.
+    Each session inherits the policy; refused announcements receive Not
+    Interested and create no router destination. Modems retain physical state
+    and receive their normal Up-response outcome. Explicit router Announce can
+    still retrieve declined destinations. IPv4/IPv6 cases cover both MAC formats,
+    allow/deny modes, retained state, and Announce after physical updates.
 
 ---
 
