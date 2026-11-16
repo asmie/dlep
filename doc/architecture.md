@@ -324,6 +324,24 @@ Session-down hooks receive `SessionClosing`; destination-down hooks may request
 termination while the session is active. The request returns queue acceptance,
 not wire acknowledgement. Application/CLI reconnect policy is unchanged.
 
+Discovery hooks use a separate pre-session context and require explicit
+`supports_discovery()` plus a nonempty advertised ID list. Both daemon roles
+pass their configured registry to discovery, but this does not negotiate TCP
+extensions. Native socket TTL/interface checks and connected-router suppression
+run before hooks. Role-compatible standard signals are projected to their core
+items and validated before extension-item callbacks. Unknown TLVs must all be
+claimed in registration order; whole-signal observers then see the original
+items, and the FSM receives the validated core projection. Observation events
+can therefore precede `PeerDiscovered`.
+
+Outgoing hooks append only non-core/non-reserved TLVs. Shared budgets allow 32
+items and 4096 bytes per signal, including headers, with an additional UDP size
+bound. Core fields and send targets cannot be replaced. Incoming contexts expose
+metadata/events without send or session-control capabilities. Discovery data is
+unauthenticated; normal session negotiation remains mandatory for TCP hooks.
+The original low-level discovery runner keeps its no-hook behavior; an explicit
+runner accepts an extension registry and role.
+
 
 ---
 
@@ -563,12 +581,12 @@ areas below. Validation should continue to accompany features.
 | DNS endpoints and TLS server names | Done in chunks 73–74: library connections, CLI/configuration DNS peers, preserved TLS identities, and name-aware retries |
 | Shell completions | Done in chunk 72: Bash, Elvish, Fish, PowerShell, and Zsh scripts generated from the standalone and combined CLI definitions |
 
-Three larger scope areas remain optional follow-ups:
+Extension termination, factory settings, and standard-signal discovery hooks are
+complete in chunks 75–77. Arbitrary rustls configurations can already be supplied
+through builders; custom TLS verification does not require weakening defaults.
 
-- Discovery extension hooks remain; explicit session termination requests and
-  per-extension factory settings are complete in chunks 75–76. Arbitrary rustls configurations can
-  already be supplied through builders; custom TLS verification does not require
-  weakening the default policy.
+Two larger scope areas remain optional follow-ups:
+
 - Simultaneous IPv4/IPv6 discovery; the configured bind family currently selects
   one discovery transport.
 - Non-Linux daemon transport; macOS currently covers portable protocol crates.
@@ -1475,6 +1493,20 @@ The order of work was:
     Bundled commands reject unregistered settings before adapters or startup.
     Round trips, defaults, validation, ordering, and IPv4/IPv6 negotiated payloads
     cover independent configured instances from shared factory recipes.
+
+77. Discovery extension hooks. **Done** — explicitly opted-in plugins with
+    advertised IDs can append bounded extension TLVs and inspect incoming Peer
+    Discovery/Peer Offer signals through a separate pre-session context. Core
+    grammar, TTL/interface filtering, and connected-router suppression precede
+    receive hooks. Every unknown item must be claimed before core processing;
+    original items and packet metadata remain available to observers. Outgoing
+    additions cannot replace core fields or targets, and share item/byte/UDP
+    size budgets. Existing plugins/runners keep their defaults; discovery never
+    activates TCP hooks without mutual negotiation. IPv4/IPv6 cases cover
+    extended discovery-to-session flows, metadata, secured-medium preservation,
+    negotiation mismatch, active connection suppression, and packet filtering.
+    Focused checks cover callback order, opt-in, unclaimed/malformed input, and
+    aggregate output budgets without disrupting the core signal.
 
 ---
 

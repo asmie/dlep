@@ -453,6 +453,7 @@ impl ModemBuilder {
             local_addr,
             events_tx.clone(),
             connected_routers.clone(),
+            extensions.clone(),
         )
         .await?
         {
@@ -501,6 +502,7 @@ async fn spawn_modem_discovery(
     local_addr: SocketAddr,
     events_tx: EventTx,
     connected_routers: ConnectedRouters,
+    extensions: ExtensionRegistry,
 ) -> Result<Option<(mpsc::Sender<()>, JoinHandle<Result<(), DaemonError>>)>, DaemonError> {
     use dlep_fsm::discovery_modem::ModemDiscoveryFsm;
 
@@ -533,6 +535,7 @@ async fn spawn_modem_discovery(
             rx,
             events_tx,
             Some(connected_routers),
+            crate::discovery::DiscoveryHooks::new(&extensions, Role::Modem),
         )
         .await
     });

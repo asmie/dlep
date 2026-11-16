@@ -12,6 +12,9 @@
 //! `_ => Vec::new()` branch). So unlike `session::TimerSet`, no
 //! generation tracking is needed here.
 
+mod extensions;
+pub(crate) use extensions::DiscoveryHooks;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -124,7 +127,39 @@ pub async fn run_discovery<F: DiscoveryFsm>(
     shutdown_rx: mpsc::Receiver<()>,
     events_tx: EventTx,
 ) -> Result<(), DaemonError> {
-    run_discovery_with_peers(fsm, socket, initial_event, shutdown_rx, events_tx, None).await
+    run_discovery_with_peers(
+        fsm,
+        socket,
+        initial_event,
+        shutdown_rx,
+        events_tx,
+        None,
+        DiscoveryHooks::default(),
+    )
+    .await
+}
+
+/// Run discovery with explicitly enabled pre-session extension hooks. Session
+/// negotiation remains independent. `role` determines compatible signal types.
+pub async fn run_discovery_with_extensions<F: DiscoveryFsm>(
+    fsm: F,
+    socket: DiscoverySocket,
+    initial_event: Option<FsmEvent>,
+    shutdown_rx: mpsc::Receiver<()>,
+    events_tx: EventTx,
+    registry: dlep_ext::ExtensionRegistry,
+    role: dlep_ext::Role,
+) -> Result<(), DaemonError> {
+    run_discovery_with_peers(
+        fsm,
+        socket,
+        initial_event,
+        shutdown_rx,
+        events_tx,
+        None,
+        DiscoveryHooks::new(&registry, role),
+    )
+    .await
 }
 
 pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
@@ -134,6 +169,7 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
     shutdown_rx: mpsc::Receiver<()>,
     events_tx: EventTx,
     connected_routers: Option<ConnectedRouters>,
+    hooks: DiscoveryHooks,
 ) -> Result<(), DaemonError> {
     run_discovery_io(
         fsm,
@@ -142,6 +178,7 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
         shutdown_rx,
         events_tx,
         connected_routers,
+        hooks,
     )
     .await
 }
@@ -153,6 +190,7 @@ async fn run_discovery_io<F: DiscoveryFsm>(
     mut shutdown_rx: mpsc::Receiver<()>,
     events_tx: EventTx,
     connected_routers: Option<ConnectedRouters>,
+    hooks: DiscoveryHooks,
 ) -> Result<(), DaemonError> {
     let mut timers = DiscoveryTimers::default();
     // Capacity 8 is comfortably above the expected steady-state queue
@@ -171,6 +209,7 @@ async fn run_discovery_io<F: DiscoveryFsm>(
             &timer_tx,
             None,
             None,
+            &hooks,
         )
         .await?;
     }
@@ -192,8 +231,12 @@ async fn run_discovery_io<F: DiscoveryFsm>(
                             tokio::task::yield_now().await;
                             continue;
                         }
+                        let Some(signal) = hooks.receive(signal, from, local_addr, interface_index, &events_tx) else {
+                            tokio::task::yield_now().await;
+                            continue;
+                        };
                         let actions = fsm.step(FsmEvent::RecvSignal { signal, from });
-                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local_addr), Some(interface_index)).await?;
+                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local_addr), Some(interface_index), &hooks).await?;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                         // A peer controls its datagram contents. Malformed
@@ -210,7 +253,7 @@ async fn run_discovery_io<F: DiscoveryFsm>(
             }
             Some((id, kind)) = timer_rx.recv() => {
                 let actions = fsm.step(FsmEvent::TimerExpired(id, kind));
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None).await?;
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None, &hooks).await?;
             }
             // Losing the owner is also shutdown; otherwise the receive loop
             // and periodic probe task outlive the last shutdown sender.
@@ -218,13 +261,14 @@ async fn run_discovery_io<F: DiscoveryFsm>(
                 let actions = fsm.step(FsmEvent::AppShutdown {
                     reason: dlep_core::StatusCode::SHUTTING_DOWN,
                 });
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None).await?;
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None, &hooks).await?;
                 return Ok(());
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_actions(
     actions: Vec<FsmAction>,
     socket: &impl DiscoveryIo,
@@ -233,38 +277,46 @@ async fn process_actions(
     timer_tx: &mpsc::Sender<(TimerId, TimerKind)>,
     local: Option<std::net::IpAddr>,
     interface_index: Option<u32>,
+    hooks: &DiscoveryHooks,
 ) -> Result<(), DaemonError> {
     for action in actions {
         match action {
-            FsmAction::SendSignal { mut signal, target } => match target {
-                SendTarget::DiscoveryGroup => {
-                    if let Err(e) = socket.send_to_group(&signal).await {
-                        warn!("discovery send_to_group failed: {e}");
-                    }
-                }
-                SendTarget::Unicast(addr) => {
-                    // Replace wildcard listeners with the selected ingress
-                    // interface's usable unicast address, never a multicast IP.
-                    if let Some(local) = local {
-                        for item in &mut signal.data_items {
-                            match (item, local) {
-                                (
-                                    dlep_core::DataItem::Ipv4ConnectionPoint { addr, .. },
-                                    std::net::IpAddr::V4(local),
-                                ) if addr.is_unspecified() => *addr = local,
-                                (
-                                    dlep_core::DataItem::Ipv6ConnectionPoint { addr, .. },
-                                    std::net::IpAddr::V6(local),
-                                ) if addr.is_unspecified() => *addr = local,
-                                _ => {}
-                            }
+            FsmAction::SendSignal { mut signal, target } => {
+                let peer = match &target {
+                    SendTarget::DiscoveryGroup => None,
+                    SendTarget::Unicast(addr) => Some(*addr),
+                };
+                hooks.send(&mut signal, peer, local, interface_index, events_tx);
+                match target {
+                    SendTarget::DiscoveryGroup => {
+                        if let Err(e) = socket.send_to_group(&signal).await {
+                            warn!("discovery send_to_group failed: {e}");
                         }
                     }
-                    if let Err(e) = socket.send_unicast(&signal, addr).await {
-                        warn!(?addr, "discovery send_unicast failed: {e}");
+                    SendTarget::Unicast(addr) => {
+                        // Replace wildcard listeners with the selected ingress
+                        // interface's usable unicast address, never a multicast IP.
+                        if let Some(local) = local {
+                            for item in &mut signal.data_items {
+                                match (item, local) {
+                                    (
+                                        dlep_core::DataItem::Ipv4ConnectionPoint { addr, .. },
+                                        std::net::IpAddr::V4(local),
+                                    ) if addr.is_unspecified() => *addr = local,
+                                    (
+                                        dlep_core::DataItem::Ipv6ConnectionPoint { addr, .. },
+                                        std::net::IpAddr::V6(local),
+                                    ) if addr.is_unspecified() => *addr = local,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Err(e) = socket.send_unicast(&signal, addr).await {
+                            warn!(?addr, "discovery send_unicast failed: {e}");
+                        }
                     }
                 }
-            },
+            }
             FsmAction::StartTimer {
                 id,
                 kind,
@@ -462,6 +514,7 @@ mod tests {
             rx,
             events,
             None,
+            DiscoveryHooks::default(),
         ));
         settle().await;
         assert_eq!(observed.sends.lock().unwrap().len(), 1);
@@ -504,7 +557,15 @@ mod tests {
         let (stop, rx) = mpsc::channel(1);
         let (events, _) = crate::runtime::new_event_channel();
         let modem = ModemDiscoveryFsm::new("0.0.0.0:854".parse().unwrap(), "test".into(), false);
-        let task = tokio::spawn(run_discovery_io(modem, socket, None, rx, events, None));
+        let task = tokio::spawn(run_discovery_io(
+            modem,
+            socket,
+            None,
+            rx,
+            events,
+            None,
+            DiscoveryHooks::default(),
+        ));
         for peer in ["192.0.2.1:10001", "192.0.2.2:10002", "192.0.2.1:10001"] {
             input
                 .send(incoming(SignalType::PEER_DISCOVERY, peer))
@@ -555,6 +616,7 @@ mod tests {
             rx,
             events,
             None,
+            DiscoveryHooks::default(),
         ));
         settle().await;
         assert_eq!(observed.receives.load(Ordering::SeqCst), 1);
@@ -606,6 +668,7 @@ mod tests {
                 rx,
                 events,
                 None,
+                DiscoveryHooks::default(),
             ));
             settle().await;
             assert_eq!(observed.receives.load(Ordering::SeqCst), 1);

@@ -41,6 +41,16 @@ remain shared exactly as before. Unknown settings names and duplicate factory
 names fail before factory invocation. The bundled commands have no dynamic
 plugin loader and reject settings without registered factories.
 
+Registered plugins can explicitly enable UDP discovery hooks with
+`supports_discovery()`. Both daemon roles automatically pass their configured
+plugins into discovery. The hooks can append bounded extension TLVs or inspect
+validated signals with packet metadata, while core fields, GTSM, interface
+filtering, and session negotiation remain managed by the existing paths.
+Low-level discovery runners can use `run_discovery_with_extensions`; the
+original `run_discovery` keeps its no-hook behavior. See the
+[extension API](https://github.com/asmie/dlep/blob/master/crates/dlep-ext/README.md#discovery-hooks)
+for the pre-session callback contract.
+
 ```toml
 [dependencies]
 dlep-daemon = "0.2.0"

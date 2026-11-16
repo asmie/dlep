@@ -28,6 +28,65 @@ The default trait method returns `Unsupported`, so existing custom contexts
 continue to compile. Termination affects one session, and the application's
 reconnect policy still applies.
 
+## Discovery hooks
+
+Discovery is separate from session negotiation. A plugin must override
+`supports_discovery()` to return true and advertise a nonempty ID list. Existing
+session-only plugins remain inactive on UDP discovery. Opted-in plugins can
+extend standard Peer Discovery and Peer Offer signals:
+
+```rust
+use std::sync::Arc;
+use dlep_core::{DataItemType, ExtensionId, RawDataItem, Signal, SignalType};
+use dlep_ext::{DiscoveryCtx, DlepExtension, ExtHandled};
+
+struct DiscoveryTag;
+impl DlepExtension for DiscoveryTag {
+    fn advertised_ids(&self) -> &[ExtensionId] { &[ExtensionId(0xF020)] }
+    fn supports_discovery(&self) -> bool { true }
+
+    fn on_discovery_send(&self, _: SignalType, ctx: &mut dyn DiscoveryCtx) {
+        let item = RawDataItem {
+            type_id: DataItemType(0xFF80),
+            value: b"vendor-tag".to_vec().into(),
+        };
+        if let Err(error) = ctx.add_data_item(item) {
+            ctx.emit_event(Arc::new(error));
+        }
+    }
+
+    fn on_discovery_data_item(
+        &self, _: &Signal, item: &RawDataItem, _: &mut dyn DiscoveryCtx,
+    ) -> ExtHandled {
+        if item.type_id == DataItemType(0xFF80) {
+            ExtHandled::Handled
+        } else {
+            ExtHandled::Passthrough
+        }
+    }
+}
+```
+
+`DiscoveryCtx::info()` provides role, direction, peer, local address, and ingress
+interface metadata where available. Incoming signals and their unicast replies
+have packet metadata; periodic multicast has no peer or ingress metadata.
+`on_discovery_signal` observes the complete original signal after every unknown
+item is claimed; the core FSM receives only core items. Item handlers stop at the
+first claimant in registration order. Unclaimed items discard the signal, and
+core grammar is checked before item hooks. Receive contexts are read-only.
+
+Outgoing additions may use non-core, non-reserved data-item types. All plugins
+share 32 items and 4096 bytes per signal, including TLV headers; additions also
+respect the UDP signal size limit. Rejected additions preserve the core signal.
+Hooks cannot replace core fields, destinations, or send arbitrary signal types.
+TTL/interface filtering and connected-router suppression precede receive hooks.
+
+Discovery metadata is unauthenticated, has no `SessionId`, and does not activate
+TCP hooks. Normal mutual session negotiation still applies. Hooks can emit
+opaque application events; receive events may precede `PeerDiscovered` because
+they run before the core discovery FSM. The same plugin instance may receive
+discovery and session callbacks concurrently.
+
 ```toml
 [dependencies]
 dlep-ext = "0.2.0"

@@ -240,6 +240,13 @@ defaults. Prebuilt `register_extension` instances retain their existing behavior
 Use `check_router_config_with_extensions` / `check_modem_config_with_extensions`
 to validate with the same catalog. See [configured plugins](doc/deployment.md#configured-extension-factories).
 
+Plugins can explicitly opt in to pre-session discovery through
+`supports_discovery()`. Separate send, data-item, and whole-signal hooks attach
+and inspect extension TLVs in Peer Discovery/Peer Offer signals. They receive
+datagram metadata and share bounded item/byte budgets; core fields and packet
+validation remain under the runtime. Discovery input is unauthenticated and does
+not activate negotiated TCP callbacks. See [discovery hooks](crates/dlep-ext/README.md#discovery-hooks).
+
 For direct connections, `connect_named("modem.example", 854)` resolves the host
 with the system resolver and verifies TLS against that hostname. It tries up to
 16 distinct addresses in resolver order within a shared 15-second deadline and

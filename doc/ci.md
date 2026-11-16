@@ -91,6 +91,12 @@ clones construct independent daemon instances. Release smoke requires all
 standalone/launcher roles to reject unregistered settings on both config checks
 and startup before adapters or sockets.
 
+Discovery-extension checks cover shared item/byte/UDP size budgets, core-field
+protection, opt-in and registration order, and dropping unclaimed or invalid
+input before core processing. Real IPv4/IPv6 flows verify datagram metadata,
+core offer fields, and independent TCP negotiation. Bad-TTL/wrong-interface
+traffic and connected-router probes must not reach receive hooks.
+
 Checkpoint 60 (2026-11-15) passed all eight archives, 591 archived Rust tests
 across 60 suites, three command installations, and 113 CLI/certificate checks
 plus four session scenarios for each build. Formatting, clippy, Rust 1.85,

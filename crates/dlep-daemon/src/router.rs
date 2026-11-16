@@ -118,13 +118,16 @@ impl RouterDaemon {
         let mut task_slot = self.discovery_task.lock().await;
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let events_tx = self.events_tx.clone();
+        let extensions = self.extensions.clone();
         let handle = tokio::spawn(async move {
-            crate::discovery::run_discovery(
+            crate::discovery::run_discovery_with_extensions(
                 fsm,
                 socket,
                 Some(FsmEvent::AppStartDiscovery),
                 shutdown_rx,
                 events_tx,
+                extensions,
+                Role::Router,
             )
             .await
         });

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Extensions can opt in to pre-session discovery hooks on both daemon roles.
+  Plugins can append bounded TLVs to Peer Discovery/Peer Offer signals and
+  inspect validated incoming items/signals with datagram metadata. Core fields,
+  GTSM/interface filtering, connected-router suppression, and TCP negotiation
+  remain intact. Unclaimed unknown items discard the datagram. Existing plugins
+  and the original low-level discovery runner retain their default behavior.
 - Embedders can register configured extension factories on both daemon builders,
   or supply an ordered `ExtensionCatalog`. Factories consume `[extensions.NAME]`
   tables before networking, with plugin-owned validation and defaults. Matching

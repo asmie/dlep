@@ -9,11 +9,18 @@
 
 #![allow(dead_code)]
 
+pub mod discovery;
+pub use discovery::{
+    DiscoveryCtx, DiscoveryDirection, DiscoveryInfo, DiscoveryItemError,
+    MAX_DISCOVERY_EXTENSION_BYTES, MAX_DISCOVERY_EXTENSION_ITEMS,
+};
+
 use std::any::Any;
 use std::sync::Arc;
 
 use dlep_core::{
-    DataItem, ExtensionId, LinkMetrics, MacAddress, Message, MessageType, RawDataItem, StatusCode,
+    DataItem, ExtensionId, LinkMetrics, MacAddress, Message, MessageType, RawDataItem, Signal,
+    SignalType, StatusCode,
 };
 
 /// Opaque session identifier produced by the runtime. `Copy`-cheap for
@@ -113,6 +120,40 @@ pub struct DestinationStateSnapshot {
 pub trait DlepExtension: Send + Sync + 'static {
     /// Extension IDs this plug-in advertises in Session Initialization.
     fn advertised_ids(&self) -> &[ExtensionId];
+
+    /// Opt in to discovery callbacks before session negotiation. At least one
+    /// advertised ID is also required. This does not activate session hooks;
+    /// their existing mutual-negotiation requirements still apply.
+    fn supports_discovery(&self) -> bool {
+        false
+    }
+
+    /// Add extension TLVs to an outgoing Peer Discovery or Peer Offer. Core
+    /// fields and the destination remain owned by the discovery FSM/runtime.
+    fn on_discovery_send(&self, kind: SignalType, ctx: &mut dyn DiscoveryCtx) {
+        let _ = (kind, ctx);
+    }
+
+    /// Consume an unknown TLV in a role-compatible signal whose core grammar
+    /// and extension budgets have passed validation. First handler wins. Every
+    /// unknown item must be claimed for the signal to reach the core FSM.
+    /// Other unclaimed items can still cause the datagram to be discarded.
+    fn on_discovery_data_item(
+        &self,
+        signal: &Signal,
+        item: &RawDataItem,
+        ctx: &mut dyn DiscoveryCtx,
+    ) -> ExtHandled {
+        let _ = (signal, item, ctx);
+        ExtHandled::Passthrough
+    }
+
+    /// Observe a complete valid signal after all unknown items were claimed.
+    /// It includes the original extension TLVs; the core FSM receives only its
+    /// core items. Discovery input is unauthenticated and has no SessionId.
+    fn on_discovery_signal(&self, signal: &Signal, ctx: &mut dyn DiscoveryCtx) {
+        let _ = (signal, ctx);
+    }
 
     /// Invoked after parsing the peer's Session Init / Session Init Response.
     /// Return `false` to opt out of this session (extension stays inert).
@@ -233,6 +274,10 @@ mod tests {
     }
 
     struct DefaultExtension;
+    #[test]
+    fn session_plugins_do_not_implicitly_enable_discovery_hooks() {
+        assert!(!DefaultExtension.supports_discovery());
+    }
     impl DlepExtension for DefaultExtension {
         fn advertised_ids(&self) -> &[ExtensionId] {
             &[ExtensionId(65000)]
