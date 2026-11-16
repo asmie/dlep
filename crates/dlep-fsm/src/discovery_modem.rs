@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use dlep_core::SignalType;
 
-use crate::discovery_common::build_peer_offer;
+use crate::discovery_common::build_peer_offer_with_secured_medium;
 use crate::events::{FsmAction, FsmEvent, SendTarget};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -18,6 +18,7 @@ pub struct ModemDiscoveryFsm {
     tcp_endpoint: SocketAddr,
     peer_description: String,
     use_tls: bool,
+    secured_medium: bool,
 }
 
 impl ModemDiscoveryFsm {
@@ -27,7 +28,13 @@ impl ModemDiscoveryFsm {
             tcp_endpoint,
             peer_description,
             use_tls,
+            secured_medium: false,
         }
+    }
+
+    pub fn with_secured_medium(mut self, secured_medium: bool) -> Self {
+        self.secured_medium = secured_medium;
+        self
     }
 
     pub fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
@@ -42,10 +49,11 @@ impl ModemDiscoveryFsm {
                 }
                 self.state = ModemDiscoveryState::OfferBurst;
                 vec![FsmAction::SendSignal {
-                    signal: build_peer_offer(
+                    signal: build_peer_offer_with_secured_medium(
                         &self.peer_description,
                         self.tcp_endpoint,
                         self.use_tls,
+                        self.secured_medium,
                     ),
                     target: SendTarget::Unicast(from),
                 }]

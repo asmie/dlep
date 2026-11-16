@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Modems can set top-level `secured_medium` (default false) to advertise RF-medium
+  access control in Peer Offers and initialization responses. Routers expose the
+  received flag in discovery/session metadata, snapshots, and adapter `session`
+  records, independently of TLS. `PeerInfo` and `PeerOffer` gain an optional
+  `secured_medium` field; manual Rust struct initializers must supply it.
 - Routers support a startup `[destinations]` admission policy with default
   acceptance and MAC allow/deny lists. Declined Destination Up announcements
   receive Not Interested and do not enter router state. Explicit Announce

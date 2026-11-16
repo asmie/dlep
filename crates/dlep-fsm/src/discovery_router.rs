@@ -103,6 +103,7 @@ impl RouterDiscoveryFsm {
                 vec![FsmAction::Emit(EmittedEvent::PeerDiscovered {
                     endpoints,
                     peer_description,
+                    secured_medium: crate::discovery_common::extract_secured_medium(&signal),
                 })]
             }
 

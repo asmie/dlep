@@ -325,9 +325,11 @@ fn translate(emitted: EmittedEvent) -> Option<DaemonEvent> {
         EmittedEvent::PeerDiscovered {
             endpoints,
             peer_description,
+            secured_medium,
         } => Some(DaemonEvent::PeerDiscovered(PeerOffer {
             endpoints,
             peer_description,
+            secured_medium,
         })),
         _ => None,
     }

@@ -134,6 +134,7 @@ fn spawn(fsm: impl SessionFsm + Send + 'static, stream: DuplexStream, role: Role
         rx,
         events,
         PeerInfo {
+            secured_medium: None,
             addr: "127.0.0.1:854".parse().unwrap(),
             is_tls: false,
             peer_description: None,

@@ -480,6 +480,9 @@ fn default_link_request_timeout_ms() -> u32 {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(from = "ModemConfigFile")]
 pub struct ModemConfig {
+    /// Whether the shared RF medium implements access control (Peer Type S flag).
+    #[serde(default)]
+    pub secured_medium: bool,
     #[serde(default)]
     pub metrics: MetricsConfig,
     /// Used by the `dlep-modem` binary; library embedders integrate directly.
@@ -494,6 +497,7 @@ pub struct ModemConfig {
 impl Default for ModemConfig {
     fn default() -> Self {
         Self {
+            secured_medium: false,
             metrics: MetricsConfig::default(),
             radio: None,
             shared: SharedConfig::default(),
@@ -549,6 +553,9 @@ impl From<RouterConfigFile> for RouterConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModemConfigFile {
+    /// Whether the shared RF medium implements access control (Peer Type S flag).
+    #[serde(default)]
+    secured_medium: bool,
     #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
@@ -565,6 +572,7 @@ struct ModemConfigFile {
 impl From<ModemConfigFile> for ModemConfig {
     fn from(file: ModemConfigFile) -> Self {
         Self {
+            secured_medium: file.secured_medium,
             shared: SharedConfig {
                 network: file.network,
                 tls: file.tls,

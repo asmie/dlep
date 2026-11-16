@@ -366,6 +366,7 @@ async fn slow_response_remains_valid_after_three_minutes_of_peer_activity() {
         receiver,
         event_tx,
         dlep_daemon::PeerInfo {
+            secured_medium: None,
             addr: "127.0.0.1:854".parse().unwrap(),
             is_tls: false,
             peer_description: None,

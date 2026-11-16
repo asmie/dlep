@@ -189,6 +189,7 @@ impl DlepExtension for TestExt {
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        secured_medium: false,
         radio: None,
         metrics: Default::default(),
         shared: SharedConfig {

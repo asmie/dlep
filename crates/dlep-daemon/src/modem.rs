@@ -443,6 +443,7 @@ impl ModemBuilder {
             events_tx.clone(),
             cfg.shared.timers.clone(),
             cfg.peer_description.clone(),
+            cfg.secured_medium,
             initial_metrics,
             cfg.shared.network.mac_address_format,
             session_cmds.clone(),
@@ -497,7 +498,8 @@ async fn spawn_modem_discovery(
         local_addr,
         cfg.peer_description.clone(),
         cfg.shared.network.use_tls,
-    );
+    )
+    .with_secured_medium(cfg.secured_medium);
 
     let (tx, rx) = mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {
@@ -520,6 +522,7 @@ async fn modem_accept_loop(
     events_tx: EventTx,
     timers: TimersConfig,
     peer_description: String,
+    secured_medium: bool,
     initial_metrics: LinkMetrics,
     mac_address_format: dlep_core::MacAddressFormat,
     session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
@@ -585,12 +588,14 @@ async fn modem_accept_loop(
             };
             info!(peer = %peer_addr, "modem accepted connection");
             let peer = PeerInfo {
+                secured_medium: None,
                 addr: peer_addr,
                 is_tls: transport.is_tls(),
                 peer_description: None,
             };
             let mut cfg =
                 session_config_from_timers(&timers, peer_description, extensions.advertised());
+            cfg.secured_medium = secured_medium;
             cfg.initial_metrics = initial_metrics;
             cfg.mac_address_format = mac_address_format;
             cfg.defer_link_characteristics = link_control.is_some();

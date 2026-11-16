@@ -7,6 +7,8 @@
 
 # Free-text description sent in the Peer Type data item.
 peer_description = "dlep-modem"
+# Whether the shared RF medium enforces access control; independent of DLEP TLS.
+secured_medium = false
 
 [network]
 # Match the modem's router-facing link: "eui48" (default) or "eui64".

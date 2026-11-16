@@ -21,6 +21,8 @@ impl From<MacAddress> for DestinationId {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
+    /// Modem-reported RF access control. None for router peers or before init.
+    pub secured_medium: Option<bool>,
     pub addr: SocketAddr,
     pub is_tls: bool,
     pub peer_description: Option<String>,
@@ -29,6 +31,8 @@ pub struct PeerInfo {
 /// Candidate endpoints from one modem offer, ordered TLS first, then IPv6.
 #[derive(Clone, Debug)]
 pub struct PeerOffer {
+    /// Modem-reported RF access control; None if Peer Type was omitted.
+    pub secured_medium: Option<bool>,
     pub endpoints: Vec<dlep_fsm::discovery_common::OfferEndpoint>,
     pub peer_description: Option<String>,
 }

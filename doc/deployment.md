@@ -159,11 +159,40 @@ direct FSM users can set the typed `SessionConfig.destination_policy` using
 `DestinationPolicy`. Typed policies give explicit denials precedence if a caller
 includes an address in both sets; TOML configuration rejects that conflict.
 
+### Modem secured-medium declaration
+
+Set the modem's top-level `secured_medium` value before any TOML section:
+
+```toml
+peer_description = "radio modem"
+secured_medium = true
+
+[network]
+use_tls = true
+```
+
+The default is `false`. This advertises the Peer Type Secured Medium flag in
+Peer Offers and Session Initialization Responses. Under
+[RFC 8175 §13.4](https://www.rfc-editor.org/rfc/rfc8175.html#section-13.4), it
+declares that the shared RF medium implements access control. It is independent
+of DLEP TLS, encryption, and certificate validation; setting it does not enforce
+access control or change any transport security setting. Configure it to match
+the actual modem medium. Router configuration rejects this modem-only field.
+
+Library callers use `ModemConfig.secured_medium`. Router-side `PeerOffer` and
+`PeerInfo` expose `secured_medium: Option<bool>`, and retained session snapshots
+carry the same value in `peer`. An offer without Peer Type has `None`; validated
+modem session initialization supplies `Some(true)` or `Some(false)`. A modem's
+metadata about its remote router uses `None` because the flag has no meaning
+when sent by a router. The initialization response is authoritative for session
+metadata, even if a discovery offer advertised a different value.
+
 | Section | Field | Default | Meaning |
 |---|---|---|---|
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |
 | top level (router) | `static_peers` | `[]` | modem `addr:port` list for static mode |
 | top level | `peer_description` | binary name | Peer Type data item text |
+| top level (modem) | `secured_medium` | `false` | Modem declaration of access control on the shared RF medium; independent of TLS |
 | `[limits]` (router) | `max_sessions` | `64` | positive bound on TCP/TLS attempts plus registered sessions |
 | `[limits]` (router) | `max_discovered_peers` | `256` | positive bound on retained non-static endpoints, including active peers |
 | `[limits]` (router) | `peer_retention_secs` | `300` | positive retention window for inactive non-static peers; failed retries do not refresh it |

@@ -215,6 +215,7 @@ async fn write_snapshot(
         write_line(writer, &json!({
             "type":"session", "session":id.0, "peer":session.peer.addr.to_string(),
             "is_tls":session.peer.is_tls, "peer_description":session.peer.peer_description,
+            "secured_medium":session.peer.secured_medium,
             "phase":phase, "extensions":session.negotiated_extensions.iter().map(|id| id.0).collect::<Vec<_>>(),
             "metrics":metrics(&session.metrics),
         })).await?;

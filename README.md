@@ -110,6 +110,8 @@ product work and its scope.
 
 Routers can filter unsolicited destinations with a `[destinations]` allow/deny
 policy; see [destination admission](doc/deployment.md#destination-admission).
+Modems can advertise RF-medium access control using top-level `secured_medium`;
+routers expose it in peer metadata and adapter snapshots, independently of TLS.
 
 CLI flags shared by both binaries:
 

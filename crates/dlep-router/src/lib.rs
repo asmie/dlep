@@ -935,6 +935,7 @@ mod reconnect_runtime_tests {
         );
         offers
             .send(DaemonEvent::PeerDiscovered(PeerOffer {
+                secured_medium: None,
                 endpoints: vec![OfferEndpoint {
                     addr,
                     use_tls: false,
@@ -1055,6 +1056,7 @@ mod reconnect_runtime_tests {
         let (inject, mut events) = tokio::sync::broadcast::channel(128);
         let offer = |addr| {
             DaemonEvent::PeerDiscovered(PeerOffer {
+                secured_medium: None,
                 endpoints: vec![OfferEndpoint {
                     addr,
                     use_tls: true,
@@ -1347,6 +1349,7 @@ mod reconnect_runtime_tests {
                 // Frequent offers used to re-dial immediately during backoff.
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 let _ = inject.send(DaemonEvent::PeerDiscovered(PeerOffer {
+                    secured_medium: None,
                     endpoints: vec![OfferEndpoint {
                         addr,
                         use_tls: false,

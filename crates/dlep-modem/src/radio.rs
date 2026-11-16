@@ -1470,6 +1470,7 @@ mod tests {
         LinkRequest {
             session_id: SessionId(1),
             peer: PeerInfo {
+                secured_medium: None,
                 addr: "127.0.0.1:1234".parse().unwrap(),
                 is_tls: false,
                 peer_description: None,

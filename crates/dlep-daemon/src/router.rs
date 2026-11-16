@@ -181,6 +181,7 @@ impl RouterDaemon {
             .connect(peer)
             .await?;
         let peer_info = PeerInfo {
+            secured_medium: None,
             addr: transport.peer_addr()?,
             is_tls: transport.is_tls(),
             peer_description: None,

@@ -165,6 +165,7 @@ pub fn session_config_from_timers(
     advertised_extensions: Vec<dlep_core::ExtensionId>,
 ) -> SessionConfig {
     SessionConfig {
+        secured_medium: false,
         destination_policy: Default::default(),
         peer_description,
         heartbeat_interval_ms: timers.heartbeat_interval_ms,
@@ -536,6 +537,11 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                             peer.peer_description = msg.data_items.iter().find_map(|i| match i {
                                 DataItem::PeerType { description, .. } => Some(description.clone()), _ => None
                             });
+                            peer.secured_medium = if is_router_side {
+                                msg.data_items.iter().find_map(|item| match item {
+                                    DataItem::PeerType { flags, .. } => Some(flags.smi), _ => None,
+                                })
+                            } else { None };
                             lifecycle.peer = peer.clone();
                         }
                         // Extensions cannot consume a core MAC that violates the

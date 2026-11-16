@@ -166,6 +166,7 @@ pub enum EmittedEvent {
     PeerDiscovered {
         endpoints: Vec<crate::discovery_common::OfferEndpoint>,
         peer_description: Option<String>,
+        secured_medium: Option<bool>,
     },
     DestinationUp {
         mac: MacAddress,

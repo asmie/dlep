@@ -44,6 +44,8 @@ impl DestinationPolicy {
 /// state handlers themselves never reach into config files or environment.
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
+    /// Modem-only Peer Type flag describing RF-medium access control.
+    pub secured_medium: bool,
     /// Router-only admission policy, fixed for this session.
     pub destination_policy: DestinationPolicy,
     /// Fixed for the session lifetime; must match the modem's link-layer format.
@@ -80,6 +82,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            secured_medium: false,
             destination_policy: DestinationPolicy::default(),
             mac_address_format: Default::default(),
             peer_description: "dlep-router".into(),

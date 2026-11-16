@@ -1088,7 +1088,9 @@ fn build_session_initialization_response(config: &SessionConfig) -> Message {
             config,
         )))
         .with_item(DataItem::PeerType {
-            flags: PeerFlags::default(),
+            flags: PeerFlags {
+                smi: config.secured_medium,
+            },
             description: config.peer_description.clone(),
         });
     let message =

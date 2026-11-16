@@ -57,10 +57,16 @@ with another snapshot or an output notice.
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `snapshot_begin` | `version` (currently 1), `generation` | Starts a complete replacement. |
-| `session` | `session`, `peer`, `is_tls`, `peer_description`, `phase`, `extensions`, `metrics` | One modem session. Description may be null; extensions are numeric IDs. |
+| `session` | `session`, `peer`, `is_tls`, `peer_description`, `secured_medium`, `phase`, `extensions`, `metrics` | One modem session. Description may be null; extensions are numeric IDs. |
 | `destination` | `session`, `mac`, `phase`, `metrics` | One destination on that session. |
 | `address` | `session`, `mac`, `kind`, `address` | An address or subnet; null `mac` means the remote peer's session address. |
 | `snapshot_end` | `generation` | Commits the replacement. Must match the opening generation. |
+
+`secured_medium` is the modem-reported RF access-control flag, independently of
+`is_tls`. It is boolean for established modem sessions and may be null when
+metadata is unavailable. It is informational; adapters decide how to use it in
+routing policy. The field is additive within protocol version 1; consumers
+should tolerate additional metadata fields.
 
 Session IDs are unique within one router process lifetime. Always key a
 destination by **both session and MAC**: different modems can report the same
@@ -84,7 +90,7 @@ Do not apply older transient notices over snapshot state.
 
 ```json
 {"type":"snapshot_begin","version":1,"generation":7}
-{"type":"session","session":1,"peer":"192.0.2.1:854","is_tls":false,"peer_description":"radio","phase":"established","extensions":[],"metrics":{"max_data_rate_rx_bps":10000000,"max_data_rate_tx_bps":10000000,"current_data_rate_rx_bps":5000000,"current_data_rate_tx_bps":5000000,"latency_us":2500}}
+{"type":"session","session":1,"peer":"192.0.2.1:854","is_tls":false,"peer_description":"radio","secured_medium":false,"phase":"established","extensions":[],"metrics":{"max_data_rate_rx_bps":10000000,"max_data_rate_tx_bps":10000000,"current_data_rate_rx_bps":5000000,"current_data_rate_tx_bps":5000000,"latency_us":2500}}
 {"type":"destination","session":1,"mac":"02:00:00:00:00:01","phase":"up","metrics":{"max_data_rate_rx_bps":10000000,"max_data_rate_tx_bps":10000000,"current_data_rate_rx_bps":5000000,"current_data_rate_tx_bps":5000000,"latency_us":2500}}
 {"type":"address","session":1,"mac":"02:00:00:00:00:01","kind":"ipv4","address":"192.0.2.10"}
 {"type":"snapshot_end","generation":7}

@@ -25,9 +25,21 @@ pub fn build_peer_discovery(peer_description: &str) -> Signal {
 /// description. The endpoint is encoded as the matching v4 or v6
 /// Connection Point.
 pub fn build_peer_offer(peer_description: &str, tcp_endpoint: SocketAddr, use_tls: bool) -> Signal {
+    build_peer_offer_with_secured_medium(peer_description, tcp_endpoint, use_tls, false)
+}
+
+/// Build a modem offer with an explicit RF-medium access-control declaration.
+pub fn build_peer_offer_with_secured_medium(
+    peer_description: &str,
+    tcp_endpoint: SocketAddr,
+    use_tls: bool,
+    secured_medium: bool,
+) -> Signal {
     let flags = ConnectionPointFlags { use_tls };
     let mut sig = Signal::new(SignalType::PEER_OFFER).with_item(DataItem::PeerType {
-        flags: PeerFlags::default(),
+        flags: PeerFlags {
+            smi: secured_medium,
+        },
         description: peer_description.to_string(),
     });
     sig = match tcp_endpoint.ip() {
@@ -50,6 +62,17 @@ pub fn build_peer_offer(peer_description: &str, tcp_endpoint: SocketAddr, use_tl
 pub fn extract_peer_description(sig: &Signal) -> Option<String> {
     sig.data_items.iter().find_map(|item| match item {
         DataItem::PeerType { description, .. } => Some(description.clone()),
+        _ => None,
+    })
+}
+
+/// The flag has meaning only in modem-originated Peer Offers.
+pub fn extract_secured_medium(sig: &Signal) -> Option<bool> {
+    if sig.signal_type != SignalType::PEER_OFFER {
+        return None;
+    }
+    sig.data_items.iter().find_map(|item| match item {
+        DataItem::PeerType { flags, .. } => Some(flags.smi),
         _ => None,
     })
 }

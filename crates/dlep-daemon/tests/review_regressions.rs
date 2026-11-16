@@ -302,6 +302,7 @@ async fn offer_fallback_respects_transport_flag() {
         .unwrap();
     let mut events = router.subscribe();
     let offer = PeerOffer {
+        secured_medium: None,
         peer_description: None,
         endpoints: vec![
             OfferEndpoint {
@@ -325,6 +326,7 @@ async fn offer_fallback_respects_transport_flag() {
     up(&mut events).await;
     // Do not silently send plaintext to a TLS-only endpoint.
     let tls_only = PeerOffer {
+        secured_medium: None,
         peer_description: None,
         endpoints: vec![OfferEndpoint {
             addr: modem.local_addr(),
@@ -468,6 +470,7 @@ async fn io_failures_and_blocked_writes_always_notify_once() {
         let (events, mut rx) = dlep_daemon::runtime::new_event_channel();
         let (_commands, commands) = tokio::sync::mpsc::channel(1);
         let peer = dlep_daemon::PeerInfo {
+            secured_medium: None,
             addr: "127.0.0.1:854".parse().unwrap(),
             is_tls: false,
             peer_description: None,

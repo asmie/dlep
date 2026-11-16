@@ -6,6 +6,7 @@ use std::sync::Arc;
 fn fixture(generation: u64) -> DaemonSnapshot {
     let session = SessionSnapshot {
         peer: PeerInfo {
+            secured_medium: Some(true),
             addr: "[::1]:854".parse().unwrap(),
             is_tls: true,
             peer_description: Some("test modem".into()),
@@ -131,6 +132,8 @@ async fn snapshot_frames_export_complete_values_and_empty_replacement() {
     );
     let session = &records[1];
     assert_eq!(session["peer"], "[::1]:854");
+    assert_eq!(session["secured_medium"], true);
+    assert_eq!(session["is_tls"], true);
     assert_eq!(session["extensions"], json!([61440]));
     assert_eq!(session["metrics"]["resources"], 0);
     assert_eq!(session["metrics"]["mtu"], 1500);

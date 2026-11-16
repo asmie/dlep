@@ -520,17 +520,17 @@ section records the limits of the available evidence.
 
 ### Feature backlog
 
-The current practical feature scope has five areas, two completed in chunks 69–70.
-The three remaining areas are the next product priorities. Roughly 6–10 focused
+The current practical feature scope has five areas, three completed in chunks 69–71.
+The two remaining areas are the next product priorities. Roughly 6–10 focused
 implementation chunks for the whole group is a planning estimate, including
-chunks 69–70; it is not an RFC-completeness percentage or a release prerequisite.
+chunks 69–71; it is not an RFC-completeness percentage or a release prerequisite.
 Validation should accompany features rather than become an open-ended queue.
 
 | Feature | Status / next behavior |
 | --- | --- |
 | Network CLI overrides | Done in chunk 69: bind/discovery options for both roles and TCP listen port for the modem |
 | Router destination acceptance policy | Done in chunk 70: startup allow/deny lists and default acceptance, with Not Interested replies for declined Up announcements |
-| Secured-medium Peer Type flag | Pending: configure and expose the flag through library and adapter metadata |
+| Secured-medium Peer Type flag | Done in chunk 71: modem configuration and received discovery/session metadata, including router-adapter snapshots |
 | DNS endpoints and TLS server names | Pending: resolve named peers while retaining the intended certificate identity |
 | Shell completions | Pending: generate completions for standalone commands and the combined launcher |
 
@@ -1378,6 +1378,16 @@ The order of work was:
     and receive their normal Up-response outcome. Explicit router Announce can
     still retrieve declined destinations. IPv4/IPv6 cases cover both MAC formats,
     allow/deny modes, retained state, and Announce after physical updates.
+
+71. Secured-medium metadata. **Done** — modem `secured_medium` configuration
+    defaults false and sets the Peer Type S flag in offers and initialization
+    responses. Router discovery/session events and retained peer snapshots expose
+    `Option<bool>`; missing Peer Type remains unknown in offers, and router peers
+    have no modem-medium declaration. Router-adapter session records include the
+    field independently of TLS. The flag describes RF-medium access control and
+    does not configure security or authenticate that declaration. IPv4/IPv6
+    discovery-to-session cases cover both values, while router transmission keeps
+    the modem-only flag clear.
 
 ---
 
