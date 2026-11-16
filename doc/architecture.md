@@ -105,7 +105,7 @@ Everything that touches the operating system. Built on Tokio.
 
 | Module | Responsibility |
 |---|---|
-| `transport.rs` | `Transport` trait (`AsyncRead + AsyncWrite + Unpin + Send + 'static` plus `peer_addr`/`local_addr`/`is_tls`). `Connector` and `Acceptor` produce `Box<dyn Transport>` for either plain TCP or TLS. |
+| `transport.rs` | `Transport` trait (`AsyncRead + AsyncWrite + Unpin + Send + 'static` plus `peer_addr`/`local_addr`/`is_tls`). `Connector` and `Acceptor` produce `Box<dyn Transport>` for either plain TCP or TLS. Named connections preserve the DNS identity through bounded resolution/fallback; numeric endpoints can use explicit TLS identities. |
 | `tls.rs` | Certificate/key loading through `rustls-pki-types::pem::PemObject`; optional certificate-generation helpers for tests. |
 | `framed.rs` | `MessageCodec` and `SignalCodec` — `tokio_util::codec::{Decoder, Encoder}` adapters over the byte-level codec from `dlep-core`. |
 | `discovery.rs` | `DiscoverySocket`: builds UDP IPv4/IPv6 sockets via `socket2`, selects multicast membership and interface, and sends with TTL/hop limit 255 using `nix::sendmsg`. `recvmsg` extracts ancillary interface and TTL/hop-limit data; the socket filters disallowed interfaces and non-255 TTLs before decoding. Malformed/truncated datagrams return `InvalidData`, separately from socket failures. |
@@ -363,6 +363,14 @@ extension registration, TLS configuration, and event subscription.
 `connect_discovered` to establish sessions. Automatic connection scheduling and
 reconnection are policies of the router binary, not the library handle.
 
+`connect_named(host, port)` resolves and connects directly, returning the numeric
+endpoint used by events and snapshots. It preserves the requested host as the
+TLS identity and re-resolves on every call. `connect_static_with_server_name`
+sets an explicit identity for a numeric endpoint; `connect_static` retains IP
+verification. All use the shared connection budget, and callers wait for
+`SessionUp` before sending commands. Named peer configuration and automatic
+reconnection by hostname remain CLI follow-ups.
+
 The modem-side API is symmetric, with `add_destination`, `update_destination` and `drop_destination` taking the place of `start_discovery` / `connect_static`. `ModemBuilder::link_control` registers the backend that answers router Link Characteristics Requests; without one they are denied.
 
 Only the modem can originate metric changes via `update_session_metrics`. The router compatibility method returns an error; router Session Update payloads are restricted to Layer 3 information. `announce_destination` is **router-side only**, because RFC 8175 §12.13 makes `Destination Announce` router-originated — the modem receives it, answers per §12.14, and surfaces it to its application as `DestinationEvent::Announced`.
@@ -534,7 +542,7 @@ Validation should accompany features rather than become an open-ended queue.
 | Network CLI overrides | Done in chunk 69: bind/discovery options for both roles and TCP listen port for the modem |
 | Router destination acceptance policy | Done in chunk 70: startup allow/deny lists and default acceptance, with Not Interested replies for declined Up announcements |
 | Secured-medium Peer Type flag | Done in chunk 71: modem configuration and received discovery/session metadata, including router-adapter snapshots |
-| DNS endpoints and TLS server names | Pending: resolve named peers while retaining the intended certificate identity |
+| DNS endpoints and TLS server names | Library support in chunk 73: bounded resolution/fallback and explicit TLS names; next: CLI/configuration peers and name-aware retries |
 | Shell completions | Done in chunk 72: Bash, Elvish, Fish, PowerShell, and Zsh scripts generated from the standalone and combined CLI definitions |
 
 Three larger scope areas are separate from that estimate:
@@ -1400,6 +1408,17 @@ The order of work was:
     Deployment instructions cover installation. Release smoke checks exercise
     every generator, invalid shell arguments, config-independent generation,
     and actual Bash completion of roles, options, and shell names.
+
+73. Named-peer connection API. **Done** — library routers expose
+    `connect_named(host, port)` and `connect_static_with_server_name(addr, name)`.
+    The transport preserves the requested hostname for certificate verification
+    and SNI across fallback, tries up to 16 distinct system-resolver answers in
+    order, and bounds resolution plus all attempts to 15 seconds. A single
+    connection/session permit covers all named-peer work and is reclaimed on
+    failure or cancellation. Numeric connections retain IP verification; events
+    and snapshots retain numeric endpoints. IPv4/IPv6 cases cover DNS-only
+    identities, wrong names, untrusted certificates, SNI, fallback, and usable
+    DLEP sessions. CLI/configuration names and name-aware retries remain next.
 
 ---
 

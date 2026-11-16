@@ -217,6 +217,20 @@ feed described below. Library applications must supply their own policy and
 handle `broadcast::error::RecvError::Lagged` if they need to continue after event
 loss.
 
+For direct connections, `connect_named("modem.example", 854)` resolves the host
+with the system resolver and verifies TLS against that hostname. It tries up to
+16 distinct addresses in resolver order within a shared 15-second deadline and
+returns the connected `SocketAddr`. Each call resolves afresh. Events and
+snapshots retain numeric endpoints, and the caller owns reconnect policy.
+One connection/session slot covers resolution and all fallback attempts.
+
+`connect_static_with_server_name(addr, "modem.example")` connects to a numeric
+endpoint with an explicit certificate identity, without DNS lookup.
+`connect_static(addr)` continues to verify the endpoint IP. All three return
+after transport registration, before DLEP initialization; wait for `SessionUp`
+before sending session commands. DNS names in `--peer` and `static_peers` are
+still pending CLI integration.
+
 Both daemons expose `state()`, a retained `watch::Receiver<DaemonSnapshot>` for
 late or slow consumers. Read its initial value and subsequent changes; clone the
 snapshot and release the watch borrow before awaiting. It contains a monotonic

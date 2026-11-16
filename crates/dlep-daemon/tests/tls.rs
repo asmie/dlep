@@ -9,8 +9,9 @@ use dlep_daemon::{
     NetworkConfig, RouterConfig, RouterDaemon, SharedConfig,
 };
 use dlep_net::tls::test_helpers::{
-    client_config_for, client_config_with_identity, expired_self_signed_for_ip, self_signed_for_ip,
-    server_config_for, server_config_requiring_client_certs,
+    client_config_for, client_config_with_identity, expired_self_signed_for_ip,
+    self_signed_for_dns, self_signed_for_ip, server_config_for,
+    server_config_requiring_client_certs,
 };
 use tokio::sync::broadcast::Receiver;
 use tokio::time::timeout;
@@ -164,6 +165,145 @@ async fn tls_session_establishes_and_carries_destination_lifecycle() {
     await_session_down(&mut router_events).await;
     await_session_down(&mut modem_events).await;
     modem.shutdown().await.expect("modem shutdown");
+}
+
+#[tokio::test]
+async fn named_tls_peer_uses_dns_identity_and_retains_numeric_session_state() {
+    let ip = "127.0.0.1";
+    let pki = self_signed_for_dns("localhost");
+    let mut modem_config = loopback_modem_config();
+    modem_config.shared.network.bind_addr = ip.parse().unwrap();
+    let modem = ModemDaemon::builder()
+        .config(modem_config)
+        .with_rustls_server(server_config_for(pki.cert_der, pki.key_der))
+        .spawn()
+        .await
+        .unwrap();
+    let addr = modem.local_addr();
+    let mut modem_events = modem.subscribe();
+    let mut config = loopback_router_config();
+    config.limits.max_sessions = 1;
+    let router = RouterDaemon::builder()
+        .config(config)
+        .with_rustls_client(client_config_for(pki.roots))
+        .spawn()
+        .await
+        .unwrap();
+    let mut events = router.subscribe();
+
+    // Default numeric connections still require an IP SAN. An explicit
+    // wrong name also fails, despite a trusted certificate and reachable IP.
+    assert!(router.connect_static(addr).await.is_err());
+    assert!(
+        router
+            .connect_static_with_server_name(addr, "wrong.example")
+            .await
+            .is_err()
+    );
+    assert_eq!(router.connection_capacity(), 1);
+    assert!(router.connection_states().borrow().is_empty());
+    assert!(events.try_recv().is_err());
+
+    assert_eq!(
+        router
+            .connect_named("localhost", addr.port())
+            .await
+            .unwrap(),
+        addr
+    );
+    await_session_up(&mut events).await;
+    await_session_up(&mut modem_events).await;
+    assert_eq!(router.connection_capacity(), 0);
+    assert_eq!(
+        router.connection_states().borrow()[&addr].active_sessions,
+        1
+    );
+    let id = DestinationId(MacAddress::new_eui48([2, 0, 0, 0, 0, 73]));
+    modem
+        .add_destination(id, LinkMetrics::default())
+        .await
+        .unwrap();
+    await_destination_event(
+        &mut events,
+        |event| matches!(event, DestinationEvent::Up { id: got, .. } if *got == id),
+    )
+    .await;
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_server_name_connects_to_numeric_endpoint_without_dns_lookup() {
+    for ip in ["127.0.0.1", "::1"] {
+        let pki = self_signed_for_dns("radio.test.invalid");
+        let mut config = loopback_modem_config();
+        config.shared.network.bind_addr = ip.parse().unwrap();
+        let modem = ModemDaemon::builder()
+            .config(config)
+            .with_rustls_server(server_config_for(pki.cert_der, pki.key_der))
+            .spawn()
+            .await
+            .unwrap();
+        let router = RouterDaemon::builder()
+            .config(loopback_router_config())
+            .with_rustls_client(client_config_for(pki.roots))
+            .spawn()
+            .await
+            .unwrap();
+        let mut events = router.subscribe();
+        router
+            .connect_static_with_server_name(modem.local_addr(), "radio.test.invalid")
+            .await
+            .unwrap();
+        await_session_up(&mut events).await;
+        router.shutdown().await.unwrap();
+        modem.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn named_tls_peer_rejects_ip_identity_and_untrusted_dns_identity() {
+    let ip = "127.0.0.1";
+    for untrusted in [false, true] {
+        let pki = if untrusted {
+            self_signed_for_dns("localhost")
+        } else {
+            self_signed_for_ip(ip.parse().unwrap())
+        };
+        let roots = if untrusted {
+            self_signed_for_dns("localhost").roots
+        } else {
+            pki.roots
+        };
+        let mut config = loopback_modem_config();
+        config.shared.network.bind_addr = ip.parse().unwrap();
+        let modem = ModemDaemon::builder()
+            .config(config)
+            .with_rustls_server(server_config_for(pki.cert_der, pki.key_der))
+            .spawn()
+            .await
+            .unwrap();
+        let mut config = loopback_router_config();
+        config.limits.max_sessions = 1;
+        let router = RouterDaemon::builder()
+            .config(config)
+            .with_rustls_client(client_config_for(roots))
+            .spawn()
+            .await
+            .unwrap();
+        let mut events = router.subscribe();
+        assert!(
+            router
+                .connect_named("localhost", modem.local_addr().port())
+                .await
+                .is_err()
+        );
+        assert_eq!(router.connection_capacity(), 1);
+        assert!(router.connection_states().borrow().is_empty());
+        assert!(events.try_recv().is_err());
+        router.shutdown().await.unwrap();
+        modem.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

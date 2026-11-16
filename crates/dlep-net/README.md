@@ -4,6 +4,12 @@ Linux UDP discovery, TCP/TLS transport, framing, and strict GTSM for DLEP (RFC 8
 
 Requires Rust 1.85 or newer.
 
+`Connector::connect_host(host, port)` resolves names using the system resolver,
+tries up to 16 distinct answers within 15 seconds, and preserves the hostname
+for TLS verification and SNI. `connect_with_server_name(addr, ServerName)` uses
+an explicit TLS identity at a numeric endpoint. `connect(addr)` verifies the
+endpoint IP. All paths retain the connector's TLS and GTSM settings.
+
 ```toml
 [dependencies]
 dlep-net = "0.2.0"

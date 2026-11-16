@@ -5,7 +5,7 @@ use std::sync::Arc;
 use dlep_core::StatusCode;
 use dlep_ext::{DlepExtension, ExtensionRegistry, Role};
 use dlep_fsm::session_router::RouterSessionFsm;
-use dlep_net::{ClientConfig, Connector};
+use dlep_net::{ClientConfig, Connector, ServerName, Transport};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -160,11 +160,56 @@ impl RouterDaemon {
     /// registration drops the pending transport; spawned sessions are always
     /// registered for graceful shutdown before this future can yield again.
     pub async fn connect_static(&self, peer: SocketAddr) -> Result<(), DaemonError> {
-        let permit = self
-            .session_slots
+        let permit = self.connection_permit()?;
+        let transport = self.connector()?.connect(peer).await?;
+        self.register_transport(transport, permit).await
+    }
+
+    /// Connect to an IP endpoint using an explicit certificate identity rather
+    /// than the endpoint IP. The name must be a DNS name or bare IP literal.
+    /// TLS verification and GTSM remain enabled according to router config.
+    /// Like `connect_static`, success precedes DLEP initialization.
+    pub async fn connect_static_with_server_name(
+        &self,
+        peer: SocketAddr,
+        server_name: &str,
+    ) -> Result<(), DaemonError> {
+        let server_name = ServerName::try_from(server_name.to_owned())
+            .map_err(|_| DaemonError::Config("invalid TLS server name or IP address".into()))?;
+        let permit = self.connection_permit()?;
+        let transport = self
+            .connector()?
+            .connect_with_server_name(peer, server_name)
+            .await?;
+        self.register_transport(transport, permit).await
+    }
+
+    /// Resolve and connect to a named peer, preserving the requested host for
+    /// TLS verification and SNI. Tries at most 16 distinct resolver answers
+    /// within 15 seconds, without downgrading TLS. Numeric literals also work.
+    /// One session slot covers resolution and every fallback attempt; dropping
+    /// this future releases it and any pending transport. The system resolver
+    /// itself may finish blocking work after cancellation.
+    ///
+    /// Returns the connected numeric endpoint before DLEP initialization.
+    /// Events and snapshots use that endpoint. Call again to resolve afresh;
+    /// automatic reconnection and name-to-session tracking belong to the caller.
+    pub async fn connect_named(&self, host: &str, port: u16) -> Result<SocketAddr, DaemonError> {
+        let permit = self.connection_permit()?;
+        let transport = self.connector()?.connect_host(host, port).await?;
+        let peer = transport.peer_addr()?;
+        self.register_transport(transport, permit).await?;
+        Ok(peer)
+    }
+
+    fn connection_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, DaemonError> {
+        self.session_slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| DaemonError::SessionLimitReached)?;
+            .map_err(|_| DaemonError::SessionLimitReached)
+    }
+
+    fn connector(&self) -> Result<Connector, DaemonError> {
         let connector = if self.network.use_tls {
             let cfg = self.client_tls.clone().ok_or_else(|| {
                 DaemonError::Config(
@@ -175,11 +220,14 @@ impl RouterDaemon {
         } else {
             Connector::plain()
         };
+        Ok(connector.with_gtsm(self.network.gtsm_enforce))
+    }
 
-        let transport = connector
-            .with_gtsm(self.network.gtsm_enforce)
-            .connect(peer)
-            .await?;
+    async fn register_transport(
+        &self,
+        transport: Box<dyn Transport>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), DaemonError> {
         let peer_info = PeerInfo {
             secured_medium: None,
             addr: transport.peer_addr()?,
@@ -479,6 +527,68 @@ mod cancellation_tests {
             .spawn()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn named_peer_budget_releases_on_cancellation_and_invalid_input() {
+        use dlep_net::tls::test_helpers::{client_config_for, self_signed_for_dns};
+        let mut config = RouterConfig::default();
+        config.limits.max_sessions = 1;
+        let daemon = Arc::new(
+            RouterDaemon::builder()
+                .config(config)
+                .with_rustls_client(client_config_for(self_signed_for_dns("localhost").roots))
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_ttl(255).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connecting = daemon.clone();
+        // A literal avoids resolver-family ordering delaying this cancellation
+        // barrier. Named DNS fallback is exercised by the transport tests.
+        let task =
+            tokio::spawn(async move { connecting.connect_named("127.0.0.1", addr.port()).await });
+        let (_peer, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(daemon.connection_capacity(), 0);
+        assert!(matches!(
+            daemon.connect_named("localhost", addr.port()).await,
+            Err(DaemonError::SessionLimitReached)
+        ));
+        assert!(matches!(
+            daemon.connect_static(addr).await,
+            Err(DaemonError::SessionLimitReached)
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(daemon.connection_capacity(), 1);
+        for name in [
+            "",
+            "https://localhost",
+            "localhost:854",
+            "[::1]",
+            "bad name",
+        ] {
+            assert!(
+                matches!(daemon.connect_named(name, addr.port()).await, Err(DaemonError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput)
+            );
+            assert!(matches!(
+                daemon.connect_static_with_server_name(addr, name).await,
+                Err(DaemonError::Config(_))
+            ));
+            assert_eq!(daemon.connection_capacity(), 1);
+        }
+        assert!(daemon.connection_states().borrow().is_empty());
+        Arc::try_unwrap(daemon)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

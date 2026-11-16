@@ -1,16 +1,22 @@
 use crate::tcp_monitor::{Monitor, Registration};
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-
 use std::time::Duration;
+
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Includes name resolution and all TCP/TLS attempts for one named peer.
+pub const HOST_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound the work done for names with many A/AAAA records.
+pub const MAX_RESOLVED_ENDPOINTS: usize = 16;
 
 /// Error message surfaced when a daemon is configured with `use_tls = true`
 /// before the TLS path is wired (M7). Centralised so the three call sites
@@ -135,6 +141,65 @@ impl Connector {
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn Transport>> {
+        self.connect_with_server_name(addr, ServerName::from(addr.ip()))
+            .await
+    }
+
+    /// Resolve a host using the system resolver and try up to 16 distinct
+    /// addresses in resolver order. The requested host remains the TLS identity
+    /// and SNI name across all attempts; IP literals retain IP verification.
+    /// Resolution and all attempts share a 15-second deadline. Each call
+    /// resolves again; no address cache or background retry task is retained.
+    pub async fn connect_host(&self, host: &str, port: u16) -> io::Result<Box<dyn Transport>> {
+        let server_name = ServerName::try_from(host.to_owned()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid peer host name or IP address",
+            )
+        })?;
+        let connect = async {
+            let addresses = tokio::net::lookup_host((host, port)).await?;
+            self.connect_resolved(addresses, server_name).await
+        };
+        tokio::time::timeout(HOST_CONNECT_TIMEOUT, connect)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connection to {host}:{port} timed out"),
+                )
+            })?
+    }
+
+    async fn connect_resolved(
+        &self,
+        addresses: impl Iterator<Item = SocketAddr>,
+        server_name: ServerName<'static>,
+    ) -> io::Result<Box<dyn Transport>> {
+        let mut seen = HashSet::new();
+        let mut last_error = io::Error::new(io::ErrorKind::NotFound, "peer host has no addresses");
+        for addr in addresses
+            .filter(|addr| seen.insert(*addr))
+            .take(MAX_RESOLVED_ENDPOINTS)
+        {
+            match self
+                .connect_with_server_name(addr, server_name.clone())
+                .await
+            {
+                Ok(transport) => return Ok(transport),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Connect to a numeric endpoint while verifying a separately supplied TLS
+    /// identity. DNS identities also set SNI. Plain TCP ignores the identity.
+    pub async fn connect_with_server_name(
+        &self,
+        addr: SocketAddr,
+        server_name: ServerName<'static>,
+    ) -> io::Result<Box<dyn Transport>> {
         let monitor = self.enforce_gtsm.then(Monitor::new).transpose()?;
         let socket = if addr.is_ipv6() {
             TcpSocket::new_v6()?
@@ -150,7 +215,6 @@ impl Connector {
             ConnectorKind::Plain => Box::new(stream),
             ConnectorKind::Tls(client) => {
                 let connector = tokio_rustls::TlsConnector::from(client.clone());
-                let server_name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
                 let tls = tokio::time::timeout(
                     TLS_HANDSHAKE_TIMEOUT,
                     connector.connect(server_name, stream),
@@ -305,6 +369,52 @@ mod tests {
     #[tokio::test]
     async fn tcp_gtsm_ipv6_including_handshake() {
         gtsm_exchange("[::1]:0").await;
+    }
+
+    #[tokio::test]
+    async fn resolved_tls_fallback_preserves_dns_identity_and_sni_for_both_families() {
+        use crate::tls::test_helpers::{client_config_for, self_signed_for_dns, server_config_for};
+
+        for (bind, stalled_bind) in [("127.0.0.1:0", "[::1]:0"), ("[::1]:0", "127.0.0.1:0")] {
+            // A reachable TCP endpoint stalls TLS, forcing fallback to the
+            // other family. Explicit resolver answers keep this independent
+            // of host-file aliases and the OS's address-family preference.
+            let stalled = TcpListener::bind(stalled_bind).await.unwrap();
+            crate::gtsm::configure_tcp(&stalled, stalled.local_addr().unwrap().is_ipv6(), true)
+                .unwrap();
+            let stalled_addr = stalled.local_addr().unwrap();
+            let listener = TcpListener::bind(bind).await.unwrap();
+            crate::gtsm::configure_tcp(&listener, listener.local_addr().unwrap().is_ipv6(), true)
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let pki = self_signed_for_dns("radio.test.invalid");
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls =
+                    tokio_rustls::TlsAcceptor::from(server_config_for(pki.cert_der, pki.key_der))
+                        .accept(stream)
+                        .await
+                        .unwrap();
+                assert_eq!(tls.get_ref().1.server_name(), Some("radio.test.invalid"));
+                tls.write_all(b"ok").await.unwrap();
+            });
+            let mut client = Connector::tls(client_config_for(pki.roots))
+                .connect_resolved(
+                    [stalled_addr, stalled_addr, addr].into_iter(),
+                    ServerName::try_from("radio.test.invalid").unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.peer_addr().unwrap(), addr);
+            assert!(client.is_tls());
+            let mut bytes = [0; 2];
+            timeout(Duration::from_secs(2), client.read_exact(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&bytes, b"ok");
+            server.await.unwrap();
+        }
     }
 
     async fn stalled_tls_accept_times_out_without_disrupting_another_peer(bind: &str) {

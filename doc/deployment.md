@@ -79,8 +79,8 @@ revocation (CRLs) is not supported; rotate by reissuing and restarting.
 
 Create a CA, a modem (server) certificate, and a router (client)
 certificate. The modem certificate's subjectAltName **must** contain the
-IP address routers connect to (hostname verification uses the IP; DNS
-names are not yet supported):
+IP address routers connect to when using the bundled CLI (its peer configuration
+currently takes numeric addresses):
 
 ```bash
 MODEM_IP=192.0.2.10   # the address routers will connect to
@@ -121,6 +121,15 @@ The router needs: `ca.pem` (to verify the modem), `router.pem` + `router.key`
 (its identity, when the modem sets `require_client_cert = true`).
 The modem needs: `modem.pem` + `modem.key`, plus `ca.pem` when requiring
 client certificates (recommended).
+
+Library routers can instead use `connect_named("modem.example", 854)` with a
+certificate containing `subjectAltName=DNS:modem.example`, or
+`connect_static_with_server_name(addr, "modem.example")` to select that identity
+without resolving DNS. CA trust and certificate validation still apply.
+Named connections resolve afresh on each call and try up to 16 distinct answers
+in resolver order within 15 seconds; the caller owns automatic retries and
+hostname-to-session tracking. Events expose the connected numeric endpoint.
+The CLI's `--peer` and TOML `static_peers` still require numeric addresses.
 
 ## 3. Configuration
 

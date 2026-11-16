@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Library routers can connect to DNS peers with `connect_named(host, port)` or
+  verify an explicit TLS identity at a numeric address with
+  `connect_static_with_server_name(addr, name)`. Named connections preserve the
+  requested hostname across address fallback, with 16-address/15-second bounds
+  and one shared connection slot. Numeric connections retain IP verification.
+  CLI/configuration support for named peers is still pending.
 - All commands can print Bash, Elvish, Fish, PowerShell, and Zsh completion
   scripts with `--generate-completions SHELL`. Scripts use the actual CLI
   definitions, including both roles in the combined launcher. Generation exits

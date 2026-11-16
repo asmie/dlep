@@ -62,7 +62,15 @@ pub mod test_helpers {
     /// the cert itself (the simplest trust setup for a single-host test).
     pub fn self_signed_for_ip(ip: IpAddr) -> TestPki {
         self_signed_with_params(
-            ip,
+            SanType::IpAddress(ip),
+            CertificateParams::new(Vec::<String>::new()).expect("rcgen params"),
+        )
+    }
+
+    /// A DNS-only identity: numeric endpoint verification must reject it.
+    pub fn self_signed_for_dns(name: &str) -> TestPki {
+        self_signed_with_params(
+            SanType::DnsName(name.try_into().expect("DNS name")),
             CertificateParams::new(Vec::<String>::new()).expect("rcgen params"),
         )
     }
@@ -73,10 +81,10 @@ pub mod test_helpers {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("rcgen params");
         params.not_before = rcgen::date_time_ymd(2000, 1, 1);
         params.not_after = rcgen::date_time_ymd(2001, 1, 1);
-        self_signed_with_params(ip, params)
+        self_signed_with_params(SanType::IpAddress(ip), params)
     }
 
-    fn self_signed_with_params(ip: IpAddr, mut params: CertificateParams) -> TestPki {
+    fn self_signed_with_params(san: SanType, mut params: CertificateParams) -> TestPki {
         let key = KeyPair::generate().expect("rcgen key generation");
         // Independent fixtures need distinct issuer names. Reusing rcgen's
         // default name makes an unrelated root look like the right issuer
@@ -90,7 +98,7 @@ pub mod test_helpers {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, format!("DLEP test {subject}"));
-        params.subject_alt_names = vec![SanType::IpAddress(ip)];
+        params.subject_alt_names = vec![san];
         let cert = params.self_signed(&key).expect("rcgen self-sign");
 
         let cert_pem = cert.pem();

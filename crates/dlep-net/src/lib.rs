@@ -22,4 +22,5 @@ pub use transport::{Acceptor, Connector, TLS_NOT_IMPLEMENTED_MSG, Transport};
 // Re-exported so daemon/binary consumers have a single import site for TLS
 // configuration, and so the underlying TLS library can be swapped without
 // churning every call site.
+pub use rustls::pki_types::ServerName;
 pub use rustls::{ClientConfig, ServerConfig};
