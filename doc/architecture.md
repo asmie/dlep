@@ -128,6 +128,10 @@ The extension plug-in surface. A separate crate so a third-party extension can d
 
 The `ExtensionRegistry` holds `Arc<dyn DlepExtension>` instances and supports advertised-ID union and runtime negotiation.
 
+`ExtensionCtx::terminate_session(reason)` queues a session-scoped control request.
+The runtime accepts it from active negotiated hooks and drives the existing FSM
+shutdown path. Custom contexts can retain the default `Unsupported` result.
+
 ### 4.5 `dlep-daemon`
 
 The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and exposes the public `RouterDaemon` / `ModemDaemon` handles. This is what library embedders depend on.
@@ -307,6 +311,17 @@ Extensions are dispatched per session by the session task. Their lifecycle:
 5. In-session unknown messages and items are first offered to negotiated extensions. Unclaimed input reaches the FSM's strict validation; handled messages reset the peer-silence deadline. Extension callbacks do not process terminating-session traffic.
 6. Destination lifecycle events notify `on_destination_state`; the router also surfaces successful Announce responses as destination arrivals.
 7. A lifecycle guard emits exactly one `SessionDown` and extension teardown callback on ordinary termination, I/O failure, or task cancellation. Codec failures initiate protocol termination; writes have a bounded deadline.
+
+Control requests are collected separately from outbound extension messages.
+The first accepted termination request wins and suppresses queued extension
+messages. Once the current action batch finishes, a still-active FSM receives
+`AppShutdown` with that status code. This is drained iteratively, preserving
+termination timers and response handling without async recursion. A protocol
+error or closing transition already in progress keeps precedence. Publication
+after the transition exposes the terminating state before the final down event.
+Session-down hooks receive `SessionClosing`; destination-down hooks may request
+termination while the session is active. The request returns queue acceptance,
+not wire acknowledgement. Application/CLI reconnect policy is unchanged.
 
 
 ---
@@ -549,8 +564,9 @@ areas below. Validation should continue to accompany features.
 
 Three larger scope areas remain optional follow-ups:
 
-- Extension controls/configuration: explicit termination requests, per-extension
-  settings, and discovery extension hooks. Arbitrary rustls configurations can
+- Extension configuration and discovery hooks: explicit session termination
+  requests are complete in chunk 75; per-extension settings and discovery hooks
+  remain. Arbitrary rustls configurations can
   already be supplied through builders; custom TLS verification does not require
   weakening the default policy.
 - Simultaneous IPv4/IPv6 discovery; the configured bind family currently selects
@@ -1435,6 +1451,18 @@ The order of work was:
     Runtime cases cover resolver failure, IPv4-to-IPv6 answer changes, aliases,
     resolution admission, and cancellation. Release smoke covers both CLI and
     TOML names, DNS-only certificates, and reconnect after modem restart.
+
+75. Extension-requested session termination. **Done** — negotiated extensions
+    can queue `terminate_session(reason)` from input, session-up, and destination
+    hooks. The first accepted request wins, suppresses queued extension messages,
+    and drives the existing FSM shutdown path after the current action batch.
+    Protocol validation and existing closing transitions keep precedence.
+    Session-down hooks reject requests; custom contexts inherit an Unsupported
+    default. Both roles preserve termination acknowledgements, response deadlines,
+    snapshots, and exactly-once down notification. IPv4/IPv6 cases cover all
+    input/destination hooks and session isolation; virtual-time cases cover
+    session-up requests, first-reason precedence, message suppression, and full
+    response deadlines with and without acknowledgements.
 
 ---
 

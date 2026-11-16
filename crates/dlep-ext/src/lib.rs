@@ -42,13 +42,46 @@ impl Role {
 }
 
 /// Context handed to every hook. Extensions may queue outbound messages and
-/// emit opaque application-level events, but cannot mutate FSM state.
+/// emit opaque application-level events, or request FSM-managed termination.
 pub trait ExtensionCtx {
     fn session_id(&self) -> SessionId;
     fn is_router_side(&self) -> bool;
     fn send_message(&mut self, msg: Message);
     fn emit_event(&mut self, ev: Arc<dyn Any + Send + Sync>);
+
+    /// Queue FSM-managed termination of this session with the supplied Status
+    /// Code. The runtime finishes the current action batch first; existing
+    /// protocol-error/closing transitions take precedence. The first accepted
+    /// request wins and suppresses queued extension messages. An unknown-message
+    /// or data-item handler should also return `Handled` for input it consumes.
+    ///
+    /// Requests from session-down hooks are rejected. Success means queued,
+    /// not acknowledged by the peer. Custom contexts default to `Unsupported`.
+    fn terminate_session(&mut self, reason: StatusCode) -> Result<(), TerminationRequestError> {
+        let _ = reason;
+        Err(TerminationRequestError::Unsupported)
+    }
 }
+
+/// Why an extension's session-termination request was not queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminationRequestError {
+    Unsupported,
+    SessionClosing,
+    AlreadyRequested,
+}
+
+impl std::fmt::Display for TerminationRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "extension context does not support session termination",
+            Self::SessionClosing => "session is closing or closed",
+            Self::AlreadyRequested => "session termination was already requested",
+        })
+    }
+}
+
+impl std::error::Error for TerminationRequestError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtHandled {
@@ -179,6 +212,26 @@ impl ExtensionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_contexts_can_report_termination_as_unsupported() {
+        struct Context;
+        impl ExtensionCtx for Context {
+            fn session_id(&self) -> SessionId {
+                SessionId(1)
+            }
+            fn is_router_side(&self) -> bool {
+                true
+            }
+            fn send_message(&mut self, _: Message) {}
+            fn emit_event(&mut self, _: Arc<dyn Any + Send + Sync>) {}
+        }
+        assert_eq!(
+            Context.terminate_session(StatusCode::SHUTTING_DOWN),
+            Err(TerminationRequestError::Unsupported)
+        );
+    }
+
     struct DefaultExtension;
     impl DlepExtension for DefaultExtension {
         fn advertised_ids(&self) -> &[ExtensionId] {

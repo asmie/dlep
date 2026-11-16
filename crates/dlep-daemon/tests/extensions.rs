@@ -575,6 +575,273 @@ async fn session_down_reason(rx: &mut Receiver<DaemonEvent>) -> dlep_core::Statu
     .expect("SessionDown deadline")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminationTrigger {
+    Message,
+    Item,
+    Destination,
+}
+
+struct TerminatingExtension {
+    trigger: TerminationTrigger,
+    terminate: bool,
+    consume: bool,
+    requests: std::sync::atomic::AtomicUsize,
+    down_hooks: std::sync::atomic::AtomicUsize,
+}
+
+impl TerminatingExtension {
+    fn new(trigger: TerminationTrigger, terminate: bool, consume: bool) -> Arc<Self> {
+        Arc::new(Self {
+            trigger,
+            terminate,
+            consume,
+            requests: Default::default(),
+            down_hooks: Default::default(),
+        })
+    }
+    fn request(&self, ctx: &mut dyn ExtensionCtx) {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ctx.terminate_session(dlep_core::StatusCode(240)).unwrap();
+    }
+}
+
+impl DlepExtension for TerminatingExtension {
+    fn advertised_ids(&self) -> &[ExtensionId] {
+        &[TEST_EXT_ID]
+    }
+    fn on_session_state(&self, state: SessionStateSnapshot, ctx: &mut dyn ExtensionCtx) {
+        if !state.up {
+            self.down_hooks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                ctx.terminate_session(dlep_core::StatusCode(241)),
+                Err(dlep_ext::TerminationRequestError::SessionClosing)
+            );
+        } else if !self.terminate {
+            match self.trigger {
+                TerminationTrigger::Message => ctx.send_message(Message::new(TEST_MSG_TYPE)),
+                TerminationTrigger::Item => {
+                    ctx.send_message(Message::new(MessageType::HEARTBEAT).with_item(
+                        DataItem::Unknown(dlep_core::RawDataItem {
+                            type_id: dlep_core::DataItemType(0xFF80),
+                            value: bytes::Bytes::new(),
+                        }),
+                    ))
+                }
+                TerminationTrigger::Destination => {}
+            }
+        }
+    }
+    fn on_unknown_message(
+        &self,
+        _: MessageType,
+        _: &[DataItem],
+        ctx: &mut dyn ExtensionCtx,
+    ) -> ExtHandled {
+        assert!(self.terminate && self.trigger == TerminationTrigger::Message);
+        self.request(ctx);
+        if self.consume {
+            ExtHandled::Handled
+        } else {
+            ExtHandled::Passthrough
+        }
+    }
+    fn on_unknown_data_item(
+        &self,
+        _: MessageType,
+        _: &dlep_core::RawDataItem,
+        ctx: &mut dyn ExtensionCtx,
+    ) -> ExtHandled {
+        assert!(self.terminate && self.trigger == TerminationTrigger::Item);
+        self.request(ctx);
+        ExtHandled::Handled
+    }
+    fn on_destination_state(
+        &self,
+        _: dlep_core::MacAddress,
+        _: dlep_ext::DestinationStateSnapshot,
+        ctx: &mut dyn ExtensionCtx,
+    ) {
+        if self.terminate && self.trigger == TerminationTrigger::Destination {
+            self.request(ctx);
+        }
+    }
+}
+
+#[tokio::test]
+async fn negotiated_hooks_can_terminate_either_role_over_ipv4_and_ipv6() {
+    use dlep_daemon::{DestinationEvent, DestinationId};
+    use std::sync::atomic::Ordering;
+    for ip in ["127.0.0.1", "::1"] {
+        for router_terminates in [false, true] {
+            for trigger in [
+                TerminationTrigger::Message,
+                TerminationTrigger::Item,
+                TerminationTrigger::Destination,
+            ] {
+                let receiver = TerminatingExtension::new(trigger, true, true);
+                let sender = TerminatingExtension::new(trigger, false, true);
+                let mut config = loopback_modem_config();
+                config.shared.network.bind_addr = ip.parse().unwrap();
+                let modem = ModemDaemon::builder()
+                    .config(config)
+                    .register_extension(if router_terminates {
+                        sender.clone()
+                    } else {
+                        receiver.clone()
+                    })
+                    .spawn()
+                    .await
+                    .unwrap();
+                let router = RouterDaemon::builder()
+                    .config(loopback_router_config())
+                    .register_extension(if router_terminates {
+                        receiver.clone()
+                    } else {
+                        sender.clone()
+                    })
+                    .spawn()
+                    .await
+                    .unwrap();
+                let mut re = router.subscribe();
+                let mut me = modem.subscribe();
+                router.connect_static(modem.local_addr()).await.unwrap();
+                let rid = session_identity(&mut re).await;
+                session_identity(&mut me).await;
+                if trigger == TerminationTrigger::Destination {
+                    let id = DestinationId(dlep_core::MacAddress::new_eui48([2, 0, 0, 0, 0, 75]));
+                    modem.add_destination(id, Default::default()).await.unwrap();
+                    if !router_terminates {
+                        timeout(STEP_TIMEOUT, async {
+                            loop {
+                                if matches!(
+                                    re.recv().await.unwrap(),
+                                    DaemonEvent::Destination {
+                                        event: DestinationEvent::Up { .. },
+                                        ..
+                                    }
+                                ) {
+                                    break;
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        // The modem's down hook observes router withdrawal.
+                        router.drop_destination(rid, id).await.unwrap();
+                    }
+                }
+                assert_eq!(
+                    session_down_reason(&mut re).await,
+                    dlep_core::StatusCode(240)
+                );
+                assert_eq!(
+                    session_down_reason(&mut me).await,
+                    dlep_core::StatusCode(240)
+                );
+                assert!(router.state().borrow().sessions.is_empty());
+                assert!(modem.state().borrow().sessions.is_empty());
+                assert_eq!(receiver.requests.load(Ordering::SeqCst), 1);
+                assert_eq!(receiver.down_hooks.load(Ordering::SeqCst), 1);
+                assert_eq!(sender.down_hooks.load(Ordering::SeqCst), 1);
+                router.shutdown().await.unwrap();
+                modem.shutdown().await.unwrap();
+                for events in [&mut re, &mut me] {
+                    while let Ok(event) = events.try_recv() {
+                        assert!(!matches!(event, DaemonEvent::SessionDown { .. }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn protocol_validation_keeps_precedence_over_extension_termination_requests() {
+    let modem = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .register_extension(TerminatingExtension::new(
+            TerminationTrigger::Message,
+            false,
+            true,
+        ))
+        .spawn()
+        .await
+        .unwrap();
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .register_extension(TerminatingExtension::new(
+            TerminationTrigger::Message,
+            true,
+            false,
+        ))
+        .spawn()
+        .await
+        .unwrap();
+    let mut re = router.subscribe();
+    let mut me = modem.subscribe();
+    router.connect_static(modem.local_addr()).await.unwrap();
+    assert_eq!(
+        session_down_reason(&mut re).await,
+        dlep_core::StatusCode::UNKNOWN_MESSAGE
+    );
+    assert_eq!(
+        session_down_reason(&mut me).await,
+        dlep_core::StatusCode::UNKNOWN_MESSAGE
+    );
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn extension_termination_is_session_scoped_and_requires_negotiation() {
+    let receiver = TerminatingExtension::new(TerminationTrigger::Message, true, true);
+    let healthy = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .spawn()
+        .await
+        .unwrap();
+    let targeted = ModemDaemon::builder()
+        .config(loopback_modem_config())
+        .register_extension(TerminatingExtension::new(
+            TerminationTrigger::Message,
+            false,
+            true,
+        ))
+        .spawn()
+        .await
+        .unwrap();
+    let router = RouterDaemon::builder()
+        .config(loopback_router_config())
+        .register_extension(receiver.clone())
+        .spawn()
+        .await
+        .unwrap();
+    let mut re = router.subscribe();
+    router.connect_static(healthy.local_addr()).await.unwrap();
+    let healthy_id = session_identity(&mut re).await;
+    router.connect_static(targeted.local_addr()).await.unwrap();
+    assert_eq!(
+        session_down_reason(&mut re).await,
+        dlep_core::StatusCode(240)
+    );
+    let snapshot = router.state().borrow().clone();
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(
+        snapshot.sessions[&healthy_id].peer.addr,
+        healthy.local_addr()
+    );
+    assert_eq!(
+        receiver.requests.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    router.shutdown().await.unwrap();
+    healthy.shutdown().await.unwrap();
+    targeted.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn unhandled_items_and_reserved_flags_terminate_with_invalid_data() {
     for reserved_flags in [false, true] {

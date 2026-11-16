@@ -5,7 +5,7 @@
 //! synchronous and tokio-free; everything async lives here.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -14,7 +14,7 @@ use bytes::BytesMut;
 use dlep_core::{DataItem, MacAddress, Message, MessageType, StatusCode};
 use dlep_ext::{
     DestinationStateSnapshot, DlepExtension, ExtHandled, ExtensionCtx, ExtensionRegistry, Role,
-    SessionId, SessionStateSnapshot,
+    SessionId, SessionStateSnapshot, TerminationRequestError,
 };
 use dlep_fsm::events::EmittedEvent;
 use dlep_fsm::{FsmAction, FsmEvent, SessionConfig, TimerId, TimerKind};
@@ -51,6 +51,22 @@ fn next_session_id(counter: &SessionIdCounter) -> SessionId {
     SessionId(counter.fetch_add(1, Ordering::Relaxed))
 }
 
+#[derive(Default)]
+struct ExtensionOutput {
+    messages: Vec<Message>,
+    termination: Option<StatusCode>,
+    termination_started: bool,
+}
+
+impl ExtensionOutput {
+    fn take_termination(&mut self) -> Option<FsmEvent> {
+        let reason = self.termination.take()?;
+        self.termination_started = true;
+        self.messages.clear();
+        Some(FsmEvent::AppShutdown { reason })
+    }
+}
+
 /// Per-hook-call context handed to extensions. Captures references to the
 /// session task's mutable state so the extension can queue outbound
 /// messages (drained to the writer once the hook returns) and emit
@@ -60,8 +76,9 @@ fn next_session_id(counter: &SessionIdCounter) -> SessionId {
 struct SessionCtx<'a> {
     session_id: SessionId,
     is_router_side: bool,
-    pending_sends: &'a mut Vec<Message>,
+    extension_output: &'a mut ExtensionOutput,
     events_tx: &'a EventTx,
+    can_terminate: bool,
 }
 
 impl<'a> ExtensionCtx for SessionCtx<'a> {
@@ -72,7 +89,18 @@ impl<'a> ExtensionCtx for SessionCtx<'a> {
         self.is_router_side
     }
     fn send_message(&mut self, msg: Message) {
-        self.pending_sends.push(msg);
+        self.extension_output.messages.push(msg);
+    }
+    fn terminate_session(&mut self, reason: StatusCode) -> Result<(), TerminationRequestError> {
+        if !self.can_terminate {
+            return Err(TerminationRequestError::SessionClosing);
+        }
+        if self.extension_output.termination.is_some() || self.extension_output.termination_started
+        {
+            return Err(TerminationRequestError::AlreadyRequested);
+        }
+        self.extension_output.termination = Some(reason);
+        Ok(())
     }
     fn emit_event(&mut self, ev: Arc<dyn Any + Send + Sync>) {
         // `broadcast::Sender::send` returns `Err(SendError)` when there
@@ -114,7 +142,7 @@ impl Drop for SessionLifecycle {
                 peer: self.peer.clone(),
                 reason: StatusCode::TIMED_OUT,
             });
-            let mut discarded_sends = Vec::new();
+            let mut discarded_sends = ExtensionOutput::default();
             dispatch_session_state(
                 &self.active_exts,
                 self.session_id,
@@ -482,7 +510,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
         mac_address_format: fsm.mac_address_format(),
         link_jobs: LinkJobs::new(link_control),
     };
-    let mut pending_sends: Vec<Message> = Vec::new();
+    let mut extension_output = ExtensionOutput::default();
 
     let (timer_expiry_tx, mut timer_expiry_rx) =
         mpsc::channel::<(TimerId, TimerKind, u64)>(COMMAND_CHANNEL_CAPACITY);
@@ -502,7 +530,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
         session_id,
         is_router_side,
         &mut lifecycle,
-        &mut pending_sends,
+        &mut extension_output,
     )
     .await?
     {
@@ -526,7 +554,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                         let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
                         if process_actions(&mut fsm, actions, &mut writer, &mut timers, &timer_expiry_tx,
                             &events_tx, &peer, &extensions, session_id, is_router_side,
-                            &mut lifecycle, &mut pending_sends).await? { break; }
+                            &mut lifecycle, &mut extension_output).await? { break; }
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -551,25 +579,25 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                             let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
                             if process_actions(&mut fsm, actions, &mut writer, &mut timers, &timer_expiry_tx,
                                 &events_tx, &peer, &extensions, session_id, is_router_side,
-                                &mut lifecycle, &mut pending_sends).await? { break; }
+                                &mut lifecycle, &mut extension_output).await? { break; }
                             continue;
                         }
                         // Only mutually negotiated extensions can consume unknown
                         // messages/items. Unclaimed input reaches strict validation.
                         let handled = fsm.in_session() && !is_known_message_type(msg.message_type) && dispatch_unknown_message(
-                            &lifecycle.active_exts, session_id, is_router_side, &mut pending_sends,
+                            &lifecycle.active_exts, session_id, is_router_side, &mut extension_output,
                             &events_tx, msg.message_type, &msg.data_items);
                         if !handled && fsm.in_session() {
                             msg.data_items = filter_unknown_items(&lifecycle.active_exts, session_id,
-                                is_router_side, &mut pending_sends, &events_tx, msg.message_type, msg.data_items);
+                                is_router_side, &mut extension_output, &events_tx, msg.message_type, msg.data_items);
                         }
                         let event = if handled { FsmEvent::RecvExtensionMessage } else { FsmEvent::RecvMessage(msg) };
                         let actions = fsm.step(event);
                         let close = process_actions(&mut fsm, actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer, &extensions, session_id, is_router_side,
-                            &mut lifecycle, &mut pending_sends).await?;
+                            &mut lifecycle, &mut extension_output).await?;
                         if close { break; }
-                        flush_pending_sends(&mut pending_sends, &mut writer, lifecycle.mac_address_format).await?;
+                        flush_extension_messages(&mut extension_output, &mut writer, lifecycle.mac_address_format).await?;
                     }
                     FrameRead::Eof => {
                         let actions = fsm.step(FsmEvent::TcpClosed);
@@ -577,7 +605,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                             actions, &mut writer, &mut timers,
                             &timer_expiry_tx, &events_tx, &peer,
                             &extensions, session_id, is_router_side,
-                            &mut lifecycle, &mut pending_sends,
+                            &mut lifecycle, &mut extension_output,
                         ).await?;
                         break;
                     }
@@ -656,7 +684,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
-                    &mut lifecycle, &mut pending_sends,
+                    &mut lifecycle, &mut extension_output,
                 ).await?;
                 if let Some(receipt) = receipt { let _ = receipt.send(Some((session_id, outcome))); }
                 if closed { break; }
@@ -680,7 +708,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
-                    &mut lifecycle, &mut pending_sends,
+                    &mut lifecycle, &mut extension_output,
                 ).await?;
                 if let Some(receipt) = receipt { let _ = receipt.send(outcome); }
                 if closed { break; }
@@ -706,7 +734,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     actions, &mut writer, &mut timers,
                     &timer_expiry_tx, &events_tx, &peer,
                     &extensions, session_id, is_router_side,
-                    &mut lifecycle, &mut pending_sends,
+                    &mut lifecycle, &mut extension_output,
                 ).await? {
                     break;
                 }
@@ -755,11 +783,27 @@ async fn process_actions(
     session_id: SessionId,
     is_router_side: bool,
     lifecycle: &mut SessionLifecycle,
-    pending_sends: &mut Vec<Message>,
+    extension_output: &mut ExtensionOutput,
 ) -> Result<bool, DaemonError> {
     let mut published = false;
     let mut close = false;
-    for action in actions {
+    let mut actions: VecDeque<_> = actions.into();
+    loop {
+        let Some(action) = actions.pop_front() else {
+            if close || !fsm.in_session() {
+                if extension_output.termination.take().is_some() {
+                    extension_output.termination_started = true;
+                    extension_output.messages.clear();
+                }
+                break;
+            }
+            let Some(event) = extension_output.take_termination() else {
+                break;
+            };
+            actions.extend(fsm.step(event));
+            published = false;
+            continue;
+        };
         match action {
             FsmAction::SendMessage(msg) => {
                 write_message(writer, &msg).await?;
@@ -869,7 +913,7 @@ async fn process_actions(
                             active_exts,
                             session_id,
                             is_router_side,
-                            pending_sends,
+                            extension_output,
                             events_tx,
                             true,
                         );
@@ -879,7 +923,7 @@ async fn process_actions(
                             active_exts,
                             session_id,
                             is_router_side,
-                            pending_sends,
+                            extension_output,
                             events_tx,
                             false,
                         );
@@ -894,7 +938,7 @@ async fn process_actions(
                             active_exts,
                             session_id,
                             is_router_side,
-                            pending_sends,
+                            extension_output,
                             events_tx,
                             *mac,
                             true,
@@ -921,7 +965,7 @@ async fn process_actions(
                             active_exts,
                             session_id,
                             is_router_side,
-                            pending_sends,
+                            extension_output,
                             events_tx,
                             *mac,
                             false,
@@ -933,7 +977,8 @@ async fn process_actions(
                 }
 
                 // Propagate extension write failures through lifecycle cleanup.
-                flush_pending_sends(pending_sends, writer, lifecycle.mac_address_format).await?;
+                flush_extension_messages(extension_output, writer, lifecycle.mac_address_format)
+                    .await?;
             }
         }
     }
@@ -1166,7 +1211,7 @@ fn dispatch_unknown_message(
     active_exts: &[Arc<dyn DlepExtension>],
     session_id: SessionId,
     is_router_side: bool,
-    pending_sends: &mut Vec<Message>,
+    extension_output: &mut ExtensionOutput,
     events_tx: &EventTx,
     message_type: MessageType,
     items: &[DataItem],
@@ -1175,8 +1220,9 @@ fn dispatch_unknown_message(
         let mut ctx = SessionCtx {
             session_id,
             is_router_side,
-            pending_sends,
+            extension_output,
             events_tx,
+            can_terminate: true,
         };
         if let ExtHandled::Handled = ext.on_unknown_message(message_type, items, &mut ctx) {
             return true;
@@ -1191,7 +1237,7 @@ fn filter_unknown_items(
     active_exts: &[Arc<dyn DlepExtension>],
     session_id: SessionId,
     is_router_side: bool,
-    pending_sends: &mut Vec<Message>,
+    extension_output: &mut ExtensionOutput,
     events_tx: &EventTx,
     in_message: MessageType,
     items: Vec<DataItem>,
@@ -1206,8 +1252,9 @@ fn filter_unknown_items(
                 let mut ctx = SessionCtx {
                     session_id,
                     is_router_side,
-                    pending_sends,
+                    extension_output,
                     events_tx,
+                    can_terminate: true,
                 };
                 ext.on_unknown_data_item(in_message, raw, &mut ctx) == ExtHandled::Handled
             })
@@ -1219,7 +1266,7 @@ fn dispatch_session_state(
     active_exts: &[Arc<dyn DlepExtension>],
     session_id: SessionId,
     is_router_side: bool,
-    pending_sends: &mut Vec<Message>,
+    extension_output: &mut ExtensionOutput,
     events_tx: &EventTx,
     up: bool,
 ) {
@@ -1228,8 +1275,9 @@ fn dispatch_session_state(
         let mut ctx = SessionCtx {
             session_id,
             is_router_side,
-            pending_sends,
+            extension_output,
             events_tx,
+            can_terminate: up,
         };
         ext.on_session_state(snap, &mut ctx);
     }
@@ -1240,7 +1288,7 @@ fn dispatch_destination_state(
     active_exts: &[Arc<dyn DlepExtension>],
     session_id: SessionId,
     is_router_side: bool,
-    pending_sends: &mut Vec<Message>,
+    extension_output: &mut ExtensionOutput,
     events_tx: &EventTx,
     mac: MacAddress,
     up: bool,
@@ -1256,24 +1304,29 @@ fn dispatch_destination_state(
         let mut ctx = SessionCtx {
             session_id,
             is_router_side,
-            pending_sends,
+            extension_output,
             events_tx,
+            can_terminate: true,
         };
         ext.on_destination_state(mac, snap, &mut ctx);
     }
 }
 
-/// Encode and write every extension-queued message in `pending_sends` to
+/// Encode and write every extension-queued message in `extension_output` to
 /// `writer`. On the first encode or write error, returns Err with the
 /// remaining (un-iterated) messages **discarded** via `Drain`'s `Drop` —
 /// callers must treat the post-failure session as terminating, since the
 /// truncated queue cannot be recovered.
-async fn flush_pending_sends(
-    pending_sends: &mut Vec<Message>,
+async fn flush_extension_messages(
+    extension_output: &mut ExtensionOutput,
     writer: &mut WriteHalf<Box<dyn Transport>>,
     format: dlep_core::MacAddressFormat,
 ) -> Result<(), DaemonError> {
-    for msg in pending_sends.drain(..) {
+    if extension_output.termination.is_some() || extension_output.termination_started {
+        extension_output.messages.clear();
+        return Ok(());
+    }
+    for msg in extension_output.messages.drain(..) {
         dlep_fsm::validation::validate_mac_format(&msg, format).map_err(|_| {
             DaemonError::Config(
                 "extension message MAC does not match session address format".into(),

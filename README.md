@@ -222,6 +222,15 @@ feed described below. Library applications must supply their own policy and
 handle `broadcast::error::RecvError::Lagged` if they need to continue after event
 loss.
 
+Negotiated extensions can request termination of their current session through
+`ExtensionCtx::terminate_session(reason)`. The runtime uses the existing FSM
+termination exchange, response deadline, snapshot cleanup, and lifecycle events.
+The first accepted request wins and discards queued extension messages; existing
+protocol-error/closing transitions take precedence. Session-down hooks reject
+new requests, and custom contexts default to `Unsupported`. See the
+[extension API example](crates/dlep-ext/README.md). Reconnect policy remains with
+the application or CLI.
+
 For direct connections, `connect_named("modem.example", 854)` resolves the host
 with the system resolver and verifies TLS against that hostname. It tries up to
 16 distinct addresses in resolver order within a shared 15-second deadline and

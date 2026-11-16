@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Negotiated extensions can call `ExtensionCtx::terminate_session(reason)` from
+  in-session hooks. The runtime drives the existing FSM termination exchange
+  and deadline, discards queued extension messages, and preserves session-scoped
+  cleanup. The first accepted request wins; protocol-error/closing transitions
+  retain precedence. Session-down hooks reject requests, and the default method
+  reports `Unsupported` so existing custom contexts continue to compile.
 - Router `--peer` and TOML `static_peers` accept DNS names with explicit ports.
   Retries resolve names afresh while preserving hostname-based TLS verification
   and SNI, bounded fallback, connection limits, and exponential backoff. Duplicate

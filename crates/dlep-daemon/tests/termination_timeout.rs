@@ -5,7 +5,10 @@ use dlep_daemon::{
     runtime::new_event_channel,
     session::{SessionFsm, new_session_id_counter, run_session},
 };
-use dlep_ext::{ExtensionRegistry, Role};
+use dlep_ext::{
+    DlepExtension, ExtensionCtx, ExtensionRegistry, Role, SessionStateSnapshot,
+    TerminationRequestError,
+};
 use dlep_fsm::{
     FsmAction, FsmEvent, SessionConfig, session_modem::ModemSessionFsm,
     session_router::RouterSessionFsm,
@@ -13,9 +16,41 @@ use dlep_fsm::{
 use std::{
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
+
+const EXTENSION: dlep_core::ExtensionId = dlep_core::ExtensionId(0xF001);
+const EXTENSION_REASON: StatusCode = StatusCode(240);
+
+struct TerminateOnUp;
+impl DlepExtension for TerminateOnUp {
+    fn advertised_ids(&self) -> &[dlep_core::ExtensionId] {
+        &[EXTENSION]
+    }
+    fn on_session_state(&self, state: SessionStateSnapshot, ctx: &mut dyn ExtensionCtx) {
+        if state.up {
+            // These invalid MAC messages must be discarded, before validation
+            // or writing, when a valid control request takes precedence.
+            let queued = Message::new(MessageType(0xF001)).with_item(
+                dlep_core::DataItem::MacAddress(dlep_core::MacAddress::BROADCAST_EUI64),
+            );
+            ctx.send_message(queued.clone());
+            ctx.terminate_session(EXTENSION_REASON).unwrap();
+            assert_eq!(
+                ctx.terminate_session(StatusCode::INVALID_DATA),
+                Err(TerminationRequestError::AlreadyRequested)
+            );
+            ctx.send_message(queued);
+        } else {
+            assert_eq!(
+                ctx.terminate_session(EXTENSION_REASON),
+                Err(TerminationRequestError::SessionClosing)
+            );
+        }
+    }
+}
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     sync::mpsc,
@@ -81,10 +116,15 @@ async fn exercise(
     role: Role,
     deadline: Duration,
     acknowledge: bool,
+    extension: bool,
 ) {
     let (transport, mut peer) = tokio::io::duplex(4096);
     let (commands, rx) = mpsc::channel(8);
     let (events, mut received) = new_event_channel();
+    let mut extensions = ExtensionRegistry::new();
+    if extension {
+        extensions.register(Arc::new(TerminateOnUp));
+    }
     let task = tokio::spawn(run_session(
         fsm,
         Box::new(MemoryTransport(transport)),
@@ -101,17 +141,21 @@ async fn exercise(
             is_tls: false,
             peer_description: None,
         },
-        ExtensionRegistry::default(),
+        extensions,
         role,
         new_session_id_counter(),
     ));
+    let other_config = SessionConfig {
+        advertised_extensions: if extension { vec![EXTENSION] } else { vec![] },
+        ..Default::default()
+    };
     if role.is_router() {
-        let mut other = ModemSessionFsm::new();
+        let mut other = ModemSessionFsm::with_config(other_config);
         other.step(FsmEvent::TcpAccepted);
         let response = sent(other.step(FsmEvent::RecvMessage(read(&mut peer).await)));
         peer.write_all(&response.encode().unwrap()).await.unwrap();
     } else {
-        let mut other = RouterSessionFsm::new();
+        let mut other = RouterSessionFsm::with_config(other_config);
         let init = sent(other.step(FsmEvent::TcpConnected));
         peer.write_all(&init.encode().unwrap()).await.unwrap();
         assert_eq!(
@@ -123,18 +167,26 @@ async fn exercise(
         received.recv().await.unwrap(),
         DaemonEvent::SessionUp { .. }
     ));
-    commands
-        .send(
-            SessionCommand::Shutdown {
-                reason: StatusCode::SHUTTING_DOWN,
-            }
-            .into(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        read(&mut peer).await.message_type,
-        MessageType::SESSION_TERMINATION
+    if !extension {
+        commands
+            .send(
+                SessionCommand::Shutdown {
+                    reason: StatusCode::SHUTTING_DOWN,
+                }
+                .into(),
+            )
+            .await
+            .unwrap();
+    }
+    let reason = if extension {
+        EXTENSION_REASON
+    } else {
+        StatusCode::SHUTTING_DOWN
+    };
+    let termination = read(&mut peer).await;
+    assert_eq!(termination.message_type, MessageType::SESSION_TERMINATION);
+    assert!(
+        matches!(termination.data_items.as_slice(), [dlep_core::DataItem::Status { code, text }] if *code == reason && text.is_empty())
     );
     tokio::task::yield_now().await;
     advance(deadline - Duration::from_millis(1)).await;
@@ -163,7 +215,7 @@ async fn exercise(
         .unwrap()
         .unwrap();
     let expected_reason = if acknowledge {
-        StatusCode::SHUTTING_DOWN
+        reason
     } else {
         StatusCode::TIMED_OUT
     };
@@ -195,6 +247,7 @@ async fn cases(router: bool) {
                     Role::Router,
                     deadline,
                     acknowledge,
+                    false,
                 )
                 .await;
             } else {
@@ -203,6 +256,7 @@ async fn cases(router: bool) {
                     Role::Modem,
                     deadline,
                     acknowledge,
+                    false,
                 )
                 .await;
             }
@@ -218,4 +272,37 @@ async fn router_waits_for_late_response_or_full_termination_deadline() {
 #[tokio::test(start_paused = true)]
 async fn modem_waits_for_late_response_or_full_termination_deadline() {
     cases(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn extension_termination_uses_the_fsm_response_deadline_and_first_reason() {
+    let deadline = Duration::from_secs(6);
+    for router in [true, false] {
+        for acknowledge in [true, false] {
+            let config = SessionConfig {
+                advertised_extensions: vec![EXTENSION],
+                heartbeat_interval_ms: 1500,
+                ..Default::default()
+            };
+            if router {
+                exercise(
+                    RouterSessionFsm::with_config(config),
+                    Role::Router,
+                    deadline,
+                    acknowledge,
+                    true,
+                )
+                .await;
+            } else {
+                exercise(
+                    ModemSessionFsm::with_config(config),
+                    Role::Modem,
+                    deadline,
+                    acknowledge,
+                    true,
+                )
+                .await;
+            }
+        }
+    }
 }

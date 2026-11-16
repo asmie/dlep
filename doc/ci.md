@@ -77,6 +77,13 @@ heartbeat intervals and must shut down cleanly on SIGINT/SIGTERM. All network
 changes occur in disposable namespaces. Use the sudo alternative in the network
 test instructions when user namespaces are unavailable.
 
+Extension runtime checks cover termination requests from negotiated session,
+message, data-item, and destination hooks. They verify IPv4/IPv6 and both roles,
+session isolation, protocol-error precedence, and exactly-once cleanup. Paused
+time checks preserve the full termination response deadline, first-request
+precedence, and queued-message suppression. Portable extension tests also check
+that existing custom contexts inherit the Unsupported default.
+
 Checkpoint 60 (2026-11-15) passed all eight archives, 591 archived Rust tests
 across 60 suites, three command installations, and 113 CLI/certificate checks
 plus four session scenarios for each build. Formatting, clippy, Rust 1.85,
