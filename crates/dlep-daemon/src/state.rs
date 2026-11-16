@@ -24,12 +24,24 @@ pub struct DaemonSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionPhase {
     Established,
     Terminating,
 }
 
+impl SessionPhase {
+    /// Stable snake_case name, as used by the bundled adapter protocols.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Established => "established",
+            Self::Terminating => "terminating",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DestinationPhase {
     /// Modem is awaiting the router's Destination Up Response.
     PendingUp,
@@ -38,6 +50,18 @@ pub enum DestinationPhase {
     Withdrawn,
     /// A locally initiated Destination Down is awaiting its response.
     PendingDown,
+}
+
+impl DestinationPhase {
+    /// Stable snake_case name, as used by the bundled adapter protocols.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingUp => "pending_up",
+            Self::Up => "up",
+            Self::Withdrawn => "withdrawn",
+            Self::PendingDown => "pending_down",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +86,33 @@ pub struct SessionSnapshot {
     /// Effective desired local addresses. Modem replacements can be queued
     /// or partly sent; this is not confirmation that the peer accepted them.
     pub local_addresses: DestinationAddrs,
-    pub destinations: HashMap<DestinationId, DestinationSnapshot>,
+    /// Destinations that did not change keep the same `Arc` across
+    /// generations, so publishing a change costs no per-destination copies.
+    pub destinations: HashMap<DestinationId, Arc<DestinationSnapshot>>,
+}
+
+impl SessionSnapshot {
+    /// Reuse `previous`'s entry for `id` when it is unchanged.
+    pub(crate) fn destination(
+        previous: Option<&SessionSnapshot>,
+        id: DestinationId,
+        phase: DestinationPhase,
+        metrics: LinkMetrics,
+        addresses: &DestinationAddrs,
+    ) -> Arc<DestinationSnapshot> {
+        match previous.and_then(|previous| previous.destinations.get(&id)) {
+            Some(old)
+                if old.phase == phase && old.metrics == metrics && old.addresses == *addresses =>
+            {
+                Arc::clone(old)
+            }
+            _ => Arc::new(DestinationSnapshot {
+                phase,
+                metrics,
+                addresses: addresses.clone(),
+            }),
+        }
+    }
 }
 
 /// Updated synchronously by session tasks before public events and command
@@ -80,6 +130,11 @@ impl StateRegistry {
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<DaemonSnapshot> {
         self.state.subscribe()
+    }
+
+    /// The retained snapshot of one session, for incremental rebuilding.
+    pub(crate) fn session(&self, id: SessionId) -> Option<Arc<SessionSnapshot>> {
+        self.state.borrow().sessions.get(&id).cloned()
     }
 
     pub(crate) fn update(&self, id: SessionId, session: SessionSnapshot) {

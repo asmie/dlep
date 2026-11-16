@@ -265,9 +265,10 @@ DNS SAN. Numeric peers continue to require matching IP SANs. Events, snapshots,
 and adapter records identify the connected numeric endpoint.
 
 Duplicate configured entries are coalesced. If names or numeric peers overlap,
-the driver reserves each endpoint during connection and skips active endpoints;
-an alias remains queued with backoff rather than borrowing another identity's
-authenticated session. At most eight connection jobs run concurrently, with
+the driver reserves each endpoint during connection and skips active endpoints.
+An alias whose answers are all active under another configured identity waits
+for that session to end, then retries with backoff; it never borrows another
+identity's authenticated session. At most eight connection jobs run concurrently, with
 resolution counted toward admission against the session budget. Shutdown cancels
 pending jobs; the OS resolver may finish its underlying blocking work afterward.
 
@@ -771,7 +772,12 @@ new work and send Session Termination with Shutting Down status to established
 peers, then wait for the responses or `termination_timeout_ms`. Repeated stop
 signals leave that exchange running. Incomplete TLS handshakes are cancelled;
 the router also interrupts TCP/TLS connection attempts during startup, discovery,
-and reconnection. The example units use `KillSignal=SIGTERM` explicitly.
+and reconnection. The example units use `KillSignal=SIGTERM` explicitly, with
+`KillMode=mixed` so that only the daemon receives it: the daemon finishes its
+shutdown, closes its adapter's input, and kills an adapter still running two
+seconds later. systemd then sends SIGKILL to any remaining unit processes.
+Under the default `KillMode=control-group`, an adapter would receive SIGTERM
+too and could exit while the daemon is still shutting down.
 Keep systemd's `TimeoutStopSec` longer than the configured termination timeout
 plus the transport write timeout (5 seconds), allowing scheduling overhead.
 When `termination_timeout_ms` is omitted, the deadline is four local heartbeat
@@ -793,7 +799,10 @@ with fallback attempted sequentially. Shutdown cancels pending attempts before
 gracefully terminating registered sessions.
 
 After a session drops, the router binary waits 1 second before retrying, then
-doubles the delay after unsuccessful retries, up to 30 seconds. Connection
+doubles the delay after unsuccessful retries, up to 30 seconds. In static mode,
+numeric, DNS, and named-zone peers share one driver that tracks each configured
+peer separately, so adding a DNS or zone entry does not change how numeric peers
+reconnect. Connection
 failures start the next delay when the attempt finishes. Pending TCP/TLS
 connections and DLEP initialization suspend further attempts without clearing
 the failure history. Rejection or failure during initialization resumes
@@ -881,6 +890,10 @@ To stop and unload the job:
 sudo launchctl bootout system/org.dlep.modem
 ```
 
+`bootout` sends SIGTERM to the DLEP process, not to its adapter; DLEP closes
+the adapter's input during shutdown and kills it if it is still running two
+seconds later.
+
 To apply changed configuration, boot out and bootstrap the job again. Avoid
 `kickstart -k` when a graceful DLEP shutdown is required. `ExitTimeOut = 300`
 allows the default 240-second protocol termination deadline plus transport I/O;
@@ -919,7 +932,8 @@ sudo service dlep_modem restart
 
 The script targets the **supervisor** PID. SIGTERM is forwarded to DLEP, and
 the supervisor waits for the termination exchange before exiting, without
-restarting the child. A child PID would instead trigger an unwanted restart.
+restarting the child. Only DLEP is signalled, not its adapter; DLEP closes the
+adapter's input during shutdown. A child PID would instead trigger an unwanted restart.
 See FreeBSD's [daemon(8) reference](https://github.com/freebsd/freebsd-src/blob/releng/15.1/usr.sbin/daemon/daemon.8)
 and [rc.d guide](https://docs.freebsd.org/en/articles/rc-scripting/).
 Allow the machine-wide `rcshutdown_timeout` enough time for the configured

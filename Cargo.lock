@@ -261,6 +261,7 @@ dependencies = [
  "dlep-fsm",
  "dlep-net",
  "ipnet",
+ "nix",
  "rustls",
  "serde",
  "tempfile",

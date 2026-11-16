@@ -366,3 +366,60 @@ async fn same_mac_on_two_modems_is_isolated_and_reconnect_gets_a_new_session() {
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn unchanged_destinations_are_shared_between_generations() {
+    let modem = modem("127.0.0.1").await;
+    let router = router().await;
+    router.connect_static(modem.local_addr()).await.unwrap();
+    let mut rs = router.state();
+    let mut ms = modem.state();
+    wait(&mut rs, |s| s.sessions.len() == 1).await;
+    wait(&mut ms, |s| s.sessions.len() == 1).await;
+    let other: DestinationId = MacAddress::new_eui48([2, 0, 0, 0, 0, 2]).into();
+    let metrics = |rate| LinkMetrics {
+        current_data_rate_tx_bps: rate,
+        max_data_rate_tx_bps: 1_000_000,
+        ..Default::default()
+    };
+    for destination in [id(), other] {
+        modem
+            .add_destination_with_addresses(destination, metrics(1), addresses(1))
+            .await
+            .unwrap();
+    }
+    let up = |s: &DaemonSnapshot, d: DestinationId| {
+        s.sessions
+            .values()
+            .next()
+            .and_then(|session| session.destinations.get(&d))
+            .is_some_and(|d| d.phase == DestinationPhase::Up)
+    };
+    let before = wait(&mut ms, |s| up(s, id()) && up(s, other)).await;
+    let routed = wait(&mut rs, |s| up(s, id()) && up(s, other)).await;
+
+    accept(|| modem.update_destination(id(), metrics(2))).await;
+    for (state, previous) in [(&mut ms, before), (&mut rs, routed)] {
+        let after = wait(state, |s| {
+            s.sessions.values().next().is_some_and(|session| {
+                session.destinations[&id()].metrics.current_data_rate_tx_bps == 2
+            })
+        })
+        .await;
+        assert!(after.generation > previous.generation);
+        let (old, new) = (
+            previous.sessions.values().next().unwrap(),
+            after.sessions.values().next().unwrap(),
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&old.destinations[&other], &new.destinations[&other]),
+            "unchanged destination was copied"
+        );
+        assert!(!std::sync::Arc::ptr_eq(
+            &old.destinations[&id()],
+            &new.destinations[&id()]
+        ));
+    }
+    router.shutdown().await.unwrap();
+    modem.shutdown().await.unwrap();
+}

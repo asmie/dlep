@@ -71,7 +71,9 @@ should tolerate additional metadata fields.
 Session IDs are unique within one router process lifetime. Always key a
 destination by **both session and MAC**: different modems can report the same
 MAC. Peer endpoints use socket-address notation, such as `192.0.2.1:854` or
-`[fe80::1%2]:854`. MAC strings contain six or eight hexadecimal octets.
+`[fe80::1%2]:854`. MAC strings contain six or eight colon-separated octets.
+The router writes two lowercase hexadecimal digits per octet; commands may use
+one or two hexadecimal digits per octet, without signs or other separators.
 
 Session phases are `established` and `terminating`; initializing sessions are
 absent and ended sessions are removed. Destination phases are `up`, `pending_up`,

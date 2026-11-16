@@ -5,6 +5,7 @@ use dlep_core::MacAddress;
 use crate::FsmEvent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CommandKind {
     AddDestination,
     DropDestination,
@@ -25,6 +26,7 @@ pub struct CommandInfo {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CommandError {
     #[error("a transaction for this scope is already in progress; retry after its response")]
     Busy,
@@ -42,6 +44,22 @@ pub enum CommandError {
     NoPendingRequest,
     #[error("destination MAC does not match the configured session address format")]
     MacAddressFormatMismatch,
+}
+
+impl CommandError {
+    /// Stable snake_case name, as used by the bundled adapter protocols.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::NotReady => "not_ready",
+            Self::UnknownDestination => "unknown_destination",
+            Self::AlreadyExists => "already_exists",
+            Self::Unsupported => "unsupported",
+            Self::InvalidInput => "invalid_input",
+            Self::NoPendingRequest => "no_pending_request",
+            Self::MacAddressFormatMismatch => "mac_format_mismatch",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

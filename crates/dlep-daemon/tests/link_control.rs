@@ -42,17 +42,25 @@ impl Pair {
     }
 
     async fn new_on(backend: Arc<dyn LinkControl>, ip: &str) -> Self {
+        Self::new_with(backend, ip, None).await
+    }
+
+    /// `deadline` overrides the modem's link-control timeout when set.
+    async fn new_with(
+        backend: Arc<dyn LinkControl>,
+        ip: &str,
+        deadline: Option<Option<Duration>>,
+    ) -> Self {
         let mut config = ModemConfig::default();
         config.shared.network.use_tls = false;
         config.shared.network.bind_addr = ip.parse().unwrap();
         config.shared.network.tcp_port = 0;
         config.shared.network.discovery_port = 0;
-        let modem = ModemDaemon::builder()
-            .config(config)
-            .link_control(backend)
-            .spawn()
-            .await
-            .unwrap();
+        let mut builder = ModemDaemon::builder().config(config).link_control(backend);
+        if let Some(deadline) = deadline {
+            builder = builder.link_control_timeout(deadline);
+        }
+        let modem = builder.spawn().await.unwrap();
         let mut router_config = RouterConfig::default();
         router_config.shared.network.use_tls = false;
         let router = RouterDaemon::builder()
@@ -465,6 +473,52 @@ async fn slow_backend_holds_the_transaction_until_it_answers() {
     assert_eq!(metrics.current_data_rate_tx_bps, 80_000);
     pair.request().await.unwrap();
     assert_eq!(pair.response().await.0, S::REQUEST_DENIED);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn backend_deadline_denies_the_request_and_releases_destination_down() {
+    let backend = |_request: LinkRequest| std::future::pending::<LinkResponse>();
+    let mut pair = Pair::new_with(
+        Arc::new(backend),
+        "127.0.0.1",
+        Some(Some(Duration::from_millis(300))),
+    )
+    .await;
+    pair.request().await.unwrap();
+    event(&mut pair.modem_events, |e| {
+        matches!(
+            e,
+            DaemonEvent::Destination {
+                event: DestinationEvent::LinkCharacteristicsRequested { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let result = pair.modem.drop_destination(destination(), S::SUCCESS).await;
+    let Err(DaemonError::CommandRejected(report)) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(report.rejected[0].1.reason, dlep_daemon::CommandError::Busy);
+
+    let (status, text, _) = pair.response().await;
+    assert_eq!(status, S::REQUEST_DENIED);
+    assert_eq!(text, "link-control backend timed out");
+    pair.modem
+        .drop_destination(destination(), S::SUCCESS)
+        .await
+        .unwrap();
+    event(&mut pair.router_events, |e| {
+        matches!(
+            e,
+            DaemonEvent::Destination {
+                event: DestinationEvent::Down { .. },
+                ..
+            }
+        )
+    })
+    .await;
     pair.shutdown().await;
 }
 

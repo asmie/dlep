@@ -38,6 +38,7 @@ pub struct PeerOffer {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum DestinationEvent {
     Up {
         id: DestinationId,
@@ -107,6 +108,7 @@ pub enum DestinationEvent {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MetricsEvent {
     pub session_wide: LinkMetrics,
 }
@@ -115,6 +117,7 @@ pub struct MetricsEvent {
 /// extension-emitted payloads so the event itself stays `Clone`, which the
 /// broadcast channel needs to fan out to multiple subscribers.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum DaemonEvent {
     CommandRejected {
         session_id: dlep_ext::SessionId,
@@ -162,6 +165,13 @@ pub enum DaemonEvent {
         addresses: DestinationAddrs,
     },
     Extension(Arc<dyn Any + Send + Sync>),
+    /// UDP discovery stopped unexpectedly (socket failure, a failed family in
+    /// a dual-stack group, or a task panic). Established sessions continue.
+    /// A router can call `start_discovery` again; a modem stops offering
+    /// until it is restarted.
+    DiscoveryStopped {
+        error: String,
+    },
 }
 
 impl fmt::Debug for DaemonEvent {
@@ -237,6 +247,10 @@ impl fmt::Debug for DaemonEvent {
                 .field("rejection", rejection)
                 .finish(),
             Self::Extension(_) => f.debug_tuple("Extension").field(&"<opaque>").finish(),
+            Self::DiscoveryStopped { error } => f
+                .debug_struct("DiscoveryStopped")
+                .field("error", error)
+                .finish(),
         }
     }
 }

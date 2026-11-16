@@ -3,7 +3,7 @@
 #![cfg(unix)]
 use std::{
     net::SocketAddr,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::Duration,
@@ -27,6 +27,8 @@ const BINARY: &str = env!("CARGO_BIN_EXE_dlep-modem");
 const ADAPTER: &str = r#"#!/usr/bin/env python3
 import json, os, sys
 mode, log = sys.argv[1], sys.argv[2]
+with open(log + ".pid", "w") as pid:
+    pid.write(f"{os.getpid()}\n")
 MAC = "02:00:00:00:00:01"
 if mode == "caps":
     def ambient(pid):
@@ -50,6 +52,23 @@ with open(log, "a") as out:
             send({"type": "session_metrics", "metrics": {"latency_us": 4000}})
             send({"type": "destination_update", "mac": MAC,
                   "metrics": {"current_data_rate_rx_bps": 42}})
+        if message["type"] == "session_up" and mode == "invalid":
+            # Each message has invalid values; none may stop the modem. The
+            # signed MAC once parsed as MAC and would have withdrawn it.
+            send({"type": "destination_update", "mac": MAC, "metrics": {"rlq_rx": 300}})
+            send({"type": "destination_up", "mac": "02:00:00:00:00:02",
+                  "addresses": {"ipv4": ["192.0.2.300"]}})
+            send({"type": "session_addresses", "add": {"ipv4_subnets": ["10.0.0.0/33"]}})
+            send({"type": "destination_down", "mac": "+2:+0:+0:+0:+0:+1"})
+            send({"type": "link_response", "request": "first", "status": "success"})
+            send({"type": "destination_update", "mac": MAC,
+                  "metrics": {"current_data_rate_rx_bps": 42}})
+        if message["type"] == "link_request_cancelled" and mode == "late":
+            # Answer too late, then prove the modem still processes reports.
+            send({"type": "link_response", "request": message["request"],
+                  "status": "success", "metrics": {"current_data_rate_tx_bps": 1}})
+            send({"type": "destination_update", "mac": MAC,
+                  "metrics": {"current_data_rate_rx_bps": 42}})
         if message["type"] != "link_request":
             continue
         request = message["request"]
@@ -66,6 +85,8 @@ with open(log, "a") as out:
         elif mode == "garbage":
             sys.stdout.write("not json\n")
             sys.stdout.flush()
+        elif mode == "unknown_field":
+            send({"type": "resync", "request": request})
 "#;
 
 fn destination() -> DestinationId {
@@ -86,6 +107,16 @@ impl Modem {
 
     /// `wrapper` runs the binary through another program, e.g. setpriv.
     fn start_with(mode: &str, wrapper: &[&str]) -> Self {
+        Self::spawn(mode, wrapper, false)
+    }
+
+    /// Start the modem as the leader of a new process group, which its
+    /// adapter joins, so a test can signal both like Ctrl-C does.
+    fn start_in_own_group(mode: &str) -> Self {
+        Self::spawn(mode, &[], true)
+    }
+
+    fn spawn(mode: &str, wrapper: &[&str], own_group: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("adapter.py");
         std::fs::write(&script, ADAPTER).unwrap();
@@ -110,6 +141,9 @@ impl Modem {
                 command
             }
         };
+        if own_group {
+            command.process_group(0);
+        }
         let child = command
             .arg("--config")
             .arg(&config)
@@ -416,8 +450,111 @@ async fn adapter_session_metrics_and_updates_reach_router() {
 }
 
 #[tokio::test]
+async fn adapter_values_are_ignored_without_stopping_the_modem() {
+    let modem = Modem::start("invalid");
+    let mut router = Router::connect(&modem).await;
+    router.up().await;
+    // The valid update sent after the invalid messages arrives; the signed MAC
+    // did not withdraw the destination first.
+    let update = router
+        .destination(|e| {
+            matches!(e, DestinationEvent::Down { .. })
+                || matches!(e, DestinationEvent::Update { metrics, .. } if metrics.current_data_rate_rx_bps == 42)
+        })
+        .await;
+    assert!(
+        matches!(update, DestinationEvent::Update { .. }),
+        "{update:?}"
+    );
+    let log = modem.log();
+    assert_eq!(
+        log.matches("ignoring radio adapter message").count(),
+        5,
+        "{log}"
+    );
+    assert!(log.contains("invalid MAC address"), "{log}");
+    router.daemon.shutdown().await.unwrap();
+    modem.stop().await;
+}
+
+#[tokio::test]
+async fn expired_link_request_is_cancelled_and_a_late_answer_is_ignored() {
+    let modem = Modem::start("late");
+    let mut router = Router::connect(&modem).await;
+    router.up().await;
+    let (status, text, metrics) = router.request().await;
+    assert_eq!(status, S::REQUEST_DENIED);
+    assert_eq!(text, "radio adapter timed out");
+    assert_eq!(metrics.current_data_rate_tx_bps, 70_000);
+    // The adapter reports newer metrics only after answering the cancelled
+    // request, so this update shows that the late answer was consumed.
+    let update = router
+        .destination(|e| matches!(e, DestinationEvent::Update { .. }))
+        .await;
+    assert!(matches!(
+        update,
+        DestinationEvent::Update { metrics, .. }
+            if metrics.current_data_rate_rx_bps == 42
+                && metrics.current_data_rate_tx_bps == 70_000
+    ));
+    let messages = modem.adapter_messages();
+    let request = messages
+        .iter()
+        .find(|m| m["type"] == "link_request")
+        .unwrap();
+    let cancelled: Vec<_> = messages
+        .iter()
+        .filter(|m| m["type"] == "link_request_cancelled")
+        .collect();
+    assert_eq!(
+        cancelled,
+        [&serde_json::json!({"type": "link_request_cancelled",
+            "request": request["request"], "reason": "timeout"})]
+    );
+    router.daemon.shutdown().await.unwrap();
+    modem.stop().await;
+}
+
+// Ctrl-C, or a service manager signalling the control group, stops the adapter
+// too. Its exit must not turn a requested shutdown into a failure, including
+// when the adapter's exit is observed shortly before the modem's own signal.
+#[tokio::test]
+async fn process_group_signal_is_a_clean_shutdown() {
+    for (signal, adapter_first) in [
+        (Signal::SIGTERM, false),
+        (Signal::SIGINT, false),
+        (Signal::SIGTERM, true),
+    ] {
+        let mut modem = Modem::start_in_own_group("silent");
+        modem.addr().await;
+        // The adapter logs the initial membership once it reads its input.
+        timeout(WAIT, async {
+            while modem.adapter_messages().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adapter started");
+        let group = Pid::from_raw(-(modem.child.id() as i32));
+        if adapter_first {
+            let pid = std::fs::read_to_string(modem.adapter_log.with_extension("log.pid")).unwrap();
+            kill(Pid::from_raw(pid.trim().parse().unwrap()), signal).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        kill(group, signal).unwrap();
+        let status = modem.exit().await;
+        assert!(status.success(), "{signal:?}: {status}: {}", modem.log());
+        assert!(
+            !modem.log().contains("radio adapter failed"),
+            "{}",
+            modem.log()
+        );
+    }
+}
+
+#[tokio::test]
 async fn adapter_failure_terminates_sessions_and_exits_with_error() {
-    for mode in ["exit", "garbage"] {
+    for mode in ["exit", "garbage", "unknown_field"] {
         let mut modem = Modem::start(mode);
         let mut router = Router::connect(&modem).await;
         router.up().await;

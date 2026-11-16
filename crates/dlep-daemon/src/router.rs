@@ -14,7 +14,7 @@ use crate::config::{NetworkConfig, RouterConfig, TimersConfig};
 use crate::connections::{ConnectionRegistry, HistoryReaper, PeerConnectionState};
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
 use crate::runtime::{
-    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
+    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionHandle,
     new_event_channel,
 };
 use crate::session::{
@@ -35,7 +35,7 @@ pub struct RouterDaemon {
     timers: TimersConfig,
     network: NetworkConfig,
     /// Per-active-session command channels, used to fan out shutdown.
-    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
+    session_cmds: Arc<Mutex<Vec<SessionHandle>>>,
     /// Background tasks: one per active session.
     tasks: Arc<Mutex<Vec<SessionTaskHandle>>>,
     /// Set by `start_discovery`; cleared by `shutdown`. Sends `()` to ask the
@@ -102,7 +102,15 @@ impl RouterDaemon {
 
         let mut slot = self.discovery_shutdown.lock().await;
         if slot.is_some() {
-            return Err(DaemonError::Config("discovery already running".into()));
+            // A stopped task (reported by `DiscoveryStopped`) may be restarted.
+            let mut task_slot = self.discovery_task.lock().await;
+            if !task_slot.as_ref().is_some_and(JoinHandle::is_finished) {
+                return Err(DaemonError::Config("discovery already running".into()));
+            }
+            slot.take();
+            if let Some(handle) = task_slot.take() {
+                let _ = handle.await;
+            }
         }
 
         let sockets = self.network.bind_discoveries(false)?;
@@ -123,7 +131,7 @@ impl RouterDaemon {
         let events_tx = self.events_tx.clone();
         let extensions = self.extensions.clone();
         let handle = tokio::spawn(async move {
-            crate::discovery::run_discovery_group(
+            crate::discovery::run_supervised_discovery_group(
                 members,
                 true,
                 shutdown_rx,
@@ -260,6 +268,7 @@ impl RouterDaemon {
         let fsm = RouterSessionFsm::with_config(session_cfg);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let session_id = crate::session::next_session_id(&self.session_id_counter);
         let events_tx = self.events_tx.clone();
         let mut commands = self.session_cmds.lock().await;
         let mut tasks = self.tasks.lock().await;
@@ -273,7 +282,7 @@ impl RouterDaemon {
             peer_info,
             self.extensions.clone(),
             Role::Router,
-            self.session_id_counter.clone(),
+            session_id,
             Some(tracker),
             None,
             Some(self.state.clone()),
@@ -284,7 +293,10 @@ impl RouterDaemon {
         });
 
         commands.retain(|tx| !tx.is_closed());
-        commands.push(cmd_tx);
+        commands.push(SessionHandle {
+            id: session_id,
+            tx: cmd_tx,
+        });
         tasks.retain(|task| !task.is_finished());
         tasks.push(handle);
         Ok(())
@@ -441,8 +453,9 @@ impl RouterDaemon {
             }
         }
         let cmds: Vec<_> = std::mem::take(&mut *self.session_cmds.lock().await);
-        for cmd_tx in cmds {
-            let _ = cmd_tx
+        for session in cmds {
+            let _ = session
+                .tx
                 .send(
                     SessionCommand::Shutdown {
                         reason: StatusCode::SHUTTING_DOWN,
@@ -845,6 +858,42 @@ mod cancellation_tests {
         drop(held);
         assert!(daemon.discovery_shutdown.lock().await.is_none());
         assert!(daemon.discovery_task.lock().await.is_none());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_discovery_can_be_restarted() {
+        let daemon = router().await;
+        daemon.start_discovery().await.unwrap();
+        assert!(matches!(
+            daemon.start_discovery().await,
+            Err(DaemonError::Config(message)) if message.contains("already running")
+        ));
+        // Simulate an unexpected stop of the running discovery task.
+        daemon.discovery_task.lock().await.as_ref().unwrap().abort();
+        timeout(Duration::from_secs(2), async {
+            while !daemon
+                .discovery_task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon.start_discovery().await.unwrap();
+        assert!(
+            !daemon
+                .discovery_task
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
         daemon.shutdown().await.unwrap();
     }
 }

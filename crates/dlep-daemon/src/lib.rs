@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+pub mod adapter_process;
 pub mod cli;
 pub mod config;
 mod connections;

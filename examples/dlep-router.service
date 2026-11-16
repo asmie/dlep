@@ -10,6 +10,9 @@ Restart=on-failure
 RestartSec=2
 # SIGTERM performs the DLEP Session Termination exchange before exit.
 KillSignal=SIGTERM
+# Signal only the daemon; it closes its adapter's input and waits up to two
+# seconds before killing it. Leftover processes get SIGKILL after it exits.
+KillMode=mixed
 # Default termination wait is 4 * 60s; allow transport writes and scheduling.
 # Increase this if heartbeat_interval_ms or termination_timeout_ms is increased.
 TimeoutStopSec=300s

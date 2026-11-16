@@ -32,11 +32,13 @@ a file. It does not run the adapter.
 - The adapter must exit when its standard input closes. On shutdown the modem
   terminates its DLEP sessions, closes the adapter's input, and kills the
   adapter if it is still running two seconds later.
-- If the adapter exits, closes its output, or writes a line that is not valid
-  JSON for a known message type, the modem terminates its sessions with
-  Shutting Down and exits with an error. Under the example systemd unit,
-  `Restart=on-failure` restarts both, and the restarted adapter reports the
-  current radio state again.
+- If the adapter exits, closes its output, or writes a line that shows it does
+  not speak this protocol (see [Errors](#errors)), the modem terminates its
+  sessions with Shutting Down and exits with an error. Under the example systemd
+  unit, `Restart=on-failure` restarts both, and the restarted adapter reports
+  the current radio state again. An adapter that exits because the same
+  shutdown signal reached it (Ctrl-C in a terminal, or a signal sent to the
+  whole process group) does not make a requested shutdown fail.
 - Failed writes to the adapter's input, or writes that cannot complete one
   record within five seconds, trigger the same failure shutdown. Input and
   output queues each hold at most 64 records. A full output queue pauses the
@@ -45,12 +47,37 @@ a file. It does not run the adapter.
   notices do not fill the pipe.
 - Unknown message types are ignored in both directions, so adapters must ignore
   types they do not recognize. Unknown fields in known messages sent by the
-  adapter are errors. Adapters should tolerate added fields in modem notices.
+  adapter are fatal errors. Adapters should tolerate added fields in modem
+  notices.
+
+### Errors
+
+Each adapter line is classified on its own:
+
+- **Fatal**, because the adapter does not speak this protocol: a line longer
+  than 64 KiB, output that is not UTF-8, closed output, invalid JSON, a value
+  that is not an object, a missing or non-string `type`, or an unknown field in
+  a known message type, including unknown names inside its `metrics`,
+  `addresses`, `add` or `remove` objects. The modem stops as described above.
+- **Ignored**: a known message whose fields fail typed deserialization or value
+  validation, such as a malformed IP address, subnet or MAC, an out-of-range
+  number (`"rlq_rx": 300`), a field of the wrong JSON type, or a missing
+  required field. The modem logs a warning with the first 256 bytes of the
+  line and ignores that message only; its state and the adapter's other
+  messages are unaffected. Values that parse but that a router could not
+  accept, such as `"rlq_rx": 101`, undeclared optional metrics or an oversized
+  address set, are likewise logged and ignored (see below).
+- Unknown message types are ignored silently, at debug level.
+
+An ignored `link_response` leaves its request pending until it is answered
+again or times out.
 
 ## Values
 
-- `mac`: colon-separated hexadecimal octets, six for EUI-48 or eight for EUI-64,
-  for example `"02:00:00:00:00:01"`. The format must match
+- `mac`: colon-separated octets of one or two hexadecimal digits each, six for
+  EUI-48 or eight for EUI-64, for example `"02:00:00:00:00:01"`. Signs, empty
+  octets and other separators are invalid. The modem writes two lowercase
+  digits per octet. The format must match
   `[network].mac_address_format`. An incompatible `destination_up` is logged
   and ignored before it enters the replay cache, even with no connected routers.
   The configured format remains fixed after all destinations are removed; it
@@ -199,6 +226,7 @@ arrived. New requests for the replacement can update its cached metrics normally
 | `destination_withdrawn` | `session`, `mac` | The router withdrew interest in this destination on this session. Physical destination knowledge remains cached. |
 | `destination_announced` | `session`, `mac`, `add`, `remove` | The router expressed interest in a destination (§12.13), optionally supplying IP address hints. The modem has already answered. |
 | `link_request` | `request`, `session`, `peer`, `mac`, `requested`, `current` | A router asks to change a destination's link. |
+| `link_request_cancelled` | `request`, `reason` | The modem no longer waits for the answer to this `link_request`. See [Cancelled requests](#cancelled-requests). |
 
 Each `session_sync` entry contains the numeric session ID, the peer's socket
 address, and the complete addresses advertised by that router. `addresses`
@@ -348,15 +376,35 @@ expires the modem replies Request Denied with the text
 `radio adapter timed out`, and a later answer is ignored without updating the
 table. A request is abandoned without an answer if its session ends.
 
+### Cancelled requests
+
+When the modem stops waiting for a forwarded request, it sends
+`{"type":"link_request_cancelled","request":7,"reason":"timeout"}` and forgets
+the request. `reason` is informational:
+
+- `timeout`: `link_request_timeout_ms` expired. The router was answered
+  Request Denied with `radio adapter timed out`.
+- `session_down`: the requesting session ended or is terminating; no answer
+  was sent.
+- `abandoned`: the modem stopped waiting for another reason; no answer was sent.
+
+Treat unknown reasons like `abandoned`. Stop working on the request if
+possible. An answer sent before or after the notice is ignored without error,
+and the notice can follow an answer the adapter has already written. If the
+adapter already applied a change for a cancelled request, the router was not
+told about it; report the resulting state with `destination_update` so the
+modem's table and the routers match the radio.
+
 The modem queues at most 64 link requests waiting for the bridge and tracks at
 most 64 requests awaiting adapter answers, across all sessions and destinations.
 Excess requests receive Request Denied with `radio adapter busy`; they are not
 forwarded or retried automatically. Completed, cancelled, and timed-out requests
 release capacity. The configured answer timeout includes time waiting in the
 bridge or output queue, separately from the five-second write deadline.
-Requests cancelled or expired before output can be queued are discarded.
-Already queued or delivered requests cannot be recalled; late answers remain
-ignored as described above.
+Requests cancelled or expired before output can be queued are discarded
+without a notice. Already queued or delivered requests cannot be recalled;
+they are followed by `link_request_cancelled`, and late answers remain ignored
+as described above.
 
 ## Example
 
@@ -405,3 +453,10 @@ ReadWritePaths=/var/lib/dlep-radio
 
 `RestrictAddressFamilies` also applies to the adapter. Extend it if the adapter
 talks to the radio over another socket family.
+
+The example unit sets `KillMode=mixed`: `systemctl stop` sends SIGTERM to the
+modem only. The modem terminates its sessions, closes the adapter's input, and
+kills the adapter if it has not exited two seconds later; systemd sends SIGKILL
+to anything left in the unit after the modem exits. Under systemd's default
+`KillMode=control-group`, the adapter would receive SIGTERM at the same time
+and could exit before the modem had finished its own shutdown.

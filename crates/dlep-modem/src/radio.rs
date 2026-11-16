@@ -5,18 +5,23 @@
 //!
 //! The adapter's destination table is kept here and replayed to every router
 //! session that comes up, so destinations reported before a router connects
-//! are not lost. Adapter exit, failed/stalled input, closed output, or malformed
-//! JSON is fatal: the modem terminates its sessions so a supervisor restarts both.
+//! are not lost. Adapter exit, failed/stalled input, closed output, or a line
+//! that does not match the protocol (see `parse_inbound`) is fatal: the modem
+//! terminates its sessions so a supervisor restarts both. A known message with
+//! invalid values is logged and ignored.
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dlep_core::{MacAddress, MacAddressFormat, StatusCode};
+use dlep_daemon::adapter_process::{
+    self, AdapterError, AdapterLines, AdapterProcess, QUEUE_SIZE, excerpt,
+};
 use dlep_daemon::link_control::{LinkControlFuture, LinkControlReplyFuture};
 use dlep_daemon::{
     AddressChanges, CommandError, DaemonError, DaemonEvent, DaemonSnapshot, DestinationAddrs,
@@ -26,22 +31,14 @@ use dlep_daemon::{
 use dlep_ext::SessionId;
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-/// Longest accepted adapter line, excluding the newline.
-const MAX_LINE: usize = 64 * 1024;
-const QUEUE_SIZE: usize = 64;
+const LABEL: &str = "radio adapter";
 const MAX_PENDING: usize = 64;
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay before re-sending a command a session rejected as Busy.
 const RETRY_DELAY: Duration = Duration::from_millis(250);
-/// Grace period for the adapter to exit after its input closes.
-const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Destination MAC as colon-separated hex octets (EUI-48 or EUI-64).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -52,19 +49,9 @@ impl TryFrom<String> for Mac {
     type Error = String;
 
     fn try_from(text: String) -> Result<Self, String> {
-        let octets = text
-            .split(':')
-            .map(|part| match part.len() {
-                1 | 2 => u8::from_str_radix(part, 16).ok(),
-                _ => None,
-            })
-            .collect::<Option<Vec<u8>>>()
-            .ok_or_else(|| format!("invalid MAC address {text:?}"))?;
-        match octets.len() {
-            6 => Ok(Self(MacAddress::new_eui48(octets.try_into().unwrap()))),
-            8 => Ok(Self(MacAddress::new_eui64(octets.try_into().unwrap()))),
-            _ => Err(format!("MAC address {text:?} must have 6 or 8 octets")),
-        }
+        text.parse()
+            .map(Self)
+            .map_err(|e| format!("invalid MAC address {:?}: {e}", excerpt(&text)))
     }
 }
 
@@ -215,7 +202,7 @@ enum Status {
 }
 
 /// Adapter → modem. Unknown message types are ignored for forward
-/// compatibility; unknown fields in known messages are errors.
+/// compatibility; unknown fields in known messages are fatal errors.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Inbound {
@@ -272,9 +259,70 @@ const INBOUND_FIELDS: &[(&str, &[&str])] = &[
     ("link_response", &["request", "status", "text", "metrics"]),
 ];
 
-/// Parse one adapter line. Serde cannot deny unknown fields on an internally
-/// tagged enum, so known message types check their field names here.
-fn parse_inbound(line: &str) -> Result<Inbound> {
+const METRIC_FIELDS: &[&str] = &[
+    "max_data_rate_rx_bps",
+    "max_data_rate_tx_bps",
+    "current_data_rate_rx_bps",
+    "current_data_rate_tx_bps",
+    "latency_us",
+    "resources",
+    "rlq_rx",
+    "rlq_tx",
+    "mtu",
+];
+const ADDRESS_FIELDS: &[&str] = &["ipv4", "ipv6", "ipv4_subnets", "ipv6_subnets"];
+
+/// Field names allowed in an object nested under `field` in a known message.
+fn nested_fields(field: &str) -> Option<&'static [&'static str]> {
+    match field {
+        "metrics" => Some(METRIC_FIELDS),
+        "addresses" | "add" | "remove" => Some(ADDRESS_FIELDS),
+        _ => None,
+    }
+}
+
+impl Inbound {
+    /// Check values that deserialize but that the modem cannot use.
+    fn validate(&self) -> Result<()> {
+        let addresses = match self {
+            Inbound::DestinationUp { addresses, .. } => vec![addresses],
+            Inbound::DestinationAddresses { add, remove, .. }
+            | Inbound::SessionAddresses { add, remove } => vec![add, remove],
+            _ => Vec::new(),
+        };
+        for addresses in addresses {
+            addresses.parse()?;
+        }
+        Ok(())
+    }
+}
+
+/// A known adapter message with invalid values. The bridge logs and ignores
+/// it; the adapter and its other messages are unaffected.
+#[derive(Debug)]
+struct InvalidMessage {
+    kind: String,
+    reason: String,
+}
+
+impl fmt::Display for InvalidMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid {} message: {}", self.kind, self.reason)
+    }
+}
+
+/// Parse one adapter line.
+///
+/// The outer error is fatal because the adapter does not speak this
+/// protocol: invalid JSON, a value that is not an object, a missing or
+/// non-string `type`, or an unknown field in a known message type, including
+/// its nested `metrics` and address objects. The inner error is a known
+/// message whose fields fail typed deserialization or value validation, such
+/// as a malformed address, subnet or MAC, an out-of-range number, a wrong
+/// field type, or a missing required field; only that message is ignored.
+/// Unknown message types parse as [`Inbound::Unknown`]. Serde cannot deny
+/// unknown fields on an internally tagged enum, so they are checked here.
+fn parse_inbound(line: &str) -> Result<Result<Inbound, InvalidMessage>> {
     let value: serde_json::Value = serde_json::from_str(line)?;
     let object = value
         .as_object()
@@ -283,15 +331,33 @@ fn parse_inbound(line: &str) -> Result<Inbound> {
         .get("type")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow!("message needs a string \"type\""))?;
-    if let Some((_, fields)) = INBOUND_FIELDS.iter().find(|(name, _)| *name == kind) {
-        if let Some(unknown) = object
-            .keys()
-            .find(|key| *key != "type" && !fields.contains(&key.as_str()))
-        {
-            bail!("unknown field {unknown:?} in {kind} message");
+    let Some((_, fields)) = INBOUND_FIELDS.iter().find(|(name, _)| *name == kind) else {
+        return Ok(Ok(Inbound::Unknown));
+    };
+    for (key, field) in object {
+        if key == "type" {
+            continue;
+        }
+        if !fields.contains(&key.as_str()) {
+            bail!("unknown field {:?} in {kind} message", excerpt(key));
+        }
+        if let (Some(nested), Some(allowed)) = (field.as_object(), nested_fields(key)) {
+            if let Some(unknown) = nested.keys().find(|k| !allowed.contains(&k.as_str())) {
+                bail!(
+                    "unknown field {:?} in {kind} message {key}",
+                    excerpt(unknown)
+                );
+            }
         }
     }
-    Ok(serde_json::from_value(value)?)
+    let kind = kind.to_owned();
+    let message = serde_json::from_value::<Inbound>(value)
+        .map_err(anyhow::Error::from)
+        .and_then(|message| message.validate().map(|()| message));
+    Ok(message.map_err(|e| InvalidMessage {
+        kind,
+        reason: excerpt(&format!("{e:#}")).to_owned(),
+    }))
 }
 
 /// Modem → adapter.
@@ -349,6 +415,24 @@ enum Outbound {
         requested: Requested,
         current: Metrics,
     },
+    /// The modem no longer waits for this `link_request`'s answer.
+    LinkRequestCancelled {
+        request: u64,
+        reason: CancelReason,
+    },
+}
+
+/// Why the modem stopped waiting for an adapter answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CancelReason {
+    /// `link_request_timeout_ms` expired; the router was answered Request
+    /// Denied with `radio adapter timed out`.
+    Timeout,
+    /// The requesting session ended or is terminating; no answer was sent.
+    SessionDown,
+    /// The daemon stopped waiting for another reason; no answer was sent.
+    Abandoned,
 }
 
 #[derive(Debug, Serialize)]
@@ -358,12 +442,36 @@ struct SessionPeer {
     addresses: Addresses,
 }
 
-type Ask = (LinkRequest, oneshot::Sender<LinkControlReply>);
+/// A link request on its way to the bridge. The backend stops waiting for
+/// the answer at `deadline`.
+struct Ask {
+    request: LinkRequest,
+    answer: oneshot::Sender<LinkControlReply>,
+    deadline: Instant,
+}
 
 /// Forwards link requests to the bridge task and bounds the adapter's answer.
 struct RadioLink {
     asks: mpsc::Sender<Ask>,
     timeout: Duration,
+    /// Wakes the bridge whenever a request future ends, so it can cancel a
+    /// request whose answer is no longer awaited at the adapter.
+    ended: Arc<Notify>,
+}
+
+/// The reply channel of a request future. Dropping it, when the future
+/// completes, times out or is cancelled, closes the channel and then wakes
+/// the bridge.
+struct Waiting {
+    response: Option<oneshot::Receiver<LinkControlReply>>,
+    ended: Arc<Notify>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.response.take();
+        self.ended.notify_one();
+    }
 }
 
 impl LinkControl for RadioLink {
@@ -374,8 +482,16 @@ impl LinkControl for RadioLink {
 
     fn request_with_receipt(&self, request: LinkRequest) -> LinkControlReplyFuture {
         let (answer, response) = oneshot::channel();
-        let sent = self.asks.try_send((request, answer));
-        let timeout = self.timeout;
+        let deadline = Instant::now() + self.timeout;
+        let sent = self.asks.try_send(Ask {
+            request,
+            answer,
+            deadline,
+        });
+        let mut waiting = Waiting {
+            response: Some(response),
+            ended: self.ended.clone(),
+        };
         Box::pin(async move {
             if let Err(error) = sent {
                 let text = match error {
@@ -384,7 +500,8 @@ impl LinkControl for RadioLink {
                 };
                 return LinkResponse::denied().with_text(text).into();
             }
-            match tokio::time::timeout(timeout, response).await {
+            let response = waiting.response.as_mut().expect("present until dropped");
+            match tokio::time::timeout_at(deadline, response).await {
                 Ok(Ok(response)) => response,
                 Ok(Err(_)) => LinkResponse::denied()
                     .with_text("radio adapter unavailable")
@@ -402,51 +519,48 @@ impl LinkControl for RadioLink {
 
 /// A running adapter process and its I/O tasks.
 pub(crate) struct Adapter {
-    child: Child,
-    lines: mpsc::Receiver<Result<String>>,
+    process: AdapterProcess,
+    lines: AdapterLines,
     out: Option<mpsc::Sender<String>>,
-    writer: Option<JoinHandle<Result<()>>>,
-    reader: JoinHandle<()>,
     asks: mpsc::Receiver<Ask>,
     link: Arc<RadioLink>,
 }
+
+/// The bridge's output queue closed, which happens only when the writer task
+/// ends. [`Adapter::run`] reports the writer's own error instead.
+#[derive(Debug)]
+struct WriterStopped;
+
+impl fmt::Display for WriterStopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("radio adapter writer stopped")
+    }
+}
+
+impl std::error::Error for WriterStopped {}
 
 impl Adapter {
     /// Start the adapter. Its standard error is inherited for logging.
     pub(crate) fn spawn(config: &RadioConfig) -> Result<Self> {
         config.validate().map_err(|e| anyhow!(e))?;
-        let mut command = Command::new(&config.command);
-        command
-            .args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        drop_ambient_capabilities(&mut command);
-        let mut child = command
-            .spawn()
+        let (mut process, lines) = AdapterProcess::spawn(LABEL, &config.command, &config.args)
             .with_context(|| format!("starting radio adapter {}", config.command.display()))?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
 
         // Brief pauses can drain without growing an unbounded output backlog.
         // A stalled record fails the writer and, in turn, the adapter bridge.
         let (out, queued) = mpsc::channel(QUEUE_SIZE);
-        let writer = tokio::spawn(write_output(stdin, queued));
-        let (lines_tx, lines) = mpsc::channel(QUEUE_SIZE);
-        let reader = tokio::spawn(read_lines(BufReader::new(stdout), lines_tx));
+        process.start_writer(|stdin| adapter_process::write_queued(stdin, LABEL, queued));
 
         let (asks_tx, asks) = mpsc::channel(QUEUE_SIZE);
         Ok(Self {
-            child,
+            process,
             lines,
             out: Some(out),
-            writer: Some(writer),
-            reader,
             asks,
             link: Arc::new(RadioLink {
                 asks: asks_tx,
                 timeout: Duration::from_millis(config.link_request_timeout_ms.into()),
+                ended: Arc::default(),
             }),
         })
     }
@@ -471,16 +585,21 @@ impl Adapter {
             session_metrics: initial,
             session_addresses: DestinationAddrs::default(),
             pending: HashMap::new(),
+            cancelled: Vec::new(),
             next_request: 1,
             retries: BTreeMap::new(),
             sessions: HashMap::new(),
             synced: false,
         };
+        let lines = &mut self.lines;
+        let asks = &mut self.asks;
+        let ended = self.link.ended.clone();
         // Supervise I/O outside the bridge loop so a writer failure or child
         // exit also interrupts replay and command acceptance waits.
         let work = async {
             let mut state = daemon.state();
             loop {
+                bridge.cancel_abandoned().await?;
                 if !bridge.synced || state.has_changed().unwrap_or(false) {
                     let snapshot = state.borrow_and_update().clone();
                     bridge.reconcile(&snapshot).await?;
@@ -493,153 +612,56 @@ impl Adapter {
                         let snapshot = state.borrow_and_update().clone();
                         bridge.reconcile(&snapshot).await?;
                     },
-                    line = self.lines.recv() => match line {
+                    line = lines.recv() => match line {
                         Some(Ok(line)) => {
-                            let message = parse_inbound(&line)
-                                .with_context(|| format!("invalid radio adapter message: {line}"))?;
-                            bridge.inbound(message).await;
+                            let parsed = parse_inbound(&line).with_context(|| {
+                                format!("invalid radio adapter message: {:?}", excerpt(&line))
+                            })?;
+                            match parsed {
+                                Ok(message) => bridge.inbound(message).await,
+                                Err(invalid) => warn!(
+                                    "ignoring radio adapter message {:?}: {invalid}",
+                                    excerpt(&line)
+                                ),
+                            }
                         }
-                        Some(Err(e)) => return Err(e),
-                        None => bail!("radio adapter closed its output"),
+                        Some(Err(e)) => return Err(e.into()),
+                        None => return Err(AdapterError::OutputClosed { label: LABEL }.into()),
                     },
-                    Some(ask) = self.asks.recv() => bridge.ask(ask).await?,
+                    Some(ask) = asks.recv() => bridge.ask(ask).await?,
                     event = events.recv() => match event {
                         Ok(event) => bridge.event(event).await?,
                         Err(broadcast::error::RecvError::Lagged(skipped)) => bridge.event_gap(skipped).await?,
                         Err(broadcast::error::RecvError::Closed) => bail!("modem daemon stopped"),
                     },
                     () = sleep_until(next_retry), if next_retry.is_some() => bridge.retry().await,
+                    // A link request future ended; the loop reports abandoned requests.
+                    () = ended.notified() => {}
                 }
             }
         };
-        tokio::select! {
+        let result: Result<Infallible> = tokio::select! {
             result = work => result,
-            status = self.child.wait() => {
-                bail!("radio adapter exited with {}", status.context("waiting for radio adapter")?);
+            error = self.process.failed() => Err(error.into()),
+        };
+        match result {
+            Ok(never) => match never {},
+            Err(error) if error.is::<WriterStopped>() => {
+                Err(self.process.writer_error().await.into())
             }
-            result = self.writer.as_mut().expect("writer active") => {
-                self.writer.take();
-                result.context("radio adapter writer task failed")??;
-                bail!("radio adapter input closed");
-            }
+            Err(error) => Err(error),
         }
     }
 
     /// Close the adapter's input, then kill it if it does not exit promptly.
     pub(crate) async fn stop(mut self) {
-        let deadline = Instant::now() + STOP_GRACE;
         self.out.take();
-        if let Some(mut writer) = self.writer.take() {
-            if tokio::time::timeout_at(deadline, &mut writer)
-                .await
-                .is_err()
-            {
-                writer.abort();
-                let _ = writer.await;
-            }
-        }
-        if tokio::time::timeout_at(deadline, self.child.wait())
-            .await
-            .is_err()
-        {
-            warn!("radio adapter did not exit after its input closed; killing it");
-            let _ = self.child.kill().await;
-        }
-        self.reader.abort();
-        let _ = (&mut self.reader).await;
+        self.process.stop().await;
     }
 }
-
-impl Drop for Adapter {
-    fn drop(&mut self) {
-        self.reader.abort();
-        if let Some(writer) = &self.writer {
-            writer.abort();
-        }
-        // kill_on_drop also covers failures before the daemon starts.
-    }
-}
-
-async fn write_output(
-    mut stdin: impl AsyncWrite + Unpin,
-    mut queued: mpsc::Receiver<String>,
-) -> Result<()> {
-    while let Some(mut line) = queued.recv().await {
-        line.push('\n');
-        tokio::time::timeout(IO_TIMEOUT, stdin.write_all(line.as_bytes()))
-            .await
-            .context("radio adapter input stalled")?
-            .context("writing to radio adapter")?;
-    }
-    Ok(())
-}
-
-/// The modem's ambient capabilities (CAP_NET_RAW and CAP_NET_BIND_SERVICE in
-/// the example unit) would otherwise survive exec into the adapter.
-#[cfg(target_os = "linux")]
-fn drop_ambient_capabilities(command: &mut Command) {
-    use nix::libc;
-    // SAFETY: the closure runs in the forked child before exec and makes only
-    // an async-signal-safe prctl system call, reading errno on failure.
-    unsafe {
-        command.pre_exec(|| {
-            let cleared = libc::prctl(
-                libc::PR_CAP_AMBIENT,
-                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-            );
-            let error = std::io::Error::last_os_error();
-            // Kernels before 4.3 have no ambient set, so nothing is inherited.
-            if cleared == -1 && error.raw_os_error() != Some(libc::EINVAL) {
-                return Err(error);
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn drop_ambient_capabilities(_command: &mut Command) {}
 
 async fn sleep_until(deadline: Option<Instant>) {
     tokio::time::sleep_until(deadline.expect("guarded by is_some")).await;
-}
-
-async fn read_lines(
-    mut stdout: BufReader<tokio::process::ChildStdout>,
-    lines: mpsc::Sender<Result<String>>,
-) {
-    loop {
-        let mut line = Vec::new();
-        let read = (&mut stdout)
-            .take(MAX_LINE as u64 + 1)
-            .read_until(b'\n', &mut line)
-            .await;
-        let result = match read {
-            Ok(0) => return,
-            Ok(_) if line.last() != Some(&b'\n') && line.len() > MAX_LINE => {
-                Err(anyhow!("radio adapter line exceeds {MAX_LINE} bytes"))
-            }
-            Ok(_) => {
-                if line.last() == Some(&b'\n') {
-                    line.pop();
-                }
-                String::from_utf8(line).context("radio adapter output is not UTF-8")
-            }
-            Err(e) => Err(anyhow!(e).context("reading radio adapter output")),
-        };
-        if let Ok(text) = &result {
-            if text.trim().is_empty() {
-                continue;
-            }
-        }
-        let failed = result.is_err();
-        if lines.send(result).await.is_err() || failed {
-            return;
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -661,6 +683,23 @@ struct Pending {
     current: LinkMetrics,
     /// False once this request's physical destination has been withdrawn.
     update_cache: bool,
+    /// When the backend stops waiting for the answer.
+    deadline: Instant,
+}
+
+/// Why the modem stopped waiting for `pending`, judged at `now`.
+fn cancel_reason(pending: &Pending, snapshot: &DaemonSnapshot, now: Instant) -> CancelReason {
+    if now >= pending.deadline {
+        CancelReason::Timeout
+    } else if snapshot
+        .sessions
+        .get(&pending.session_id)
+        .is_none_or(|session| session.phase != SessionPhase::Established)
+    {
+        CancelReason::SessionDown
+    } else {
+        CancelReason::Abandoned
+    }
 }
 
 struct Bridge<'a> {
@@ -671,6 +710,8 @@ struct Bridge<'a> {
     session_metrics: LinkMetrics,
     session_addresses: DestinationAddrs,
     pending: HashMap<u64, Pending>,
+    /// Requests the modem stopped waiting for, not yet reported to the adapter.
+    cancelled: Vec<(u64, CancelReason)>,
     next_request: u64,
     /// One deadline per operation and session; reports share the latest cache.
     retries: BTreeMap<(SessionId, Retry), Instant>,
@@ -681,10 +722,43 @@ struct Bridge<'a> {
 impl Bridge<'_> {
     async fn send(&self, message: &Outbound) -> Result<()> {
         let line = serde_json::to_string(message).expect("serializable message");
-        self.out
-            .send(line)
-            .await
-            .context("radio adapter writer stopped")
+        self.out.send(line).await.map_err(|_| WriterStopped.into())
+    }
+
+    /// Move requests matching `abandoned` from `pending` to `cancelled`.
+    fn abandon_where(&mut self, snapshot: &DaemonSnapshot, abandoned: impl Fn(&Pending) -> bool) {
+        let now = Instant::now();
+        let mut requests: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| abandoned(pending))
+            .map(|(&request, _)| request)
+            .collect();
+        requests.sort_unstable();
+        for request in requests {
+            let pending = self.pending.remove(&request).expect("listed request");
+            self.cancelled
+                .push((request, cancel_reason(&pending, snapshot, now)));
+        }
+    }
+
+    /// Tell the adapter about requests whose answer is no longer awaited:
+    /// timed out, or abandoned when their session ended. This releases their
+    /// capacity, and a late answer then finds no pending request.
+    async fn cancel_abandoned(&mut self) -> Result<()> {
+        if self
+            .pending
+            .values()
+            .any(|pending| pending.answer.is_closed())
+        {
+            let snapshot = self.daemon.state().borrow().clone();
+            self.abandon_where(&snapshot, |pending| pending.answer.is_closed());
+        }
+        for (request, reason) in std::mem::take(&mut self.cancelled) {
+            self.send(&Outbound::LinkRequestCancelled { request, reason })
+                .await?;
+        }
+        Ok(())
     }
 
     async fn inbound(&mut self, message: Inbound) {
@@ -852,12 +926,16 @@ impl Bridge<'_> {
                 let Some(pending) = self.pending.remove(&request) else {
                     debug!(
                         request,
-                        "radio adapter answered an unknown or expired link request"
+                        "radio adapter answered an unknown or cancelled link request"
                     );
                     return;
                 };
                 if pending.answer.is_closed() {
+                    // The cancellation notice follows; the answer is unused.
                     debug!(request, "radio adapter answered an expired link request");
+                    let snapshot = self.daemon.state().borrow().clone();
+                    let reason = cancel_reason(&pending, &snapshot, Instant::now());
+                    self.cancelled.push((request, reason));
                     return;
                 }
                 // `current` in the request is only a snapshot. Reports can
@@ -940,9 +1018,14 @@ impl Bridge<'_> {
         }
     }
 
-    async fn ask(&mut self, (request, mut answer): Ask) -> Result<()> {
+    async fn ask(&mut self, ask: Ask) -> Result<()> {
+        let Ask {
+            request,
+            mut answer,
+            deadline,
+        } = ask;
         // Answers that timed out leave closed senders behind.
-        self.pending.retain(|_, p| !p.answer.is_closed());
+        self.cancel_abandoned().await?;
         if answer.is_closed() {
             return Ok(());
         }
@@ -996,6 +1079,7 @@ impl Bridge<'_> {
                         .sessions
                         .get(&request.session_id)
                         .is_some_and(|session| session.phase == SessionPhase::Established),
+                deadline,
             },
         );
         Ok(())
@@ -1017,9 +1101,10 @@ impl Bridge<'_> {
                 .get(id)
                 .is_some_and(|session| session.phase == SessionPhase::Established)
         });
-        self.pending.retain(|_, pending| {
-            snapshot.sessions.contains_key(&pending.session_id) && !pending.answer.is_closed()
+        self.abandon_where(snapshot, |pending| {
+            !snapshot.sessions.contains_key(&pending.session_id) || pending.answer.is_closed()
         });
+        self.cancel_abandoned().await?;
         if self.synced && self.sessions == sessions {
             return Ok(());
         }
@@ -1360,10 +1445,12 @@ mod tests {
     use super::*;
     use dlep_core::{Message, MessageType};
     use dlep_daemon::ModemConfig;
+    use dlep_daemon::adapter_process::{MAX_LINE, STOP_GRACE};
     use dlep_fsm::session_common::{
         build_destination_down_response, build_destination_up_response,
         build_link_characteristics_request, build_session_update_response, extract_link_metrics,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -1455,6 +1542,7 @@ mod tests {
             session_metrics: ModemConfig::default().metrics.link_metrics(),
             session_addresses: DestinationAddrs::default(),
             pending: HashMap::new(),
+            cancelled: Vec::new(),
             next_request: 1,
             retries: BTreeMap::new(),
             sessions: HashMap::new(),
@@ -1464,6 +1552,22 @@ mod tests {
 
     fn mac() -> MacAddress {
         MacAddress::new_eui48([2, 0, 0, 0, 0, 1])
+    }
+
+    fn ask(answer: oneshot::Sender<LinkControlReply>) -> Ask {
+        Ask {
+            request: link_request(),
+            answer,
+            deadline: Instant::now() + WAIT,
+        }
+    }
+
+    fn parsed(line: &str) -> Inbound {
+        parse_inbound(line).unwrap().unwrap()
+    }
+
+    fn notice_json(line: Option<String>) -> serde_json::Value {
+        serde_json::from_str(&line.expect("notice")).unwrap()
     }
 
     fn link_request() -> LinkRequest {
@@ -1485,49 +1589,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stalled_radio_writer_has_a_deadline_and_closes_the_queue() {
-        let (input, _peer) = tokio::io::duplex(8);
-        let (out, queued) = mpsc::channel(QUEUE_SIZE);
-        out.send("x".repeat(32)).await.unwrap();
-        let start = Instant::now();
-        let error = write_output(input, queued).await.unwrap_err();
-        assert!(error.to_string().contains("radio adapter input stalled"));
-        assert_eq!(Instant::now() - start, IO_TIMEOUT);
-        assert!(out.is_closed());
-    }
-
-    #[tokio::test]
-    async fn radio_writer_preserves_records_across_partial_writes_and_reports_broken_input() {
-        let (input, mut peer) = tokio::io::duplex(4);
-        let (out, queued) = mpsc::channel(QUEUE_SIZE);
-        for line in [r#"{"type":"first"}"#, r#"{"type":"second"}"#] {
-            out.send(line.into()).await.unwrap();
-        }
-        drop(out);
-        let mut received = String::new();
-        let (result, read) = tokio::join!(
-            write_output(input, queued),
-            peer.read_to_string(&mut received)
-        );
-        result.unwrap();
-        read.unwrap();
-        assert_eq!(received, "{\"type\":\"first\"}\n{\"type\":\"second\"}\n");
-
-        let (input, peer) = tokio::io::duplex(4);
-        drop(peer);
-        let (out, queued) = mpsc::channel(QUEUE_SIZE);
-        out.send("record".into()).await.unwrap();
-        let error = write_output(input, queued).await.unwrap_err();
-        assert!(error.to_string().contains("writing to radio adapter"));
-        assert!(out.is_closed());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn radio_link_rejects_queue_overflow_and_times_out_queued_requests() {
         let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
         let link = RadioLink {
             asks,
             timeout: Duration::from_millis(100),
+            ended: Arc::default(),
         };
         let requests: Vec<_> = (0..QUEUE_SIZE)
             .map(|_| link.request(link_request()))
@@ -1536,15 +1603,15 @@ mod tests {
         assert_eq!(full, LinkResponse::denied().with_text("radio adapter busy"));
         assert_eq!(queued.len(), QUEUE_SIZE);
         drop(requests);
-        while let Ok((_, answer)) = queued.try_recv() {
-            assert!(answer.is_closed());
+        while let Ok(ask) = queued.try_recv() {
+            assert!(ask.answer.is_closed());
         }
         let expired = link.request(link_request()).await;
         assert_eq!(
             expired,
             LinkResponse::denied().with_text("radio adapter timed out")
         );
-        assert!(queued.recv().await.unwrap().1.is_closed());
+        assert!(queued.recv().await.unwrap().answer.is_closed());
         drop(queued);
         assert_eq!(
             link.request(link_request()).await,
@@ -1561,14 +1628,14 @@ mod tests {
         let mut replies = Vec::new();
         for _ in 0..MAX_PENDING {
             let (answer, response) = oneshot::channel();
-            bridge.ask((link_request(), answer)).await.unwrap();
+            bridge.ask(ask(answer)).await.unwrap();
             replies.push(response);
             let message: serde_json::Value =
                 serde_json::from_str(&notices.recv().await.unwrap()).unwrap();
             assert_eq!(message["type"], "link_request");
         }
         let (answer, response) = oneshot::channel();
-        bridge.ask((link_request(), answer)).await.unwrap();
+        bridge.ask(ask(answer)).await.unwrap();
         assert_eq!(
             response.await.unwrap().response,
             LinkResponse::denied().with_text("radio adapter busy")
@@ -1577,10 +1644,15 @@ mod tests {
         assert!(notices.try_recv().is_err());
         drop(replies.pop());
         let (answer, mut response) = oneshot::channel();
-        bridge.ask((link_request(), answer)).await.unwrap();
+        bridge.ask(ask(answer)).await.unwrap();
         assert!(response.try_recv().is_err());
         assert_eq!(bridge.pending.len(), MAX_PENDING);
-        assert!(notices.try_recv().is_ok());
+        // The abandoned request is cancelled at the adapter before the next one.
+        assert_eq!(
+            notice_json(notices.try_recv().ok()),
+            serde_json::json!({"type":"link_request_cancelled", "request":MAX_PENDING, "reason":"session_down"})
+        );
+        assert_eq!(notice_json(notices.try_recv().ok())["type"], "link_request");
         daemon.shutdown().await.unwrap();
     }
 
@@ -1593,7 +1665,7 @@ mod tests {
         bridge.out = out;
         {
             let (answer, response) = oneshot::channel();
-            let request = bridge.ask((link_request(), answer));
+            let request = bridge.ask(ask(answer));
             tokio::pin!(request);
             tokio::select! {
                 biased;
@@ -1606,9 +1678,59 @@ mod tests {
         assert_eq!(notices.recv().await.unwrap(), "occupied");
         let (answer, response) = oneshot::channel();
         drop(response);
-        bridge.ask((link_request(), answer)).await.unwrap();
+        bridge.ask(ask(answer)).await.unwrap();
         assert!(bridge.pending.is_empty());
         assert!(notices.try_recv().is_err());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_link_requests_are_cancelled_at_the_adapter_and_late_answers_ignored() {
+        let daemon = modem().await;
+        let mut bridge = bridge(&daemon);
+        let (out, mut notices) = mpsc::channel(QUEUE_SIZE);
+        bridge.out = out;
+        let (asks, mut queued) = mpsc::channel(QUEUE_SIZE);
+        let link = RadioLink {
+            asks,
+            timeout: Duration::from_millis(50),
+            ended: Arc::default(),
+        };
+        let late_answer = |request: &serde_json::Value| {
+            parsed(&format!(
+                r#"{{"type":"link_response","request":{request},"status":"success","metrics":{{"latency_us":1}}}}"#
+            ))
+        };
+        // The answer arrives after the bridge reported the cancellation, or
+        // between the timeout and the bridge noticing it.
+        for answer_before_sweep in [false, true] {
+            let reply = link.request(link_request());
+            bridge.ask(queued.recv().await.unwrap()).await.unwrap();
+            let request = notice_json(notices.try_recv().ok());
+            assert_eq!(request["type"], "link_request");
+            assert_eq!(
+                reply.await,
+                LinkResponse::denied().with_text("radio adapter timed out")
+            );
+            // The ended request future wakes the bridge loop.
+            tokio::time::timeout(WAIT, link.ended.notified())
+                .await
+                .unwrap();
+            if answer_before_sweep {
+                bridge.inbound(late_answer(&request["request"])).await;
+                assert!(notices.try_recv().is_err());
+            }
+            bridge.cancel_abandoned().await.unwrap();
+            assert_eq!(
+                notice_json(notices.try_recv().ok()),
+                serde_json::json!({"type":"link_request_cancelled",
+                    "request":request["request"], "reason":"timeout"})
+            );
+            assert!(bridge.pending.is_empty());
+            bridge.inbound(late_answer(&request["request"])).await;
+            bridge.cancel_abandoned().await.unwrap();
+            assert!(notices.try_recv().is_err());
+        }
         daemon.shutdown().await.unwrap();
     }
 
@@ -1958,9 +2080,7 @@ mod tests {
         // Any replay sent to the withdrawn destination would precede this ACK.
         flush_peer(&mut peer).await;
         // Explicit refresh uses the same reconciliation without reporting loss.
-        bridge
-            .inbound(parse_inbound(r#"{"type":"resync"}"#).unwrap())
-            .await;
+        bridge.inbound(parsed(r#"{"type":"resync"}"#)).await;
         assert!(!bridge.synced);
         let snapshot = daemon.state().borrow().clone();
         bridge.reconcile(&snapshot).await.unwrap();
@@ -1997,6 +2117,7 @@ mod tests {
                 mac: mac(),
                 current: LinkMetrics::default(),
                 update_cache: true,
+                deadline: Instant::now() + WAIT,
             },
         );
         let mut state = daemon.state();
@@ -2013,6 +2134,10 @@ mod tests {
         assert!(bridge.retries.is_empty());
         assert!(bridge.pending.is_empty());
         assert!(abandoned.await.is_err());
+        assert_eq!(
+            notice_json(notices.try_recv().ok()),
+            serde_json::json!({"type":"link_request_cancelled", "request":999, "reason":"session_down"})
+        );
         let sync: serde_json::Value = serde_json::from_str(&notices.try_recv().unwrap()).unwrap();
         assert_eq!(sync["sessions"], serde_json::json!([]));
 
@@ -2242,6 +2367,7 @@ mod tests {
         let daemon = modem_with(Some(Arc::new(RadioLink {
             asks,
             timeout: Duration::from_secs(30),
+            ended: Arc::default(),
         })))
         .await;
         let mut events = daemon.subscribe();
@@ -3290,6 +3416,7 @@ mod tests {
         let daemon = modem_with(Some(Arc::new(RadioLink {
             asks,
             timeout: Duration::from_secs(30),
+            ended: Arc::default(),
         })))
         .await;
         let mut events = daemon.subscribe();
@@ -3421,7 +3548,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(ask.0.current.latency, Duration::from_micros(900));
+        assert_eq!(ask.request.current.latency, Duration::from_micros(900));
         bridge.ask(ask).await.unwrap();
         bridge
             .inbound(Inbound::LinkResponse {
@@ -3699,7 +3826,10 @@ mod tests {
                 r#"{"type":"session_addresses","add":{"ipv6_subnets":["2001:db8:1::1/64"]},"remove":{"ipv6_subnets":["2001:db8:1::2/64"]}}"#,
                 r#"{"type":"session_addresses","add":{"ipv4":["192.0.2.2"],"ipv6_subnets":["bad"]},"remove":{"ipv4":["192.0.2.1"]}}"#,
             ] {
-                bridge.inbound(parse_inbound(line).unwrap()).await;
+                // Malformed values are ignored before they reach the bridge.
+                if let Ok(message) = parse_inbound(line).unwrap() {
+                    bridge.inbound(message).await;
+                }
                 assert_eq!(bridge.session_addresses, expected, "{line}");
                 if let Some(peer) = &mut peer {
                     flush_peer(peer).await;
@@ -3804,7 +3934,7 @@ mod tests {
         })
         .to_string();
         assert!(line.len() <= MAX_LINE);
-        bridge.inbound(parse_inbound(&line).unwrap()).await;
+        bridge.inbound(parsed(&line)).await;
         let expected = replacement.parse().unwrap();
         assert_eq!(bridge.session_addresses, expected);
         let removal = read(&mut peer).await;
@@ -3964,6 +4094,7 @@ mod tests {
             let daemon = modem_with(Some(Arc::new(RadioLink {
                 asks,
                 timeout: Duration::from_secs(30),
+                ended: Arc::default(),
             })))
             .await;
             let mut events = daemon.subscribe();
@@ -4131,6 +4262,7 @@ mod tests {
                 .link_control(Arc::new(RadioLink {
                     asks,
                     timeout: Duration::from_secs(30),
+                    ended: Arc::default(),
                 }))
                 .spawn()
                 .await
@@ -4204,7 +4336,7 @@ mod tests {
                         line.len() <= MAX_LINE,
                         "valid adapter framing must reach response validation"
                     );
-                    bridge.inbound(parse_inbound(&line).unwrap()).await;
+                    bridge.inbound(parsed(&line)).await;
                     let response = read(&mut peer).await;
                     assert_eq!(
                         response.message_type,
@@ -4259,6 +4391,7 @@ mod tests {
         let daemon = modem_with(Some(Arc::new(RadioLink {
             asks,
             timeout: Duration::from_secs(30),
+            ended: Arc::default(),
         })))
         .await;
         let mut events = daemon.subscribe();
@@ -4295,7 +4428,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let sid = ask.0.session_id;
+        let sid = ask.request.session_id;
         bridge.ask(ask).await.unwrap();
         daemon
             .send_command_to(
@@ -4397,6 +4530,7 @@ mod tests {
                     mac: mac(),
                     current: original,
                     update_cache: true,
+                    deadline: Instant::now() + WAIT,
                 },
             );
             bridge
@@ -4435,6 +4569,7 @@ mod tests {
                     mac: mac(),
                     current: original,
                     update_cache: true,
+                    deadline: Instant::now() + WAIT,
                 },
             );
             let mut inbound = Box::pin(bridge.inbound(Inbound::LinkResponse {
@@ -4522,6 +4657,7 @@ mod tests {
             "02-00-00-00-00-01",
             "002:00:00:00:00:01",
             "zz:00:00:00:00:01",
+            "+2:+0:+0:+0:+0:+1",
         ] {
             assert!(Mac::try_from(bad.to_string()).is_err(), "{bad}");
         }
@@ -4558,21 +4694,16 @@ mod tests {
 
     #[test]
     fn inbound_messages_parse_strictly_but_ignore_unknown_types() {
-        assert!(matches!(
-            parse_inbound(r#"{"type":"resync"}"#).unwrap(),
-            Inbound::Resync
-        ));
-        let Inbound::SessionAddresses { add, remove } =
-            parse_inbound(r#"{"type":"session_addresses"}"#).unwrap()
+        assert!(matches!(parsed(r#"{"type":"resync"}"#), Inbound::Resync));
+        let Inbound::SessionAddresses { add, remove } = parsed(r#"{"type":"session_addresses"}"#)
         else {
             panic!("expected session addresses")
         };
         assert!(add.parse().unwrap().is_empty());
         assert!(remove.parse().unwrap().is_empty());
-        let up = parse_inbound(
+        let up = parsed(
             r#"{"type":"destination_up","mac":"02:00:00:00:00:01","metrics":{"latency_us":5},"addresses":{"ipv4":["192.0.2.1"],"ipv6_subnets":["2001:db8::/32"]}}"#,
-        )
-        .unwrap();
+        );
         let Inbound::DestinationUp {
             addresses, metrics, ..
         } = up
@@ -4584,8 +4715,7 @@ mod tests {
         assert_eq!(addresses.v4, ["192.0.2.1".parse::<Ipv4Addr>().unwrap()]);
         assert_eq!(addresses.v6_subnets.len(), 1);
 
-        let response =
-            parse_inbound(r#"{"type":"link_response","request":3,"status":"denied"}"#).unwrap();
+        let response = parsed(r#"{"type":"link_response","request":3,"status":"denied"}"#);
         assert!(matches!(
             response,
             Inbound::LinkResponse {
@@ -4596,39 +4726,96 @@ mod tests {
             }
         ));
         assert!(matches!(
-            parse_inbound(r#"{"type":"future_message","anything":[1,2]}"#).unwrap(),
+            parsed(r#"{"type":"future_message","anything":[1,2]}"#),
             Inbound::Unknown
         ));
+    }
 
+    /// Lines that show the adapter does not speak this protocol stop the modem.
+    #[test]
+    fn framing_json_and_unknown_fields_are_fatal() {
         for bad in [
             "not json",
+            r#"{"type":"resync""#,
             "[1]",
+            r#""resync""#,
+            r#"{"mac":"02:00:00:00:00:01"}"#,
+            r#"{"type":3}"#,
             r#"{"type":"resync","request":1}"#,
             r#"{"type":"resync","sessions":[]}"#,
             r#"{"type":"session_addresses","session":1}"#,
             r#"{"type":"session_addresses","request":1}"#,
             r#"{"type":"session_addresses","mac":"02:00:00:00:00:01"}"#,
             r#"{"type":"session_addresses","add":{"v4":[]}}"#,
-            r#"{"type":"session_addresses","remove":{"ipv4":["bad"]}}"#,
-            r#"{"type":"session_addresses","add":null}"#,
-            r#"{"mac":"02:00:00:00:00:01"}"#,
             r#"{"type":"destination_down","mac":"02:00:00:00:00:01","reason":1}"#,
             r#"{"type":"destination_update","mac":"02:00:00:00:00:01","metrics":{"latency":5}}"#,
             r#"{"type":"destination_up","mac":"02:00:00:00:00:01","addresses":{"v4":[]}}"#,
-            r#"{"type":"destination_down","mac":"bogus"}"#,
-            r#"{"type":"link_response","request":1,"status":"maybe"}"#,
-            r#"{"type":"destination_update","mac":"02:00:00:00:00:01","metrics":{"rlq_rx":300}}"#,
+            r#"{"type":"link_response","request":1,"status":"success","metrics":{"rate":1}}"#,
         ] {
             assert!(parse_inbound(bad).is_err(), "{bad}");
         }
-        assert!(
-            Addresses {
-                ipv4_subnets: vec!["10.0.0.0/33".into()],
-                ..Default::default()
-            }
-            .parse()
-            .is_err()
+        let error = parse_inbound(
+            r#"{"type":"destination_update","mac":"02:00:00:00:00:01","metrics":{"latency":5}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            r#"unknown field "latency" in destination_update message metrics"#
         );
+    }
+
+    /// Known messages with values the modem cannot use are ignored one by one.
+    #[test]
+    fn invalid_values_in_known_messages_are_not_fatal() {
+        for (bad, reason) in [
+            (
+                r#"{"type":"destination_update","mac":"02:00:00:00:00:01","metrics":{"rlq_rx":300}}"#,
+                "300",
+            ),
+            (
+                r#"{"type":"destination_up","mac":"02:00:00:00:00:02","addresses":{"ipv4":["192.0.2.300"]}}"#,
+                "invalid IPv4 address",
+            ),
+            (
+                r#"{"type":"session_addresses","remove":{"ipv4":["bad"]}}"#,
+                "invalid IPv4 address",
+            ),
+            (
+                r#"{"type":"session_addresses","add":{"ipv4_subnets":["10.0.0.0/33"]}}"#,
+                "10.0.0.0/33",
+            ),
+            (
+                r#"{"type":"destination_addresses","mac":"02:00:00:00:00:01","remove":{"ipv6_subnets":["2001:db8::/129"]}}"#,
+                "2001:db8::/129",
+            ),
+            (
+                r#"{"type":"destination_down","mac":"+2:+0:+0:+0:+0:+1"}"#,
+                "invalid MAC address",
+            ),
+            (r#"{"type":"destination_down","mac":"bogus"}"#, "bogus"),
+            (r#"{"type":"destination_down","mac":5}"#, "invalid type"),
+            (r#"{"type":"destination_down"}"#, "missing field `mac`"),
+            (r#"{"type":"session_addresses","add":null}"#, "invalid type"),
+            (
+                r#"{"type":"session_metrics","metrics":[]}"#,
+                "struct Metrics",
+            ),
+            (
+                r#"{"type":"link_response","request":1,"status":"maybe"}"#,
+                "maybe",
+            ),
+            (
+                r#"{"type":"link_response","request":-1,"status":"denied"}"#,
+                "-1",
+            ),
+        ] {
+            let invalid = parse_inbound(bad)
+                .unwrap_or_else(|e| panic!("{bad}: fatal {e:#}"))
+                .expect_err(bad);
+            let text = invalid.to_string();
+            assert!(text.starts_with("invalid "), "{bad}: {text}");
+            assert!(text.contains(reason), "{bad}: {text}");
+        }
     }
 
     #[test]

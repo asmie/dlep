@@ -1,7 +1,9 @@
 use super::*;
-use dlep_daemon::{DestinationSnapshot, PeerInfo, SessionSnapshot};
+use dlep_daemon::adapter_process::MAX_LINE;
+use dlep_daemon::{DestinationPhase, DestinationSnapshot, PeerInfo, SessionPhase, SessionSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 fn fixture(generation: u64) -> DaemonSnapshot {
     let session = SessionSnapshot {
@@ -24,8 +26,8 @@ fn fixture(generation: u64) -> DaemonSnapshot {
         },
         local_addresses: DestinationAddrs::default(),
         destinations: HashMap::from([(
-            mac("02:00:00:00:00:01").unwrap().into(),
-            DestinationSnapshot {
+            "02:00:00:00:00:01".parse::<MacAddress>().unwrap().into(),
+            Arc::new(DestinationSnapshot {
                 phase: DestinationPhase::PendingDown,
                 metrics: LinkMetrics {
                     current_data_rate_tx_bps: generation,
@@ -37,7 +39,7 @@ fn fixture(generation: u64) -> DaemonSnapshot {
                     v4_subnets: vec!["198.51.100.0/24".parse().unwrap()],
                     v6_subnets: vec!["2001:db8:1::/64".parse().unwrap()],
                 },
-            },
+            }),
         )]),
     };
     DaemonSnapshot {
@@ -85,27 +87,15 @@ fn parses_commands_strictly_and_leaves_unknown_messages_forward_compatible() {
     };
     assert!(add.parse().unwrap().is_empty() && remove.parse().unwrap().is_empty());
     assert_eq!(
-        mac("02:00:00:00:00:01").unwrap().to_string(),
+        "02:00:00:00:00:01"
+            .parse::<MacAddress>()
+            .unwrap()
+            .to_string(),
         "02:00:00:00:00:01"
     );
-    assert!(mac("02:00:00:00:00:00:00:01").is_ok());
-    assert!(mac("002:00:00:00:00:01").is_err());
-    assert!(mac("02:00:00:00:00").is_err());
-}
-
-#[tokio::test]
-async fn line_reader_bounds_allocations_and_rejects_invalid_utf8() {
-    for (bytes, valid) in [
-        ([vec![b'x'; MAX_LINE], vec![b'\n']].concat(), true),
-        (vec![b'x'; MAX_LINE + 1], false),
-        (vec![0xff, b'\n'], false),
-        (b"last line without newline".to_vec(), true),
-    ] {
-        let (tx, mut rx) = mpsc::channel(2);
-        read_lines(BufReader::new(bytes.as_slice()), tx).await;
-        assert_eq!(rx.recv().await.unwrap().is_ok(), valid);
-        assert!(rx.recv().await.is_none());
-    }
+    assert!("02:00:00:00:00:00:00:01".parse::<MacAddress>().is_ok());
+    assert!("002:00:00:00:00:01".parse::<MacAddress>().is_err());
+    assert!("02:00:00:00:00".parse::<MacAddress>().is_err());
 }
 
 #[tokio::test]
@@ -182,7 +172,7 @@ async fn completion_notices_preserve_status_text_between_complete_snapshots() {
             session_id: SessionId(1),
             peer: fixture(1).sessions[&SessionId(1)].peer.clone(),
             event: DestinationEvent::DownResponse {
-                id: mac("02:00:00:00:00:01").unwrap().into(),
+                id: "02:00:00:00:00:01".parse::<MacAddress>().unwrap().into(),
                 status,
                 text: text.into(),
             },
@@ -341,7 +331,7 @@ async fn commands_target_one_session_and_distinguish_acceptance_busy_and_stale_i
         .unwrap()
         .0;
     let address = "02:00:00:00:00:01";
-    let id = mac(address).unwrap().into();
+    let id = address.parse::<MacAddress>().unwrap().into();
     for modem in [&a, &b] {
         modem
             .add_destination(

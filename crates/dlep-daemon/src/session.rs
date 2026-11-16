@@ -28,13 +28,11 @@ use tracing::debug;
 use crate::config::TimersConfig;
 use crate::connections::ConnectionTracker;
 use crate::events::{DaemonEvent, PeerInfo};
-use crate::link_control::{LinkControl, LinkJobs, LinkRequest};
+use crate::link_control::{LinkJobs, LinkRequest};
 use crate::runtime::{
     COMMAND_CHANNEL_CAPACITY, DaemonError, EventTx, SessionCommand, SessionRequest,
 };
-use crate::state::{
-    DestinationPhase, DestinationSnapshot, SessionPhase, SessionSnapshot, StateRegistry,
-};
+use crate::state::{DestinationPhase, SessionPhase, SessionSnapshot, StateRegistry};
 
 /// Per-daemon monotonic counter for `SessionId`. Each daemon constructs
 /// its own `Arc<AtomicU64>` and passes it into every `run_session` call;
@@ -47,7 +45,7 @@ pub fn new_session_id_counter() -> SessionIdCounter {
     Arc::new(AtomicU64::new(1))
 }
 
-fn next_session_id(counter: &SessionIdCounter) -> SessionId {
+pub(crate) fn next_session_id(counter: &SessionIdCounter) -> SessionId {
     SessionId(counter.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -122,6 +120,9 @@ struct SessionLifecycle {
     connection: Option<ConnectionTracker>,
     session_id: SessionId,
     peer: PeerInfo,
+    /// Peer Type metadata from a received Session Initialization (Response),
+    /// applied to `peer` only once the FSM accepts it and emits SessionUp.
+    pending_peer_type: Option<PeerTypeMetadata>,
     events_tx: EventTx,
     is_router: bool,
     active_exts: Vec<Arc<dyn DlepExtension>>,
@@ -129,6 +130,30 @@ struct SessionLifecycle {
     mac_address_format: dlep_core::MacAddressFormat,
     /// Backend calls answering deferred Link Characteristics Requests.
     link_jobs: LinkJobs,
+}
+
+/// Peer Type fields reported by the peer during session initialization.
+struct PeerTypeMetadata {
+    description: Option<String>,
+    secured_medium: Option<bool>,
+}
+
+impl PeerTypeMetadata {
+    fn from_message(msg: &Message, is_router_side: bool) -> Self {
+        let peer_type = msg.data_items.iter().find_map(|item| match item {
+            DataItem::PeerType { description, flags } => Some((description, flags)),
+            _ => None,
+        });
+        Self {
+            description: peer_type.map(|(description, _)| description.clone()),
+            // Only a modem's Peer Type carries Secured Medium semantics.
+            secured_medium: if is_router_side {
+                peer_type.map(|(_, flags)| flags.smi)
+            } else {
+                None
+            },
+        }
+    }
 }
 
 impl Drop for SessionLifecycle {
@@ -161,9 +186,12 @@ impl SessionLifecycle {
         if self.down_emitted {
             state.remove(self.session_id);
         } else if self.established {
-            if let Some(snapshot) =
-                fsm.state_snapshot(self.peer.clone(), self.negotiated_extensions.clone())
-            {
+            let previous = state.session(self.session_id);
+            if let Some(snapshot) = fsm.state_snapshot(
+                self.peer.clone(),
+                self.negotiated_extensions.clone(),
+                previous.as_deref(),
+            ) {
                 state.update(self.session_id, snapshot);
             }
         }
@@ -212,12 +240,15 @@ pub trait SessionFsm {
     fn mac_address_format(&self) -> dlep_core::MacAddressFormat;
     fn step(&mut self, event: FsmEvent) -> Vec<FsmAction>;
     fn in_session(&self) -> bool;
-    /// Local post-transition state for daemon snapshots. Custom FSMs used with
-    /// `run_session` need not implement this; that API does not retain state.
+    /// Local post-transition state for daemon snapshots. `previous` is the
+    /// retained snapshot of this session; unchanged destinations should reuse
+    /// its entries. Custom FSMs used with `run_session` need not implement
+    /// this; that API does not retain state.
     fn state_snapshot(
         &self,
         _peer: PeerInfo,
         _negotiated_extensions: Vec<dlep_core::ExtensionId>,
+        _previous: Option<&SessionSnapshot>,
     ) -> Option<SessionSnapshot> {
         None
     }
@@ -228,6 +259,7 @@ impl SessionFsm for dlep_fsm::session_router::RouterSessionFsm {
         &self,
         peer: PeerInfo,
         negotiated_extensions: Vec<dlep_core::ExtensionId>,
+        previous: Option<&SessionSnapshot>,
     ) -> Option<SessionSnapshot> {
         use dlep_fsm::session_router::RouterSessionState;
         use dlep_fsm::transaction::RequestKind;
@@ -257,14 +289,15 @@ impl SessionFsm for dlep_fsm::session_router::RouterSessionFsm {
                     } else {
                         DestinationPhase::Up
                     };
-                    (
-                        (*mac).into(),
-                        DestinationSnapshot {
-                            phase,
-                            metrics: dest.metrics,
-                            addresses: dest.addrs.clone(),
-                        },
-                    )
+                    let id = (*mac).into();
+                    let snapshot = SessionSnapshot::destination(
+                        previous,
+                        id,
+                        phase,
+                        dest.metrics,
+                        &dest.addrs,
+                    );
+                    (id, snapshot)
                 })
                 .collect(),
         })
@@ -285,6 +318,7 @@ impl SessionFsm for dlep_fsm::session_modem::ModemSessionFsm {
         &self,
         peer: PeerInfo,
         negotiated_extensions: Vec<dlep_core::ExtensionId>,
+        previous: Option<&SessionSnapshot>,
     ) -> Option<SessionSnapshot> {
         use dlep_fsm::session_modem::ModemSessionState;
         use dlep_fsm::transaction::RequestKind;
@@ -310,14 +344,15 @@ impl SessionFsm for dlep_fsm::session_modem::ModemSessionFsm {
                         _ if dest.announced => DestinationPhase::Up,
                         _ => DestinationPhase::Withdrawn,
                     };
-                    (
-                        (*mac).into(),
-                        DestinationSnapshot {
-                            phase,
-                            metrics: dest.metrics,
-                            addresses: dest.addrs.clone(),
-                        },
-                    )
+                    let id = (*mac).into();
+                    let snapshot = SessionSnapshot::destination(
+                        previous,
+                        id,
+                        phase,
+                        dest.metrics,
+                        &dest.addrs,
+                    );
+                    (id, snapshot)
                 })
                 .collect(),
         })
@@ -467,7 +502,7 @@ pub async fn run_session<F: SessionFsm>(
         peer,
         extensions,
         role,
-        session_id_counter,
+        next_session_id(&session_id_counter),
         None,
         None,
         None,
@@ -482,19 +517,18 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
     initial_event: FsmEvent,
     mut commands: mpsc::Receiver<SessionRequest>,
     events_tx: EventTx,
-    mut peer: PeerInfo,
+    peer: PeerInfo,
     extensions: ExtensionRegistry,
     role: Role,
-    session_id_counter: SessionIdCounter,
+    session_id: SessionId,
     connection: Option<ConnectionTracker>,
-    link_control: Option<Arc<dyn LinkControl>>,
+    link_control: Option<crate::link_control::LinkBackend>,
     state: Option<Arc<StateRegistry>>,
 ) -> Result<(), DaemonError> {
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut read_buf = BytesMut::with_capacity(4096);
     let mut codec = MessageCodec;
 
-    let session_id = next_session_id(&session_id_counter);
     let is_router_side = role.is_router();
     let mut lifecycle = SessionLifecycle {
         state,
@@ -502,7 +536,8 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
         negotiated_extensions: Vec::new(),
         connection,
         session_id,
-        peer: peer.clone(),
+        peer,
+        pending_peer_type: None,
         events_tx: events_tx.clone(),
         is_router: is_router_side,
         active_exts: Vec::new(),
@@ -525,7 +560,6 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
         &mut timers,
         &timer_expiry_tx,
         &events_tx,
-        &peer,
         &extensions,
         session_id,
         is_router_side,
@@ -553,7 +587,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                     Err(DaemonError::Codec(_)) => {
                         let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
                         if process_actions(&mut fsm, actions, &mut writer, &mut timers, &timer_expiry_tx,
-                            &events_tx, &peer, &extensions, session_id, is_router_side,
+                            &events_tx, &extensions, session_id, is_router_side,
                             &mut lifecycle, &mut extension_output).await? { break; }
                         continue;
                     }
@@ -561,16 +595,11 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                 };
                 match frame {
                     FrameRead::Message(mut msg) => {
-                        if matches!(msg.message_type, MessageType::SESSION_INITIALIZATION | MessageType::SESSION_INITIALIZATION_RESPONSE) {
-                            peer.peer_description = msg.data_items.iter().find_map(|i| match i {
-                                DataItem::PeerType { description, .. } => Some(description.clone()), _ => None
-                            });
-                            peer.secured_medium = if is_router_side {
-                                msg.data_items.iter().find_map(|item| match item {
-                                    DataItem::PeerType { flags, .. } => Some(flags.smi), _ => None,
-                                })
-                            } else { None };
-                            lifecycle.peer = peer.clone();
+                        // Peer metadata is published only if the FSM accepts this
+                        // initialization; a stray one mid-session changes nothing.
+                        if !lifecycle.established && matches!(msg.message_type,
+                            MessageType::SESSION_INITIALIZATION | MessageType::SESSION_INITIALIZATION_RESPONSE) {
+                            lifecycle.pending_peer_type = Some(PeerTypeMetadata::from_message(&msg, is_router_side));
                         }
                         // Extensions cannot consume a core MAC that violates the
                         // link format, even inside a negotiated private message.
@@ -578,7 +607,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                             &msg, lifecycle.mac_address_format).is_err() {
                             let actions = fsm.step(FsmEvent::ProtocolError(StatusCode::INVALID_DATA));
                             if process_actions(&mut fsm, actions, &mut writer, &mut timers, &timer_expiry_tx,
-                                &events_tx, &peer, &extensions, session_id, is_router_side,
+                                &events_tx, &extensions, session_id, is_router_side,
                                 &mut lifecycle, &mut extension_output).await? { break; }
                             continue;
                         }
@@ -594,7 +623,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                         let event = if handled { FsmEvent::RecvExtensionMessage } else { FsmEvent::RecvMessage(msg) };
                         let actions = fsm.step(event);
                         let close = process_actions(&mut fsm, actions, &mut writer, &mut timers,
-                            &timer_expiry_tx, &events_tx, &peer, &extensions, session_id, is_router_side,
+                            &timer_expiry_tx, &events_tx, &extensions, session_id, is_router_side,
                             &mut lifecycle, &mut extension_output).await?;
                         if close { break; }
                         flush_extension_messages(&mut extension_output, &mut writer, lifecycle.mac_address_format).await?;
@@ -603,8 +632,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                         let actions = fsm.step(FsmEvent::TcpClosed);
                         let _ = process_actions(&mut fsm,
                             actions, &mut writer, &mut timers,
-                            &timer_expiry_tx, &events_tx, &peer,
-                            &extensions, session_id, is_router_side,
+                            &timer_expiry_tx, &events_tx, &extensions, session_id, is_router_side,
                             &mut lifecycle, &mut extension_output,
                         ).await?;
                         break;
@@ -682,8 +710,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                 }).map_or(Ok(()), Err);
                 let closed = process_actions(&mut fsm,
                     actions, &mut writer, &mut timers,
-                    &timer_expiry_tx, &events_tx, &peer,
-                    &extensions, session_id, is_router_side,
+                    &timer_expiry_tx, &events_tx, &extensions, session_id, is_router_side,
                     &mut lifecycle, &mut extension_output,
                 ).await?;
                 if let Some(receipt) = receipt { let _ = receipt.send(Some((session_id, outcome))); }
@@ -706,8 +733,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                 }
                 let closed = process_actions(&mut fsm,
                     actions, &mut writer, &mut timers,
-                    &timer_expiry_tx, &events_tx, &peer,
-                    &extensions, session_id, is_router_side,
+                    &timer_expiry_tx, &events_tx, &extensions, session_id, is_router_side,
                     &mut lifecycle, &mut extension_output,
                 ).await?;
                 if let Some(receipt) = receipt { let _ = receipt.send(outcome); }
@@ -732,8 +758,7 @@ pub(crate) async fn run_session_tracked<F: SessionFsm>(
                 let actions = fsm.step(FsmEvent::TimerExpired(id, kind));
                 if process_actions(&mut fsm,
                     actions, &mut writer, &mut timers,
-                    &timer_expiry_tx, &events_tx, &peer,
-                    &extensions, session_id, is_router_side,
+                    &timer_expiry_tx, &events_tx, &extensions, session_id, is_router_side,
                     &mut lifecycle, &mut extension_output,
                 ).await? {
                     break;
@@ -778,7 +803,6 @@ async fn process_actions(
     timers: &mut TimerSet,
     timer_expiry_tx: &mpsc::Sender<(TimerId, TimerKind, u64)>,
     events_tx: &EventTx,
-    peer: &PeerInfo,
     extensions: &ExtensionRegistry,
     session_id: SessionId,
     is_router_side: bool,
@@ -877,6 +901,10 @@ async fn process_actions(
                 //    that actually accepted negotiation (not just the wire
                 //    intersection).
                 if let EmittedEvent::SessionUp { peer_extensions } = &emitted {
+                    if let Some(peer_type) = lifecycle.pending_peer_type.take() {
+                        lifecycle.peer.peer_description = peer_type.description;
+                        lifecycle.peer.secured_medium = peer_type.secured_medium;
+                    }
                     lifecycle.active_exts = extensions.negotiate(peer_extensions);
                     lifecycle.established = true;
                     lifecycle.negotiated_extensions =
@@ -899,7 +927,7 @@ async fn process_actions(
                 //    in response, and so `SessionDown` is always delivered
                 //    even if a subsequent flush errors on a closed socket.
                 if let Some(daemon_event) =
-                    translate_emitted(&emitted, peer, session_id, active_exts)
+                    translate_emitted(&emitted, &lifecycle.peer, session_id, active_exts)
                 {
                     let _ = events_tx.send(daemon_event);
                 }
@@ -954,7 +982,7 @@ async fn process_actions(
                     } => {
                         lifecycle.link_jobs.start(LinkRequest {
                             session_id,
-                            peer: peer.clone(),
+                            peer: lifecycle.peer.clone(),
                             id: (*mac).into(),
                             requested: *requested,
                             current: *metrics,
@@ -980,6 +1008,9 @@ async fn process_actions(
                 flush_extension_messages(extension_output, writer, lifecycle.mac_address_format)
                     .await?;
             }
+            // Discovery actions and action kinds added later do not apply to
+            // a TCP session.
+            _ => debug!("session task received a non-session action; ignoring"),
         }
     }
     if !published {
@@ -1156,6 +1187,8 @@ fn translate_emitted(
                 session_wide: *metrics,
             },
         }),
+        // Event kinds added later have no public session form yet.
+        _ => None,
     }
 }
 

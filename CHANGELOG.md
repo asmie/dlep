@@ -35,11 +35,20 @@
   `SessionSnapshot.local_addresses`, and the `secured_medium` field on
   `PeerInfo` / `PeerOffer` also require updates in exhaustive
   initializers. Review the detailed changes below for affected types.
-- Update exhaustive matches on daemon/FSM events, commands, configuration-check
-  errors, and `PeerEndpoint` variants. New completion events expose peer replies
-  separately from local command acceptance; an accepted command does not imply
-  that the peer applied it. Deferred link-control implementations must eventually
-  answer each pending request or let session cleanup cancel it.
+- Event, command, error, and phase enums are now `#[non_exhaustive]` so later
+  releases can add variants without breaking callers: `DaemonEvent`,
+  `DestinationEvent`, `SessionCommand`, `DaemonError`, `ConfigCheckError`,
+  `ConfigLoadError`, `ExtensionSetupError`, `TlsSetupError`, `SessionPhase`,
+  `DestinationPhase`, `FsmEvent`, `FsmAction`, `EmittedEvent`, `CommandError`,
+  `CommandKind`, `CodecError`, `DiscoveryDirection`, `DiscoveryItemError`, and
+  `TerminationRequestError`. Matches on them need a wildcard arm. The output
+  structs `CommandReport` and `MetricsEvent` are also non-exhaustive; match
+  them with `..`. `PeerEndpoint` stays exhaustive because every peer kind needs
+  explicit handling. Update exhaustive matches on `PeerEndpoint`. New completion
+  events expose peer replies separately from local command acceptance; an
+  accepted command does not imply that the peer applied it. A deferred
+  link-control request is denied after its deadline (30 seconds by default)
+  if the backend has not answered, or cancelled by session cleanup.
 - TOML keeps numeric, DNS, and named-zone peers in one `static_peers` list.
   Rust configuration stores them in separate numeric, named, and scoped vectors.
   New optional settings have defaults; unknown sections/keys remain errors.
@@ -72,6 +81,39 @@
 
 ### Detailed changes
 
+- Session-targeted commands (session addresses, per-session Destination Down,
+  Link Characteristics Requests, and adapter commands that name a session) are
+  delivered only to the selected session. A stalled or busy unrelated session
+  no longer delays them until the acceptance timeout.
+- The router binary now runs all static peers (numeric, DNS, and named-zone)
+  through one driver that shares the discovery loop's backoff policy.
+  Previously, adding one DNS or zone entry moved numeric peers to a different
+  reconnect driver. An alias whose endpoint is already active under another
+  configured identity now waits for that session to end instead of retrying
+  and warning on every backoff.
+- A radio adapter message with invalid values (malformed address, subnet or
+  MAC, out-of-range number, wrong field type, missing field) is now logged and
+  ignored instead of stopping the modem. Invalid JSON, framing errors, a
+  missing `type`, and unknown fields in known messages, including nested
+  `metrics` and address objects, remain fatal. Logged adapter lines are
+  truncated to 256 bytes and escaped.
+- The modem sends the radio adapter
+  `{"type":"link_request_cancelled","request":N,"reason":...}` when it stops
+  waiting for a forwarded link request (`timeout`, `session_down`, or
+  `abandoned`). An adapter that already applied the change should report the
+  resulting state with `destination_update`; a late answer is still ignored.
+- Adapter MAC strings no longer accept signed octets such as `+2:+0:+0:+0:+0:+1`.
+  `MacAddress` implements `FromStr` (error type `MacParseError`), accepting one
+  or two hexadecimal digits per octet and six or eight octets.
+- The example systemd units set `KillMode=mixed`, so `systemctl stop` signals
+  only the daemon, which closes its adapter's input before the adapter is
+  killed. The modem also treats an adapter exit that coincides with a
+  SIGINT/SIGTERM (for example Ctrl-C to the process group) as a clean shutdown
+  rather than a failure.
+- The router and modem adapters share process handling in
+  `dlep_daemon::adapter_process`. A failed adapter input writer is reported
+  with its own error (stalled or failed write) instead of a generic stopped
+  writer. Both adapters skip whitespace-only output lines.
 - Fixed macOS IPv4 multicast group membership to use the resolved interface
   address. XNU ignores the trailing interface index in an `ip_mreqn` membership
   request, which could join another interface and leave selected-interface
@@ -128,11 +170,17 @@
   usable address for the single TCP listener, including across discovery
   families. Single-family discovery remains the default. Full Rust
   `NetworkConfig` initializers need the new field or a default.
+- If discovery stops unexpectedly (a socket failure, a failed family in a
+  dual-stack group, or a task panic), both daemons log an error and publish the
+  new `DaemonEvent::DiscoveryStopped`; sessions continue and a router can call
+  `start_discovery` again. Previously the failure surfaced only at shutdown.
 - Extensions can opt in to pre-session discovery hooks on both daemon roles.
-  Plugins can append bounded TLVs to Peer Discovery/Peer Offer signals and
-  inspect validated incoming items/signals with datagram metadata. Core fields,
+  Plugins can append bounded TLVs to Peer Discovery/Peer Offer signals (32
+  items and 1024 bytes in total, with the whole signal capped at 1452 bytes so
+  a peer's 1500-byte receive buffer can read it) and inspect validated incoming items/signals with datagram metadata. Core fields,
   GTSM/interface filtering, connected-router suppression, and TCP negotiation
-  remain intact. Unclaimed unknown items discard the datagram. Existing plugins
+  remain intact. Unclaimed unknown items discard the datagram. A panicking
+  discovery hook is disabled instead of stopping discovery. Existing plugins
   and the original low-level discovery runner retain their default behavior.
 - Embedders can register configured extension factories on both daemon builders,
   or supply an ordered `ExtensionCatalog`. Factories consume `[extensions.NAME]`
@@ -171,6 +219,9 @@
   received flag in discovery/session metadata, snapshots, and adapter `session`
   records, independently of TLS. `PeerInfo` and `PeerOffer` gain an optional
   `secured_medium` field; manual Rust struct initializers must supply it.
+  Peer Type metadata (description and Secured Medium) is taken only from an
+  initialization the session accepts; a rejected or stray mid-session
+  initialization no longer changes the reported peer.
 - Routers support a startup `[destinations]` admission policy with default
   acceptance and MAC allow/deny lists. Declined Destination Up announcements
   receive Not Interested and do not enter router state. Explicit Announce
@@ -385,7 +436,9 @@
 
 - Both daemon handles expose retained `state()` snapshots with a generation,
   session/peer identity, negotiated extensions, effective metrics, addresses,
-  and destination phases. Late or lagged consumers can reconcile current state
+  and destination phases. Destinations are `Arc<DestinationSnapshot>`, and
+  unchanged ones are shared across generations, so an update does not copy the
+  session's other destinations. Late or lagged consumers can reconcile current state
   without relying on public broadcast delivery. Session cleanup removes retained
   entries on termination, I/O failure, and cancellation.
 - Radio bridge replay now follows retained session state, including after a lost
@@ -405,8 +458,10 @@
   `radio: Option<RadioConfig>`, which breaks exhaustive struct literals.
 - Modem link-control backend: `ModemBuilder::link_control` registers a
   `LinkControl` implementation (or closure) that answers router Link
-  Characteristics Requests, taking as long as the radio needs. Invalid answers
-  and backend panics fall back to Request Denied. Without a backend, requests
+  Characteristics Requests. A pending request blocks Destination Down for its
+  destination, so an answer missing after 30 seconds is cancelled and denied;
+  `ModemBuilder::link_control_timeout` changes or disables the deadline.
+  Invalid answers and backend panics fall back to Request Denied. Without a backend, requests
   are still denied immediately; the `dlep-modem` binary uses its radio adapter
   when one is configured.
 - The modem application receives `DestinationEvent::LinkCharacteristicsRequested`

@@ -8,6 +8,7 @@ use crate::config::{DiscoveryMode, ModemConfig, RouterConfig};
 use crate::tls::{TlsSetupError, client_config, server_config};
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigLoadError {
     #[error("failed to read config file {path}: {source}")]
     Read {
@@ -45,6 +46,7 @@ where
 
 /// Errors surfaced by `--check-config` style validation.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigCheckError {
     #[error(transparent)]
     Extension(#[from] crate::ExtensionSetupError),

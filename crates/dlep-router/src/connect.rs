@@ -42,7 +42,9 @@ impl<'a> ConnectAttempts<'a> {
         self.reserved.iter()
     }
 
-    pub fn start_static(&mut self, daemon: &'a RouterDaemon, peer: SocketAddr) -> bool {
+    /// Re-dial a discovered endpoint with retry history. Configured static
+    /// peers use the static driver instead.
+    pub fn start_retry(&mut self, daemon: &'a RouterDaemon, peer: SocketAddr) -> bool {
         self.insert(
             vec![peer],
             Some(peer),
@@ -128,7 +130,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     #[test]
-    fn evicted_retries_are_cancelled_but_static_and_new_offers_survive() {
+    fn evicted_retries_are_cancelled_but_retained_retries_and_new_offers_survive() {
         let a = "127.0.0.1:1".parse().unwrap();
         let b = "127.0.0.1:2".parse().unwrap();
         let c = "127.0.0.1:3".parse().unwrap();

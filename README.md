@@ -231,7 +231,10 @@ only reports offers; the application chooses when to connect. The router binary
 adds concurrent scheduling and reconnection using the retained connection-state
 feed described below. Library applications must supply their own policy and
 handle `broadcast::error::RecvError::Lagged` if they need to continue after event
-loss.
+loss. If discovery stops unexpectedly (for example, a socket failure or a
+failed family in dual-stack mode), both daemons log an error and publish
+`DaemonEvent::DiscoveryStopped`; sessions continue, and a router can call
+`start_discovery` again.
 
 Negotiated extensions can request termination of their current session through
 `ExtensionCtx::terminate_session(reason)`. The runtime uses the existing FSM
@@ -471,10 +474,13 @@ On the modem, `ModemBuilder::link_control(backend)` registers a
 `dlep_daemon::LinkControl` backend that decides each request. It receives a
 `LinkRequest` (session, peer, destination, requested values, and current
 metrics) and returns a `LinkResponse`: `granted(metrics)` for an applied change
-or `denied()` when it cannot be met, optionally `with_text(..)`. The future may
-run as long as the radio needs; the request holds that destination's transaction
-slot, so the router's further requests and the modem's `drop_destination` for it
-return Busy until the answer. Destination updates remain available. Granted
+or `denied()` when it cannot be met, optionally `with_text(..)`. The request
+holds that destination's transaction slot, so the router's further requests and
+the modem's `drop_destination` for it return Busy until the answer. The runtime
+therefore drops a backend future that has not answered within 30 seconds and
+replies Request Denied ("link-control backend timed out");
+`ModemBuilder::link_control_timeout(Some(duration))` changes the deadline and
+`None` waits indefinitely. Destination updates remain available. Granted
 metrics merge into the destination like `update_destination` and are reported
 only on the requesting session. Undeclared metrics, session-terminating
 statuses, oversized responses, and backend panics produce `Request Denied` with

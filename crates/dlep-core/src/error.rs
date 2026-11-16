@@ -42,6 +42,7 @@ impl fmt::Display for ExpectedLen {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CodecError {
     #[error("buffer too short: need at least {needed} bytes, have {have}")]
     Truncated { needed: usize, have: usize },

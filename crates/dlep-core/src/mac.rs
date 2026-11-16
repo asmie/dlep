@@ -1,4 +1,7 @@
 use std::fmt;
+use std::str::FromStr;
+
+use thiserror::Error;
 
 /// Destination address format of the modem's router-facing link (§13.7).
 /// This is a local session policy, not a negotiated wire parameter.
@@ -93,6 +96,49 @@ impl fmt::Display for MacAddress {
     }
 }
 
+/// Error from parsing a [`MacAddress`] from text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum MacParseError {
+    /// A part between colons is empty, longer than two characters, or not
+    /// made of ASCII hexadecimal digits (signs and other separators included).
+    #[error("MAC address octets must be one or two hexadecimal digits separated by colons")]
+    InvalidOctet,
+    /// The text has a number of octets other than six (EUI-48) or eight (EUI-64).
+    #[error("MAC address needs six or eight octets, found {0}")]
+    OctetCount(usize),
+}
+
+/// Parses colon-separated octets of one or two ASCII hexadecimal digits
+/// (either case), six for EUI-48 or eight for EUI-64, such as
+/// `02:00:00:0a:0b:1`. The [`Display`](fmt::Display) form always parses back.
+impl FromStr for MacAddress {
+    type Err = MacParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut octets = [0u8; 8];
+        let mut count = 0usize;
+        for part in text.split(':') {
+            // `u8::from_str_radix` alone would also accept a leading `+`.
+            if !(1..=2).contains(&part.len()) || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(MacParseError::InvalidOctet);
+            }
+            if let Some(octet) = octets.get_mut(count) {
+                *octet = u8::from_str_radix(part, 16).expect("validated hexadecimal digits");
+            }
+            count += 1;
+        }
+        match count {
+            6 => {
+                let mut eui48 = [0u8; 6];
+                eui48.copy_from_slice(&octets[..6]);
+                Ok(Self::Eui48(eui48))
+            }
+            8 => Ok(Self::Eui64(octets)),
+            count => Err(MacParseError::OctetCount(count)),
+        }
+    }
+}
+
 impl From<[u8; 6]> for MacAddress {
     fn from(v: [u8; 6]) -> Self {
         Self::Eui48(v)
@@ -102,5 +148,68 @@ impl From<[u8; 6]> for MacAddress {
 impl From<[u8; 8]> for MacAddress {
     fn from(v: [u8; 8]) -> Self {
         Self::Eui64(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_eui48_and_eui64_with_one_or_two_digit_octets() {
+        assert_eq!(
+            "02:00:00:0a:0B:1".parse::<MacAddress>(),
+            Ok(MacAddress::new_eui48([2, 0, 0, 10, 11, 1]))
+        );
+        assert_eq!(
+            "2:0:0:0:0:0:0:ff".parse::<MacAddress>(),
+            Ok(MacAddress::new_eui64([2, 0, 0, 0, 0, 0, 0, 0xff]))
+        );
+        for mac in [
+            MacAddress::new_eui48([0x02, 0xab, 0, 0, 0, 0x01]),
+            MacAddress::BROADCAST_EUI64,
+        ] {
+            assert_eq!(mac.to_string().parse::<MacAddress>(), Ok(mac));
+        }
+    }
+
+    #[test]
+    fn rejects_signs_separators_empty_parts_and_wrong_counts() {
+        for bad in [
+            "",
+            "+2:+0:+0:+0:+0:+1",
+            "02:00:00:00:00:+f",
+            "-2:00:00:00:00:01",
+            "02-00-00-00-00-01",
+            "02.00.00.00.00.01",
+            "002:00:00:00:00:01",
+            "02:00::00:00:01",
+            "02:00:00:00:00:01:",
+            " 02:00:00:00:00:01",
+            "zz:00:00:00:00:01",
+            "0x:00:00:00:00:01",
+        ] {
+            assert_eq!(
+                bad.parse::<MacAddress>(),
+                Err(MacParseError::InvalidOctet),
+                "{bad:?}"
+            );
+        }
+        for (bad, count) in [
+            ("02", 1),
+            ("02:00:00:00:00", 5),
+            ("02:00:00:00:00:00:00", 7),
+            ("02:00:00:00:00:00:00:00:00", 9),
+        ] {
+            assert_eq!(
+                bad.parse::<MacAddress>(),
+                Err(MacParseError::OctetCount(count)),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            MacParseError::OctetCount(5).to_string(),
+            "MAC address needs six or eight octets, found 5"
+        );
     }
 }

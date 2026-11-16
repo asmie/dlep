@@ -76,8 +76,11 @@ first claimant in registration order. Unclaimed items discard the signal, and
 core grammar is checked before item hooks. Receive contexts are read-only.
 
 Outgoing additions may use non-core, non-reserved data-item types. All plugins
-share 32 items and 4096 bytes per signal, including TLV headers; additions also
-respect the UDP signal size limit. Rejected additions preserve the core signal.
+share 32 items and 1024 bytes per signal, including TLV headers, and the whole
+encoded signal must stay within 1452 bytes (`MAX_DISCOVERY_SIGNAL_BYTES`, the
+IPv6 UDP payload at a 1500-byte MTU). Receivers read one 1500-byte datagram and
+drop truncated ones, so the limit keeps every peer able to read the signal.
+Rejected additions preserve the core signal.
 Hooks cannot replace core fields, destinations, or send arbitrary signal types.
 TTL/interface filtering and connected-router suppression precede receive hooks.
 
@@ -86,6 +89,11 @@ TCP hooks. Normal mutual session negotiation still applies. Hooks can emit
 opaque application events; receive events may precede `PeerDiscovered` because
 they run before the core discovery FSM. The same plugin instance may receive
 discovery and session callbacks concurrently.
+
+Discovery hooks run on the shared discovery task, so they must return quickly
+and must not block. A hook that panics is disabled for discovery on that task
+(its partial additions are discarded and its items count as unclaimed); other
+plugins and discovery itself keep running.
 
 ```toml
 [dependencies]

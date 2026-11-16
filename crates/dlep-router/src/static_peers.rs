@@ -1,14 +1,19 @@
-//! Static connections keyed by configured identity, rather than DNS/zone answers.
-//! Numeric-only configurations retain the existing discovery-capable driver.
+//! Static-mode connection driver. Every configured peer (numeric address, DNS
+//! name, or named IPv6 zone) is scheduled by its configured identity and
+//! follows the numeric endpoint it last connected to, so numeric peers
+//! reconnect the same way whatever else is configured. Discovery mode uses
+//! `run_event_loop`; both share `ReconnectQueue`'s backoff policy.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     future::{Future, poll_fn},
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::Poll,
-    time::Instant,
 };
 
 use dlep_daemon::{
@@ -16,60 +21,100 @@ use dlep_daemon::{
     ScopedPeer,
 };
 use dlep_net::transport::{HOST_CONNECT_TIMEOUT, MAX_RESOLVED_ENDPOINTS};
-use tokio::sync::broadcast::{Receiver, error::RecvError};
+use tokio::{
+    sync::{
+        broadcast::{Receiver, error::RecvError},
+        watch,
+    },
+    time::Instant,
+};
 
 use crate::{ReconnectQueue, connect::MAX_CONNECT_ATTEMPTS};
 
+type States = HashMap<SocketAddr, PeerConnectionState>;
+
+/// Daemon operations used by the driver. Tests substitute a fake daemon so
+/// retry timing can be checked under paused Tokio time.
+pub(crate) trait Dialer: Sync {
+    fn connection_states(&self) -> watch::Receiver<States>;
+    fn connection_capacity(&self) -> usize;
+    fn wait_for_connection_capacity(&self) -> impl Future<Output = ()> + Send;
+    /// Open TCP/TLS to `addr` and register the session. TLS verifies
+    /// `server_name` when given and the endpoint IP otherwise. The connection
+    /// budget is claimed on the first poll, before any I/O is awaited.
+    fn dial(
+        &self,
+        addr: SocketAddr,
+        server_name: Option<&str>,
+    ) -> impl Future<Output = Result<(), DaemonError>> + Send;
+}
+
+impl Dialer for RouterDaemon {
+    fn connection_states(&self) -> watch::Receiver<States> {
+        RouterDaemon::connection_states(self)
+    }
+
+    fn connection_capacity(&self) -> usize {
+        RouterDaemon::connection_capacity(self)
+    }
+
+    fn wait_for_connection_capacity(&self) -> impl Future<Output = ()> + Send {
+        RouterDaemon::wait_for_connection_capacity(self)
+    }
+
+    async fn dial(&self, addr: SocketAddr, server_name: Option<&str>) -> Result<(), DaemonError> {
+        match server_name {
+            Some(name) => self.connect_static_with_server_name(addr, name).await,
+            None => self.connect_static(addr).await,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// Never attempted. Started in configuration order outside the backoff
+    /// queue, so the first failure waits the base delay.
+    Startup,
+    /// Waiting for its deadline in the backoff queue.
+    Waiting,
+    /// Resolution or TCP/TLS connection in progress.
+    Connecting,
+    /// Tracking an endpoint's retained session state, whether this identity
+    /// dialed it or another configured identity already holds it.
+    Following { addr: SocketAddr, seen: u64 },
+}
+
 struct Entry {
     peer: PeerEndpoint,
-    endpoint: Option<SocketAddr>,
-    seen: u64,
-    retries: u32,
-    tried: bool,
-    pending: bool,
-    due: Option<Instant>,
+    state: State,
 }
 
-impl Entry {
-    fn schedule(&mut self, now: Instant) {
-        self.due
-            .get_or_insert_with(|| now + ReconnectQueue::backoff_for(self.retries));
-    }
-
-    fn reconcile(&mut self, state: Option<&PeerConnectionState>, now: Instant) {
-        if self.pending || self.endpoint.is_none() {
-            return;
-        }
-        if let Some(state) = state {
-            if state.establishment_count != self.seen {
-                self.seen = state.establishment_count;
-                self.retries = 0;
-            }
-            if state.active_sessions > 0 {
-                self.due = None;
-                return;
-            }
-        }
-        // Stop following an old answer once its session ends. A different
-        // configured identity may later connect to the same numeric address.
-        self.endpoint = None;
-        self.schedule(now);
-    }
+/// Successful attempt outcomes; both leave the peer following `addr`.
+enum Attempt {
+    /// This identity opened the endpoint's session.
+    Dialed { addr: SocketAddr, seen: u64 },
+    /// Every candidate already has a session under another configured identity.
+    Covered { addr: SocketAddr, seen: u64 },
 }
 
-struct Connected {
-    addr: SocketAddr,
-    baseline: u64,
+enum Failure {
+    /// Every candidate is being dialed under another configured identity.
+    Busy,
+    Daemon(DaemonError),
 }
-type Attempt<'a> = (
+
+type Pending<'a> = (
     usize,
-    Pin<Box<dyn Future<Output = Result<Connected, DaemonError>> + Send + 'a>>,
+    Pin<Box<dyn Future<Output = Result<Attempt, Failure>> + Send + 'a>>,
 );
 type Reservations = Arc<Mutex<HashSet<SocketAddr>>>;
 type Resolution = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 type Resolver = dyn Fn(NamedPeer) -> Resolution + Send + Sync;
 type ZoneResolver = dyn Fn(&ScopedPeer) -> std::io::Result<SocketAddr> + Send + Sync;
 
+/// `Connector::connect_host` cannot be reused: each answer must be checked
+/// against active sessions and reserved before it is dialed. Resolution and
+/// fallback therefore happen here, within the transport's published limits.
 fn system_resolve(peer: NamedPeer) -> Resolution {
     Box::pin(async move {
         let mut seen = HashSet::new();
@@ -91,64 +136,190 @@ impl Drop for ReservedAddress {
     }
 }
 
-async fn connect(
-    daemon: &RouterDaemon,
+/// Counts an attempt against the connection budget until it dials (the daemon
+/// then holds a permit for it) or ends. Resolution holds no daemon permit.
+struct Admission(Option<Arc<AtomicUsize>>);
+impl Admission {
+    fn new(unadmitted: &Arc<AtomicUsize>) -> Self {
+        unadmitted.fetch_add(1, Ordering::Relaxed);
+        Self(Some(unadmitted.clone()))
+    }
+
+    fn admit(&mut self) {
+        if let Some(unadmitted) = self.0.take() {
+            unadmitted.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.admit();
+    }
+}
+
+async fn connect<D: Dialer>(
+    dialer: &D,
     peer: PeerEndpoint,
     reservations: Reservations,
+    mut admission: Admission,
     resolve: &Resolver,
     zone: &ZoneResolver,
-) -> Result<Connected, DaemonError> {
+) -> Result<Attempt, Failure> {
     let work = async {
-        let addresses = match &peer {
-            PeerEndpoint::Address(addr) => vec![*addr],
-            PeerEndpoint::Named(name) => resolve(name.clone()).await?,
-            PeerEndpoint::Scoped(peer) => vec![zone(peer)?],
+        let (addresses, server_name) = match &peer {
+            PeerEndpoint::Address(addr) => (vec![*addr], None),
+            PeerEndpoint::Named(name) => (
+                resolve(name.clone())
+                    .await
+                    .map_err(|e| Failure::Daemon(e.into()))?,
+                Some(name.host()),
+            ),
+            PeerEndpoint::Scoped(peer) => (
+                vec![zone(peer).map_err(|e| Failure::Daemon(e.into()))?],
+                None,
+            ),
         };
-        let states = daemon.connection_states();
-        let mut error = DaemonError::Config("peer has no available addresses".into());
+        let states = dialer.connection_states();
+        let mut covered = None;
+        let mut reserved = false;
+        let mut error = None;
         for addr in addresses {
-            let baseline = {
-                let state = states.borrow();
-                if state.get(&addr).is_some_and(|s| s.active_sessions > 0) {
-                    continue;
-                }
-                state.get(&addr).map_or(0, |s| s.establishment_count)
-            };
+            let state = states.borrow().get(&addr).copied().unwrap_or_default();
+            if state.active_sessions > 0 {
+                covered.get_or_insert((addr, state.establishment_count));
+                continue;
+            }
             if !reservations.lock().unwrap().insert(addr) {
+                reserved = true;
                 continue;
             }
             let _reservation = ReservedAddress {
                 addr,
                 reservations: reservations.clone(),
             };
-            let result = match &peer {
-                PeerEndpoint::Address(_) | PeerEndpoint::Scoped(_) => {
-                    daemon.connect_static(addr).await
+            admission.admit();
+            match dialer.dial(addr, server_name).await {
+                Ok(()) => {
+                    return Ok(Attempt::Dialed {
+                        addr,
+                        seen: state.establishment_count,
+                    });
                 }
-                PeerEndpoint::Named(name) => {
-                    daemon
-                        .connect_static_with_server_name(addr, name.host())
-                        .await
-                }
-            };
-            match result {
-                Ok(()) => return Ok(Connected { addr, baseline }),
                 Err(DaemonError::SessionLimitReached) => {
-                    return Err(DaemonError::SessionLimitReached);
+                    return Err(Failure::Daemon(DaemonError::SessionLimitReached));
                 }
-                Err(failed) => error = failed,
+                Err(failed) => error = Some(failed),
             }
         }
-        Err(error)
+        // An alias of an endpoint that is already up waits for that session to
+        // end; it never borrows another identity's authenticated session.
+        match (covered, error) {
+            (Some((addr, seen)), _) => Ok(Attempt::Covered { addr, seen }),
+            (None, Some(error)) => Err(Failure::Daemon(error)),
+            (None, None) if reserved => Err(Failure::Busy),
+            (None, None) => Err(Failure::Daemon(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "peer host has no addresses",
+            )))),
+        }
     };
     tokio::time::timeout(HOST_CONNECT_TIMEOUT, work)
         .await
         .map_err(|_| {
-            DaemonError::Io(std::io::Error::new(
+            Failure::Daemon(DaemonError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "static peer connection timed out",
-            ))
+            )))
         })?
+}
+
+/// Per-peer state plus backoff history keyed by entry index.
+struct Schedule {
+    entries: Vec<Entry>,
+    queue: ReconnectQueue<usize>,
+}
+
+impl Schedule {
+    fn new(peers: impl IntoIterator<Item = PeerEndpoint>) -> Self {
+        // Coalesce duplicates while keeping configuration order for startup.
+        let mut unique = BTreeSet::new();
+        Self {
+            entries: peers
+                .into_iter()
+                .filter(|peer| unique.insert(peer.clone()))
+                .map(|peer| Entry {
+                    peer,
+                    state: State::Startup,
+                })
+                .collect(),
+            queue: ReconnectQueue::default(),
+        }
+    }
+
+    /// Reconcile followed endpoints from retained state, never from possibly
+    /// lost lifecycle broadcasts. A new establishment resets backoff even when
+    /// the session has already ended in the same coalesced snapshot.
+    fn reconcile(&mut self, states: &States, now: Instant) {
+        for (i, entry) in self.entries.iter_mut().enumerate() {
+            let State::Following { addr, seen } = &mut entry.state else {
+                continue;
+            };
+            if let Some(state) = states.get(addr) {
+                if state.establishment_count != *seen {
+                    *seen = state.establishment_count;
+                    self.queue.forget(&i);
+                }
+                if state.active_sessions > 0 {
+                    continue;
+                }
+            }
+            // Stop following once the session ends or its history is evicted;
+            // the next attempt resolves names and zones afresh.
+            entry.state = State::Waiting;
+            self.queue.schedule(i, now);
+        }
+    }
+
+    /// Never-attempted peers first, then due retries oldest first, up to
+    /// `limit`. Excess due peers stay queued without advancing their backoff.
+    fn take_ready(&mut self, now: Instant, limit: usize) -> Vec<usize> {
+        let mut ready: Vec<_> = (0..self.entries.len())
+            .filter(|&i| self.entries[i].state == State::Startup)
+            .take(limit)
+            .collect();
+        ready.extend(self.queue.take_due_limited(now, limit - ready.len()));
+        for &i in &ready {
+            self.entries[i].state = State::Connecting;
+            self.queue.suspend(&i);
+        }
+        ready
+    }
+
+    fn completed(&mut self, i: usize, result: Result<Attempt, Failure>, now: Instant) {
+        let entry = &mut self.entries[i];
+        match result {
+            Ok(Attempt::Dialed { addr, seen }) => {
+                tracing::debug!(peer = %entry.peer, %addr, "transport connected; awaiting DLEP initialization");
+                entry.state = State::Following { addr, seen };
+            }
+            Ok(Attempt::Covered { addr, seen }) => {
+                tracing::debug!(peer = %entry.peer, %addr, "endpoint has a session under another configured identity; waiting for it to end");
+                entry.state = State::Following { addr, seen };
+            }
+            Err(failure) => {
+                entry.state = State::Waiting;
+                self.queue.schedule(i, now);
+                match failure {
+                    Failure::Busy => {
+                        tracing::debug!(peer = %entry.peer, "endpoints are being connected under another configured identity; will retry with backoff")
+                    }
+                    Failure::Daemon(error) => {
+                        tracing::warn!(peer = %entry.peer, %error, "connection failed; will retry with backoff")
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub async fn run(
@@ -170,8 +341,8 @@ pub async fn run(
     .await;
 }
 
-async fn run_with_resolver(
-    daemon: &RouterDaemon,
+async fn run_with_resolver<D: Dialer>(
+    dialer: &D,
     events: &mut Receiver<DaemonEvent>,
     addresses: &[SocketAddr],
     names: &[NamedPeer],
@@ -179,105 +350,63 @@ async fn run_with_resolver(
     resolve: &Resolver,
     zone: &ZoneResolver,
 ) {
-    let peers: BTreeSet<_> = addresses
-        .iter()
-        .copied()
-        .map(PeerEndpoint::Address)
-        .chain(names.iter().cloned().map(PeerEndpoint::Named))
-        .chain(scoped.iter().cloned().map(PeerEndpoint::Scoped))
-        .collect();
-    let mut entries: Vec<_> = peers
-        .into_iter()
-        .map(|peer| Entry {
-            peer,
-            endpoint: None,
-            seen: 0,
-            retries: 0,
-            tried: false,
-            pending: false,
-            due: Some(Instant::now()),
-        })
-        .collect();
+    let mut schedule = Schedule::new(
+        addresses
+            .iter()
+            .copied()
+            .map(PeerEndpoint::Address)
+            .chain(names.iter().cloned().map(PeerEndpoint::Named))
+            .chain(scoped.iter().cloned().map(PeerEndpoint::Scoped)),
+    );
     let reservations = Reservations::default();
-    let mut attempts: Vec<Attempt<'_>> = Vec::new();
-    let mut states = daemon.connection_states();
+    let unadmitted = Arc::new(AtomicUsize::new(0));
+    let mut pending: Vec<Pending<'_>> = Vec::new();
+    let mut states = dialer.connection_states();
+    // At most eight attempts run at once. Attempts still resolving count
+    // against the session budget too, since they will claim a permit to dial.
+    let capacity = |pending: &Vec<Pending<'_>>| {
+        (MAX_CONNECT_ATTEMPTS - pending.len()).min(
+            dialer
+                .connection_capacity()
+                .saturating_sub(unadmitted.load(Ordering::Relaxed)),
+        )
+    };
     loop {
         let now = Instant::now();
-        {
-            let snapshot = states.borrow_and_update();
-            for entry in &mut entries {
-                entry.reconcile(entry.endpoint.and_then(|addr| snapshot.get(&addr)), now);
-            }
+        schedule.reconcile(&states.borrow_and_update(), now);
+        for i in schedule.take_ready(now, capacity(&pending)) {
+            let peer = schedule.entries[i].peer.clone();
+            tracing::info!(%peer, "connecting to configured modem");
+            let admission = Admission::new(&unadmitted);
+            let attempt = connect(dialer, peer, reservations.clone(), admission, resolve, zone);
+            pending.push((i, Box::pin(attempt)));
         }
-        // Treat resolution futures as occupied slots too. TCP/TLS permits are
-        // also counted by the daemon, so this may conservatively defer work.
-        let capacity = MAX_CONNECT_ATTEMPTS
-            .min(daemon.connection_capacity())
-            .saturating_sub(attempts.len());
-        let mut due: Vec<_> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, entry)| entry.due.filter(|at| *at <= now).map(|at| (at, i)))
-            .collect();
-        due.sort();
-        for (_, i) in due.into_iter().take(capacity) {
-            let entry = &mut entries[i];
-            if entry.tried {
-                entry.retries = entry.retries.saturating_add(1);
-            }
-            entry.tried = true;
-            entry.pending = true;
-            entry.due = None;
-            tracing::info!(peer = %entry.peer, "connecting to configured modem");
-            attempts.push((
-                i,
-                Box::pin(connect(
-                    daemon,
-                    entry.peer.clone(),
-                    reservations.clone(),
-                    resolve,
-                    zone,
-                )),
-            ));
-        }
-        let next_due = if attempts.len() < MAX_CONNECT_ATTEMPTS.min(daemon.connection_capacity()) {
-            entries.iter().filter_map(|entry| entry.due).min()
+        // A full pool waits for completion rather than spinning on past deadlines.
+        let next_due = if capacity(&pending) > 0 {
+            schedule.queue.next_due()
         } else {
             None
         };
         let timer = async {
             match next_due {
-                Some(at) => tokio::time::sleep_until(at.into()).await,
+                Some(at) => tokio::time::sleep_until(at).await,
                 None => std::future::pending().await,
             }
         };
         tokio::select! {
             _ = timer => {},
-            _ = daemon.wait_for_connection_capacity(), if daemon.connection_capacity() == 0 => {},
+            _ = dialer.wait_for_connection_capacity(), if dialer.connection_capacity() == 0 => {},
             changed = states.changed() => { if changed.is_err() { return; } },
             (i, result) = poll_fn(|cx| {
-                for index in 0..attempts.len() {
-                    if let Poll::Ready(result) = attempts[index].1.as_mut().poll(cx) {
-                        let (i, _) = attempts.remove(index);
+                // Poll every attempt so a stalled endpoint cannot block others.
+                for index in 0..pending.len() {
+                    if let Poll::Ready(result) = pending[index].1.as_mut().poll(cx) {
+                        let (i, _) = pending.remove(index);
                         return Poll::Ready((i, result));
                     }
                 }
                 Poll::Pending
-            }) => {
-                let entry = &mut entries[i];
-                entry.pending = false;
-                match result {
-                    Ok(connected) => {
-                        entry.endpoint = Some(connected.addr);
-                        entry.seen = connected.baseline;
-                    }
-                    Err(error) => {
-                        entry.endpoint = None;
-                        entry.schedule(Instant::now());
-                        tracing::warn!(peer = %entry.peer, %error, "connection failed; will retry with backoff");
-                    }
-                }
-            },
+            }) => schedule.completed(i, result, Instant::now()),
             event = events.recv() => match event {
                 Ok(DaemonEvent::SessionUp { peer, .. }) => tracing::info!(addr = %peer.addr, tls = peer.is_tls, "session up"),
                 Ok(DaemonEvent::SessionDown { peer, reason, .. }) => tracing::info!(addr = %peer.addr, ?reason, "session down"),
@@ -294,10 +423,182 @@ mod tests {
     use super::*;
     use dlep_daemon::{ModemConfig, ModemDaemon, RouterConfig};
     use dlep_net::tls::test_helpers::{client_config_for, self_signed_for_dns, server_config_for};
-    use std::{
-        sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
-    };
+    use std::{sync::atomic::AtomicU64, time::Duration};
+    use tokio::sync::broadcast;
+
+    /// Endpoints in `up` accept and initialize at once; others refuse.
+    struct FakeDaemon {
+        states: watch::Sender<States>,
+        up: Mutex<HashSet<SocketAddr>>,
+        dials: Mutex<Vec<(SocketAddr, std::time::Duration)>>,
+        generation: AtomicU64,
+        start: Instant,
+    }
+
+    impl FakeDaemon {
+        fn new(up: impl IntoIterator<Item = SocketAddr>) -> Self {
+            Self {
+                states: watch::channel(States::new()).0,
+                up: Mutex::new(up.into_iter().collect()),
+                dials: Mutex::default(),
+                generation: AtomicU64::new(0),
+                start: Instant::now(),
+            }
+        }
+
+        fn set_up(&self, addr: SocketAddr, up: bool) {
+            let mut endpoints = self.up.lock().unwrap();
+            if up {
+                endpoints.insert(addr);
+            } else {
+                endpoints.remove(&addr);
+            }
+        }
+
+        /// The modem restarts: its session ends and connections are refused.
+        fn restart(&self, addr: SocketAddr) {
+            self.set_up(addr, false);
+            self.states.send_modify(|states| {
+                states.get_mut(&addr).unwrap().active_sessions = 0;
+            });
+        }
+
+        fn evict(&self, addr: SocketAddr) {
+            self.states.send_modify(|states| {
+                states.remove(&addr);
+            });
+        }
+
+        fn dials_to(&self, addr: SocketAddr) -> Vec<Duration> {
+            let dials = self.dials.lock().unwrap();
+            dials.iter().filter(|d| d.0 == addr).map(|d| d.1).collect()
+        }
+    }
+
+    impl Dialer for FakeDaemon {
+        fn connection_states(&self) -> watch::Receiver<States> {
+            self.states.subscribe()
+        }
+
+        fn connection_capacity(&self) -> usize {
+            64
+        }
+
+        fn wait_for_connection_capacity(&self) -> impl Future<Output = ()> + Send {
+            std::future::pending()
+        }
+
+        fn dial(
+            &self,
+            addr: SocketAddr,
+            _: Option<&str>,
+        ) -> impl Future<Output = Result<(), DaemonError>> + Send {
+            self.dials
+                .lock()
+                .unwrap()
+                .push((addr, self.start.elapsed()));
+            let result = if self.up.lock().unwrap().contains(&addr) {
+                let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                self.states.send_modify(|states| {
+                    let state = states.entry(addr).or_default();
+                    state.active_sessions += 1;
+                    state.establishment_count = generation;
+                });
+                Ok(())
+            } else {
+                Err(DaemonError::Io(
+                    std::io::ErrorKind::ConnectionRefused.into(),
+                ))
+            };
+            std::future::ready(result)
+        }
+    }
+
+    fn secs(values: &[u64]) -> Vec<Duration> {
+        values.iter().copied().map(Duration::from_secs).collect()
+    }
+
+    /// Dial times of a numeric peer whose modem restarts at 10 s and returns
+    /// at 16 s, then drops again with its history evicted at 30 s. Returns
+    /// them with the number of dials made for the configured DNS name.
+    async fn numeric_retry_schedule(
+        names: &[NamedPeer],
+        scoped: &[ScopedPeer],
+    ) -> (Vec<Duration>, usize) {
+        let numeric: SocketAddr = "192.0.2.1:854".parse().unwrap();
+        let other: SocketAddr = "192.0.2.2:854".parse().unwrap();
+        let fake = FakeDaemon::new([numeric]);
+        let (_feed, mut events) = broadcast::channel(1);
+        let resolve =
+            move |_: NamedPeer| -> Resolution { Box::pin(async move { Ok(vec![other]) }) };
+        let zone = |_: &ScopedPeer| -> std::io::Result<SocketAddr> {
+            Err(std::io::ErrorKind::NotFound.into())
+        };
+        let script = async {
+            let at = |secs| fake.start + Duration::from_secs(secs);
+            tokio::time::sleep_until(at(10)).await;
+            fake.restart(numeric);
+            tokio::time::sleep_until(at(16)).await;
+            fake.set_up(numeric, true);
+            tokio::time::sleep_until(at(30)).await;
+            fake.evict(numeric);
+            tokio::time::sleep_until(at(40)).await;
+        };
+        let addresses = [numeric];
+        tokio::select! {
+            () = run_with_resolver(&fake, &mut events, &addresses, names, scoped, &resolve, &zone) => {
+                panic!("driver stopped")
+            }
+            () = script => {}
+        }
+        (fake.dials_to(numeric), fake.dials_to(other).len())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn numeric_reconnects_identically_with_named_and_scoped_peers_configured() {
+        let alone = numeric_retry_schedule(&[], &[]).await;
+        // Connected at once; refused at 11 s and 13 s (1 s, then 2 s), back at
+        // 17 s (4 s). Establishment reset the history, so eviction at 30 s
+        // waits the base delay again.
+        assert_eq!(alone, (secs(&[0, 11, 13, 17, 31]), 0));
+        let name = NamedPeer::new("radio.test.invalid", 854).unwrap();
+        let zone = ScopedPeer::new("fe80::1".parse().unwrap(), "dlep-test", 854).unwrap();
+        let (mixed, named_dials) = numeric_retry_schedule(&[name], &[zone]).await;
+        assert_eq!(mixed, alone.0);
+        assert!(named_dials > 1, "the DNS peer must keep retrying meanwhile");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn alias_of_an_active_endpoint_follows_it_without_retrying() {
+        let addr: SocketAddr = "192.0.2.1:854".parse().unwrap();
+        let fake = FakeDaemon::new([addr]);
+        let (_feed, mut events) = broadcast::channel(1);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let counter = resolutions.clone();
+        let resolve = move |_: NamedPeer| -> Resolution {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(vec![addr]) })
+        };
+        let name = NamedPeer::new("alias.test.invalid", addr.port()).unwrap();
+        let script = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            assert_eq!(fake.dials_to(addr), secs(&[0]));
+            assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+            // Both identities retry after the base delay; the alias follows again.
+            fake.restart(addr);
+            fake.set_up(addr, true);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        };
+        let (addresses, names) = ([addr], [name]);
+        tokio::select! {
+            () = run_with_resolver(&fake, &mut events, &addresses, &names, &[], &resolve, &ScopedPeer::resolve) => {
+                panic!("driver stopped")
+            }
+            () = script => {}
+        }
+        assert_eq!(fake.dials_to(addr), secs(&[0, 61]));
+        assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    }
 
     async fn up(events: &mut Receiver<DaemonEvent>) -> SocketAddr {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -358,7 +659,7 @@ mod tests {
             let peer =
                 ScopedPeer::new("fe80::1".parse().unwrap(), "dlep-test", address.port()).unwrap();
             run_with_resolver(
-                &driver,
+                &*driver,
                 &mut driver.subscribe(),
                 &[],
                 &[],
@@ -453,7 +754,7 @@ mod tests {
                 })
             };
             run_with_resolver(
-                &driver,
+                &*driver,
                 &mut driver.subscribe(),
                 &[],
                 &[NamedPeer::new("radio.test.invalid", port).unwrap()],
@@ -504,12 +805,15 @@ mod tests {
         );
         let mut events = router.subscribe();
         let driver = router.clone();
+        let (resolved, mut resolutions) = watch::channel(0usize);
         let task = tokio::spawn(async move {
-            let resolve =
-                move |_: NamedPeer| -> Resolution { Box::pin(async move { Ok(vec![addr]) }) };
+            let resolve = move |_: NamedPeer| -> Resolution {
+                resolved.send_modify(|count| *count += 1);
+                Box::pin(async move { Ok(vec![addr]) })
+            };
             let name = NamedPeer::new("alias.test.invalid", addr.port()).unwrap();
             run_with_resolver(
-                &driver,
+                &*driver,
                 &mut driver.subscribe(),
                 &[addr, addr],
                 &[name.clone(), name],
@@ -520,7 +824,17 @@ mod tests {
             .await;
         });
         assert_eq!(up(&mut events).await, addr);
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // The alias first meets the numeric peer's reservation and retries
+        // after the base delay; its second resolution finds the session active.
+        // On this current-thread runtime the alias decides, and a duplicate
+        // dial would claim budget, before this task observes the count.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            resolutions.wait_for(|count| *count >= 2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             router.connection_states().borrow()[&addr].active_sessions,
             1
@@ -571,7 +885,7 @@ mod tests {
                 .map(|i| NamedPeer::new(&format!("radio{i}.test.invalid"), 854).unwrap())
                 .collect();
             run_with_resolver(
-                &driver,
+                &*driver,
                 &mut driver.subscribe(),
                 &[],
                 &names,

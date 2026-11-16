@@ -17,7 +17,8 @@ dlep-fsm.workspace = true
 dlep-net.workspace = true
 dlep-ext.workspace = true
 bytes.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
+nix.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

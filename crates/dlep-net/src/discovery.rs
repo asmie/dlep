@@ -11,6 +11,10 @@ use tokio::io::unix::AsyncFd;
 use crate::framed::SignalCodec;
 use crate::gtsm;
 
+/// Receive buffer for one discovery datagram: a standard Ethernet MTU.
+/// Longer datagrams are truncated by the kernel and rejected.
+pub const MAX_DATAGRAM_BYTES: usize = 1500;
+
 /// Parameters needed to bring up the discovery socket. Lives here (rather
 /// than reaching into `dlep-daemon::NetworkConfig`) to keep `dlep-net`
 /// config-free.
@@ -333,7 +337,7 @@ impl DiscoverySocket {
         // Hoisted above the retry loop so an EAGAIN spin doesn't re-allocate.
         // Linux reports IPv4 TTL as int; Darwin uses one byte in IP_RECVTTL.
         // IPv6 hop limits are int on both. Reserve the larger representation.
-        let mut payload = [0u8; 1500];
+        let mut payload = [0u8; MAX_DATAGRAM_BYTES];
         #[cfg(not(target_os = "freebsd"))]
         let mut cmsg_space = nix::cmsg_space!(i32, nix::libc::in_pktinfo, nix::libc::in6_pktinfo);
         #[cfg(target_os = "freebsd")]

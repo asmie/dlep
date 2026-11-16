@@ -19,6 +19,7 @@ use thiserror::Error;
 use crate::config::TlsConfig;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TlsSetupError {
     /// Router side: peer verification needs a trust root. DLEP deployments
     /// run private PKI, so there is deliberately no system-roots fallback.

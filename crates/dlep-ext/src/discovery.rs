@@ -8,11 +8,20 @@ use std::{
     sync::Arc,
 };
 
-/// Aggregate extension-item budgets for one discovery signal.
+/// Most extension data items all plugins together may add to one signal.
 pub const MAX_DISCOVERY_EXTENSION_ITEMS: usize = 32;
-pub const MAX_DISCOVERY_EXTENSION_BYTES: usize = 4096;
+/// Most extension bytes, including TLV headers, all plugins together may add
+/// to one signal. Additions must also keep the whole signal within
+/// [`MAX_DISCOVERY_SIGNAL_BYTES`].
+pub const MAX_DISCOVERY_EXTENSION_BYTES: usize = 1024;
+/// Largest encoded discovery signal a hook may produce: the UDP payload of an
+/// IPv6 datagram on a 1500-byte MTU link (1500 − 40 − 8). Receivers read at
+/// most one 1500-byte datagram and drop truncated ones, so larger signals
+/// would be fragmented or silently discarded by every peer.
+pub const MAX_DISCOVERY_SIGNAL_BYTES: usize = 1452;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DiscoveryDirection {
     Incoming,
     Outgoing,
@@ -44,6 +53,7 @@ pub trait DiscoveryCtx {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DiscoveryItemError {
     ReadOnly,
     InvalidType,

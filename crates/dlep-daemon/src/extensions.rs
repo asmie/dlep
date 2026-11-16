@@ -31,6 +31,7 @@ pub struct ExtensionCatalog {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ExtensionSetupError {
     #[error("extension factory name must not be empty")]
     EmptyName,

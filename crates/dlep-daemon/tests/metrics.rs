@@ -111,7 +111,7 @@ async fn configured_metrics_and_partial_updates_reach_router_without_optional_pl
     };
     let got = event(&mut re, |e| matches!(e, DaemonEvent::Metrics { .. })).await;
     assert!(
-        matches!(got, DaemonEvent::Metrics { session_id: sid, event: MetricsEvent { session_wide: metrics }, .. } if sid == session_id && metrics == initial)
+        matches!(got, DaemonEvent::Metrics { session_id: sid, event: MetricsEvent { session_wide: metrics, .. }, .. } if sid == session_id && metrics == initial)
     );
     let id = DestinationId(MacAddress::new_eui48([2, 0, 0, 0, 0, 1]));
     for bad in [
@@ -154,7 +154,7 @@ async fn configured_metrics_and_partial_updates_reach_router_without_optional_pl
     .unwrap();
     let updated = event(&mut re, |e| matches!(e, DaemonEvent::Metrics { .. })).await;
     assert!(
-        matches!(updated, DaemonEvent::Metrics { event: MetricsEvent { session_wide: metrics }, .. } if metrics.resources == Some(30) && metrics.mtu == Some(1300) && metrics.rlq_rx.is_none())
+        matches!(updated, DaemonEvent::Metrics { event: MetricsEvent { session_wide: metrics, .. }, .. } if metrics.resources == Some(30) && metrics.mtu == Some(1300) && metrics.rlq_rx.is_none())
     );
     // Request follows the router's Up acknowledgment and Session Update response
     // on the same stream, so the modem has completed both transactions first.

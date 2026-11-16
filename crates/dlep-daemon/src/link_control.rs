@@ -5,14 +5,20 @@
 //! Without a backend, [`crate::ModemDaemon`] immediately replies Request
 //! Denied with the current metrics. A backend registered through
 //! [`crate::ModemBuilder::link_control`] receives each request instead and
-//! decides the response, which may take as long as the radio needs: RFC 8175
-//! §8 gives transactions no deadline, and the router detects a failed modem
-//! through the session heartbeat.
+//! decides the response. RFC 8175 §8 gives transactions no deadline, but a
+//! pending request holds the destination's transaction slot: the modem cannot
+//! report Destination Down for it until the request is answered. The runtime
+//! therefore denies a request the backend has not answered within
+//! [`DEFAULT_LINK_CONTROL_TIMEOUT`]; configure or disable the deadline with
+//! [`crate::ModemBuilder::link_control_timeout`]. On the deadline the backend
+//! future is dropped, so a backend can detect cancellation through its own
+//! drop guards or closed channels.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dlep_core::{MacAddress, StatusCode};
 use dlep_ext::SessionId;
@@ -83,6 +89,10 @@ impl LinkResponse {
     }
 }
 
+/// Default deadline for a backend answer before the runtime replies Request
+/// Denied ("link-control backend timed out").
+pub const DEFAULT_LINK_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub type LinkControlFuture = Pin<Box<dyn Future<Output = LinkResponse> + Send + 'static>>;
 
 /// Local disposition of a backend reply. Success means the session accepted
@@ -141,7 +151,9 @@ pub trait LinkControl: Send + Sync + 'static {
     /// The runtime calls this method. Override it to attach an acceptance
     /// receipt before retaining a grant or handling a later hardware report.
     /// Existing backends use `request` unchanged through this default.
-    /// Await the receipt outside the returned future, which must finish first.
+    /// Await the receipt outside the returned future, which must finish first:
+    /// the receipt is sent only after the future completes, so awaiting it
+    /// inside the future waits until the request's deadline denies it.
     fn request_with_receipt(&self, request: LinkRequest) -> LinkControlReplyFuture {
         let response = self.request(request);
         Box::pin(async move { response.await.into() })
@@ -158,16 +170,24 @@ where
     }
 }
 
+/// A registered backend and the deadline for each of its answers.
+#[derive(Clone)]
+pub(crate) struct LinkBackend {
+    pub(crate) backend: Arc<dyn LinkControl>,
+    /// None waits for the backend indefinitely.
+    pub(crate) timeout: Option<Duration>,
+}
+
 /// Backend calls in flight for one session. Dropping it aborts them.
 #[derive(Default)]
 pub(crate) struct LinkJobs {
-    backend: Option<Arc<dyn LinkControl>>,
+    backend: Option<LinkBackend>,
     tasks: JoinSet<LinkControlReply>,
     macs: HashMap<Id, MacAddress>,
 }
 
 impl LinkJobs {
-    pub(crate) fn new(backend: Option<Arc<dyn LinkControl>>) -> Self {
+    pub(crate) fn new(backend: Option<LinkBackend>) -> Self {
         Self {
             backend,
             ..Self::default()
@@ -175,14 +195,29 @@ impl LinkJobs {
     }
 
     /// Without a backend, a deferred request is denied rather than left
-    /// pending for the rest of the session.
+    /// pending for the rest of the session. A backend that misses its deadline
+    /// is cancelled and the request denied.
     pub(crate) fn start(&mut self, request: LinkRequest) {
         let mac = request.id.0;
         let handle = match &self.backend {
-            Some(backend) => {
+            Some(LinkBackend { backend, timeout }) => {
                 let backend = Arc::clone(backend);
-                self.tasks
-                    .spawn(async move { backend.request_with_receipt(request).await })
+                let timeout = *timeout;
+                self.tasks.spawn(async move {
+                    let reply = backend.request_with_receipt(request);
+                    let Some(limit) = timeout else {
+                        return reply.await;
+                    };
+                    match tokio::time::timeout(limit, reply).await {
+                        Ok(reply) => reply,
+                        Err(_) => {
+                            warn!("link-control backend did not answer within {limit:?}; denying");
+                            LinkResponse::denied()
+                                .with_text("link-control backend timed out")
+                                .into()
+                        }
+                    }
+                })
             }
             None => self.tasks.spawn(async { LinkResponse::denied().into() }),
         };
@@ -227,7 +262,10 @@ mod tests {
         let backend = |_request: LinkRequest| -> LinkControlFuture {
             panic!("backend panicked before returning its future")
         };
-        let mut jobs = LinkJobs::new(Some(Arc::new(backend)));
+        let mut jobs = LinkJobs::new(Some(LinkBackend {
+            backend: Arc::new(backend),
+            timeout: None,
+        }));
 
         // A failed request must leave the job queue usable for the next one.
         for suffix in [1, 2] {
@@ -257,5 +295,53 @@ mod tests {
             assert!(jobs.is_empty());
             assert!(jobs.macs.is_empty());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_request_is_denied_and_cancelled_at_its_deadline() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let backend = move |_request: LinkRequest| {
+            let guard = Dropped(flag.clone());
+            async move {
+                let _guard = guard;
+                std::future::pending::<LinkResponse>().await
+            }
+        };
+        let mut jobs = LinkJobs::new(Some(LinkBackend {
+            backend: Arc::new(backend),
+            timeout: Some(Duration::from_secs(30)),
+        }));
+        let mac = MacAddress::new_eui48([2, 0, 0, 0, 0, 1]);
+        jobs.start(LinkRequest {
+            session_id: SessionId(1),
+            peer: PeerInfo {
+                secured_medium: None,
+                addr: "127.0.0.1:12345".parse().unwrap(),
+                is_tls: false,
+                peer_description: None,
+            },
+            id: mac.into(),
+            requested: LinkCharacteristics::default(),
+            current: LinkMetrics::default(),
+        });
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            jobs.next().await,
+            Some((FsmEvent::AppLinkCharacteristicsResponse {
+                mac: response_mac,
+                status: StatusCode::REQUEST_DENIED,
+                text,
+                metrics: None,
+            }, None)) if response_mac == mac && text == "link-control backend timed out"
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

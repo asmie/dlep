@@ -14,9 +14,9 @@ use tracing::{info, warn};
 use crate::config::{ModemConfig, TimersConfig};
 use crate::connections::ConnectedRouters;
 use crate::events::{DestinationId, LinkMetrics, PeerInfo};
-use crate::link_control::{LinkControl, LinkResponse};
+use crate::link_control::{DEFAULT_LINK_CONTROL_TIMEOUT, LinkBackend, LinkControl, LinkResponse};
 use crate::runtime::{
-    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionRequest,
+    COMMAND_CHANNEL_CAPACITY, DaemonError, EventRx, EventTx, SessionCommand, SessionHandle,
     new_event_channel,
 };
 use crate::session::{
@@ -29,7 +29,7 @@ pub struct ModemDaemon {
     state: Arc<crate::state::StateRegistry>,
     /// Address the listen socket actually bound to (resolves `tcp_port = 0`).
     local_addr: SocketAddr,
-    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
+    session_cmds: Arc<Mutex<Vec<SessionHandle>>>,
     /// First entry is the listen task; subsequent entries are per-session.
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     listen_task: JoinHandle<()>,
@@ -314,8 +314,9 @@ impl ModemDaemon {
         let _ = self.listen_task.await;
 
         let cmds: Vec<_> = std::mem::take(&mut *self.session_cmds.lock().await);
-        for cmd_tx in cmds {
-            let _ = cmd_tx
+        for session in cmds {
+            let _ = session
+                .tx
                 .send(
                     SessionCommand::Shutdown {
                         reason: StatusCode::SHUTTING_DOWN,
@@ -342,6 +343,8 @@ pub struct ModemBuilder {
     extensions: crate::ExtensionCatalog,
     server_tls: Option<Arc<ServerConfig>>,
     link_control: Option<Arc<dyn LinkControl>>,
+    /// None selects [`DEFAULT_LINK_CONTROL_TIMEOUT`].
+    link_control_timeout: Option<Option<std::time::Duration>>,
 }
 
 impl ModemBuilder {
@@ -383,6 +386,15 @@ impl ModemBuilder {
     /// of denying them. See [`crate::link_control`].
     pub fn link_control(mut self, backend: Arc<dyn LinkControl>) -> Self {
         self.link_control = Some(backend);
+        self
+    }
+
+    /// Deadline for each link-control backend answer; the default is
+    /// [`DEFAULT_LINK_CONTROL_TIMEOUT`]. When it expires the runtime drops the
+    /// backend future and replies Request Denied, which releases the
+    /// destination for Destination Down. `None` waits indefinitely.
+    pub fn link_control_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.link_control_timeout = Some(timeout);
         self
     }
 
@@ -439,8 +451,7 @@ impl ModemBuilder {
 
         let (events_tx, _events_rx) = new_event_channel();
         let state = crate::state::StateRegistry::new();
-        let session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let session_cmds: Arc<Mutex<Vec<SessionHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let session_id_counter = new_session_id_counter();
         let connected_routers = ConnectedRouters::default();
@@ -478,7 +489,12 @@ impl ModemBuilder {
             session_id_counter.clone(),
             stop_rx,
             connected_routers,
-            self.link_control,
+            self.link_control.map(|backend| LinkBackend {
+                backend,
+                timeout: self
+                    .link_control_timeout
+                    .unwrap_or(Some(DEFAULT_LINK_CONTROL_TIMEOUT)),
+            }),
             state.clone(),
         ));
 
@@ -544,7 +560,7 @@ async fn spawn_modem_discovery(
 
     let (tx, rx) = mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {
-        crate::discovery::run_discovery_group(
+        crate::discovery::run_supervised_discovery_group(
             members,
             false,
             rx,
@@ -567,13 +583,13 @@ async fn modem_accept_loop(
     secured_medium: bool,
     initial_metrics: LinkMetrics,
     mac_address_format: dlep_core::MacAddressFormat,
-    session_cmds: Arc<Mutex<Vec<mpsc::Sender<SessionRequest>>>>,
+    session_cmds: Arc<Mutex<Vec<SessionHandle>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     extensions: ExtensionRegistry,
     session_id_counter: SessionIdCounter,
     stopping: watch::Receiver<bool>,
     connected_routers: ConnectedRouters,
-    link_control: Option<Arc<dyn LinkControl>>,
+    link_control: Option<LinkBackend>,
     state: Arc<crate::state::StateRegistry>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(64));
@@ -642,13 +658,14 @@ async fn modem_accept_loop(
             cfg.mac_address_format = mac_address_format;
             cfg.defer_link_characteristics = link_control.is_some();
             let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+            let session_id = crate::session::next_session_id(&counter);
             {
                 let mut senders = commands.lock().await;
                 if *stopping.borrow() {
                     return;
                 }
                 senders.retain(|s| !s.is_closed());
-                senders.push(tx);
+                senders.push(SessionHandle { id: session_id, tx });
             }
             if let Err(e) = run_session_tracked(
                 ModemSessionFsm::with_config(cfg),
@@ -659,7 +676,7 @@ async fn modem_accept_loop(
                 peer,
                 extensions,
                 Role::Modem,
-                counter,
+                session_id,
                 None,
                 link_control,
                 Some(state),

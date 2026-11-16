@@ -192,6 +192,52 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
     .await
 }
 
+/// Run a discovery group and report an unexpected stop. Shutdown returns
+/// `Ok`; any error is logged and published as `DaemonEvent::DiscoveryStopped`
+/// so applications learn that discovery ended while sessions continue.
+pub(crate) async fn run_supervised_discovery_group<F: DiscoveryFsm>(
+    members: Vec<(F, DiscoverySocket)>,
+    start: bool,
+    shutdown_rx: mpsc::Receiver<()>,
+    events_tx: EventTx,
+    connected_routers: Option<ConnectedRouters>,
+    registry: dlep_ext::ExtensionRegistry,
+    role: dlep_ext::Role,
+) -> Result<(), DaemonError> {
+    /// Aborts the group when the supervisor is cancelled.
+    struct AbortOnDrop(tokio::task::JoinHandle<Result<(), DaemonError>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let events = events_tx.clone();
+    // A separate task turns a panic into an error reported here instead of
+    // only when shutdown joins the daemon's discovery handle.
+    let mut group = AbortOnDrop(tokio::spawn(run_discovery_group(
+        members,
+        start,
+        shutdown_rx,
+        events_tx,
+        connected_routers,
+        registry,
+        role,
+    )));
+    let result = (&mut group.0).await.unwrap_or_else(|error| {
+        Err(DaemonError::Config(format!(
+            "discovery task failed: {error}"
+        )))
+    });
+    if let Err(error) = &result {
+        tracing::error!(%error, "discovery stopped; established sessions continue");
+        let _ = events.send(crate::DaemonEvent::DiscoveryStopped {
+            error: error.to_string(),
+        });
+    }
+    result
+}
+
 /// Own both family tasks as one lifecycle. Dropping the supervisor aborts all
 /// children; ordinary shutdown closes their stop channels and joins them.
 /// Any unexpected child exit stops the complete group.
@@ -447,9 +493,6 @@ async fn process_actions(
                 timers.arm(id, handle, packet);
             }
             FsmAction::CancelTimer(id) => timers.cancel(id),
-            FsmAction::ResetHeartbeat { .. } | FsmAction::SendMessage(_) | FsmAction::CloseTcp => {
-                debug!("discovery task received session-domain action; ignoring");
-            }
             FsmAction::Emit(emitted) => {
                 if let Some(mut evt) = translate(emitted) {
                     if let (DaemonEvent::PeerDiscovered(offer), Some(index)) =
@@ -466,6 +509,9 @@ async fn process_actions(
                     let _ = events_tx.send(evt);
                 }
             }
+            // Session-domain actions (messages, heartbeats, TCP close) and
+            // any future action kinds have no meaning on a discovery socket.
+            _ => debug!("discovery task received a non-discovery action; ignoring"),
         }
     }
     Ok(())
@@ -502,7 +548,15 @@ mod tests {
 
     struct GroupObserver {
         sends: Arc<AtomicUsize>,
-        panic_once: bool,
+    }
+
+    /// Router discovery FSM whose start event can fail its whole task.
+    struct FailingStart(RouterDiscoveryFsm, bool);
+    impl DiscoveryFsm for FailingStart {
+        fn step(&mut self, event: FsmEvent) -> Vec<FsmAction> {
+            assert!(!self.1, "injected discovery task failure");
+            self.0.step(event)
+        }
     }
     impl dlep_ext::DlepExtension for GroupObserver {
         fn advertised_ids(&self) -> &[dlep_core::ExtensionId] {
@@ -512,11 +566,7 @@ mod tests {
             true
         }
         fn on_discovery_send(&self, _: SignalType, _: &mut dyn dlep_ext::DiscoveryCtx) {
-            let previous = self.sends.fetch_add(1, Ordering::SeqCst);
-            assert!(
-                !self.panic_once || previous != 0,
-                "injected discovery hook failure"
-            );
+            self.sends.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -531,7 +581,8 @@ mod tests {
             .bind_discoveries(false)
             .unwrap()
             .into_iter()
-            .map(|socket| (router(), socket))
+            .enumerate()
+            .map(|(index, socket)| (FailingStart(router(), panic_once && index == 0), socket))
             .collect();
         let ports: Vec<_> = members
             .iter()
@@ -541,11 +592,10 @@ mod tests {
         let mut registry = dlep_ext::ExtensionRegistry::new();
         registry.register(Arc::new(GroupObserver {
             sends: count.clone(),
-            panic_once,
         }));
         let (_stop, rx) = mpsc::channel(1);
-        let (events, _) = crate::runtime::new_event_channel();
-        let task = tokio::spawn(run_discovery_group(
+        let (events, mut received) = crate::runtime::new_event_channel();
+        let task = tokio::spawn(run_supervised_discovery_group(
             members,
             true,
             rx,
@@ -562,6 +612,11 @@ mod tests {
                     .unwrap()
                     .is_err()
             );
+            assert!(matches!(
+                received.try_recv(),
+                Ok(crate::DaemonEvent::DiscoveryStopped { error })
+                    if error.contains("discovery task failed")
+            ));
         } else {
             timeout(Duration::from_secs(2), async {
                 while count.load(Ordering::SeqCst) < 2 {
@@ -707,7 +762,6 @@ mod tests {
         let mut registry = dlep_ext::ExtensionRegistry::new();
         registry.register(Arc::new(GroupObserver {
             sends: count.clone(),
-            panic_once: false,
         }));
         let fsm = ModemDiscoveryFsm::new("0.0.0.0:854".parse().unwrap(), "modem".into(), true)
             .with_offer_retries(2, Duration::from_secs(1))

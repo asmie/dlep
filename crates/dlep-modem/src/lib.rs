@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -6,6 +7,10 @@ use dlep_daemon::{ModemConfig, ModemDaemon, check_modem_config, load_toml_config
 use tracing_subscriber::EnvFilter;
 
 mod radio;
+
+/// How long an adapter failure waits for a shutdown signal that the same
+/// process-group signal may have delivered to the modem.
+const SIGNAL_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum LogFormat {
@@ -147,7 +152,11 @@ where
         builder = builder.with_rustls_server(tls);
     }
     if let Some(adapter) = &adapter {
-        builder = builder.link_control(adapter.link_control());
+        // The radio link enforces `[radio].link_request_timeout_ms` itself and
+        // tells the adapter when it gives up, so the daemon deadline is off.
+        builder = builder
+            .link_control(adapter.link_control())
+            .link_control_timeout(None);
     }
     let daemon = builder
         .spawn()
@@ -158,11 +167,25 @@ where
 
     // An adapter failure terminates sessions like a shutdown signal, then
     // exits with an error so a supervisor restarts the modem and adapter.
+    // A signal sent to the whole process group (Ctrl-C, or a service manager
+    // that signals every process) can also stop the adapter. Its exit then
+    // races the modem's own signal, so the signal wins ties and an adapter
+    // failure shortly followed by a signal counts as a requested shutdown.
     let outcome = match &mut adapter {
         Some(adapter) => tokio::select! {
+            biased;
             () = shutdown.recv() => Ok(()),
             result = adapter.run(&daemon, events, initial_metrics, mac_address_format) => {
-                result.map(|never| match never {}).context("radio adapter failed")
+                let error = match result {
+                    Ok(never) => match never {},
+                    Err(error) => error,
+                };
+                if shutdown.received_within(SIGNAL_GRACE).await {
+                    tracing::info!("radio adapter stopped during shutdown: {error:#}");
+                    Ok(())
+                } else {
+                    Err(error.context("radio adapter failed"))
+                }
             }
         },
         None => {
@@ -174,11 +197,13 @@ where
         Ok(()) => tracing::info!("shutdown requested"),
         Err(e) => tracing::error!("{e:#}; shutting down"),
     }
-    daemon.shutdown().await?;
+    // Stop the adapter gracefully even if the daemon shutdown fails: closing
+    // its input before killing it is what the example units' KillMode relies on.
+    let shutdown_result = daemon.shutdown().await;
     if let Some(adapter) = adapter {
         adapter.stop().await;
     }
-    outcome
+    outcome.and(shutdown_result.map_err(Into::into))
 }
 
 fn init_tracing(requested: &str, format: LogFormat) {

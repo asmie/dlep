@@ -1,6 +1,8 @@
 //! Opt-in process signal handling for the standalone binaries.
 
 use std::io;
+use std::time::Duration;
+
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 /// Register before starting listeners or connection attempts so shutdown
@@ -26,5 +28,13 @@ impl ShutdownSignals {
             _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
         }
+    }
+
+    /// Whether SIGINT or SIGTERM arrives within `grace`, consuming it. A
+    /// signal the runtime has already observed is reported without waiting.
+    /// Use this to classify a failure that a process-group signal can cause,
+    /// such as a child process exiting on the same Ctrl-C.
+    pub async fn received_within(&mut self, grace: Duration) -> bool {
+        tokio::time::timeout(grace, self.recv()).await.is_ok()
     }
 }

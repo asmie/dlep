@@ -15,6 +15,7 @@ use crate::events::DaemonEvent;
 /// Per-session control message. The session task receives one of these on its
 /// mpsc command channel and translates into the appropriate `FsmEvent`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum SessionCommand {
     /// Start the local-initiated termination handshake.
     Shutdown { reason: StatusCode },
@@ -117,6 +118,7 @@ impl SessionCommand {
 /// Broadcasts are not atomic: a healthy session may accept a command while
 /// another rejects it. Inspect this report before deciding which peers to retry.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct CommandReport {
     pub accepted: Vec<dlep_ext::SessionId>,
     pub rejected: Vec<(dlep_ext::SessionId, dlep_fsm::CommandRejection)>,
@@ -126,8 +128,25 @@ pub struct CommandReport {
     pub unknown: usize,
 }
 
+/// Command channel of one session task. The session ID is allocated before
+/// the task starts so targeted commands are delivered only to their session.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionHandle {
+    pub(crate) id: dlep_ext::SessionId,
+    pub(crate) tx: mpsc::Sender<SessionRequest>,
+}
+
+impl SessionHandle {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
+/// Deliver `command` and wait for local acceptance. A targeted command goes
+/// only to the selected session, so a stalled or busy unrelated session
+/// cannot delay it; an untargeted command waits for every session's receipt.
 pub(crate) async fn dispatch_command(
-    senders: Vec<mpsc::Sender<SessionRequest>>,
+    sessions: Vec<SessionHandle>,
     command: SessionCommand,
     target: Option<dlep_ext::SessionId>,
 ) -> Result<(), DaemonError> {
@@ -139,6 +158,10 @@ pub(crate) async fn dispatch_command(
     let target = target.or(command.target());
     let mut report = CommandReport::default();
     let mut receipts = Vec::new();
+    let senders = sessions
+        .into_iter()
+        .filter(|session| target.is_none_or(|target| target == session.id))
+        .map(|session| session.tx);
     for sender in senders {
         let (receipt, receiver) = oneshot::channel();
         if sender
@@ -163,12 +186,6 @@ pub(crate) async fn dispatch_command(
             Err(_) => report.unknown += 1,
         }
     }
-    // Session IDs are unique. Once the selected session replied, failures of
-    // unrelated sessions cannot change the outcome of a targeted command.
-    if target.is_some() && (!report.accepted.is_empty() || !report.rejected.is_empty()) {
-        report.undelivered = 0;
-        report.unknown = 0;
-    }
     if !report.rejected.is_empty() || report.undelivered != 0 || report.unknown != 0 {
         Err(DaemonError::CommandRejected(report))
     } else if report.accepted.is_empty() {
@@ -190,6 +207,7 @@ pub const COMMAND_CHANNEL_CAPACITY: usize = 64;
 
 /// Errors returned from the public daemon API.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DaemonError {
     #[error("router connection/session limit reached")]
     SessionLimitReached,
@@ -242,6 +260,13 @@ mod command_tests {
     use super::*;
     use dlep_ext::SessionId;
 
+    fn handle(id: u64, tx: mpsc::Sender<SessionRequest>) -> SessionHandle {
+        SessionHandle {
+            id: SessionId(id),
+            tx,
+        }
+    }
+
     #[tokio::test]
     async fn closed_channels_and_lost_receipts_never_report_success() {
         let (closed, receiver) = mpsc::channel(1);
@@ -260,7 +285,7 @@ mod command_tests {
             drop(receiver.recv().await.unwrap());
         });
         let error = dispatch_command(
-            vec![closed, accepted, lost],
+            vec![handle(1, accepted), handle(2, closed), handle(3, lost)],
             SessionCommand::SessionUpdate {
                 metrics: Default::default(),
             },
@@ -293,7 +318,7 @@ mod command_tests {
                 .unwrap();
         });
         dispatch_command(
-            vec![closed, accepted],
+            vec![handle(2, closed), handle(1, accepted)],
             SessionCommand::SessionUpdate {
                 metrics: Default::default(),
             },
@@ -302,5 +327,58 @@ mod command_tests {
         .await
         .unwrap();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn targeted_command_skips_a_stalled_unrelated_session() {
+        // The unrelated session's queue is full and never drained.
+        let (stalled, _stalled_receiver) = mpsc::channel::<SessionRequest>(1);
+        stalled
+            .try_send(
+                SessionCommand::SessionUpdate {
+                    metrics: Default::default(),
+                }
+                .into(),
+            )
+            .unwrap();
+        let (accepted, mut receiver) = mpsc::channel::<SessionRequest>(1);
+        let task = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            request
+                .receipt
+                .unwrap()
+                .send(Some((SessionId(2), Ok(()))))
+                .unwrap();
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_command(
+                vec![handle(1, stalled.clone()), handle(2, accepted)],
+                SessionCommand::SessionUpdate {
+                    metrics: Default::default(),
+                },
+                Some(SessionId(2)),
+            ),
+        )
+        .await
+        .expect("targeted command waited for an unrelated session")
+        .unwrap();
+        task.await.unwrap();
+        assert_eq!(stalled.capacity(), 0, "unrelated session received nothing");
+    }
+
+    #[tokio::test]
+    async fn targeted_command_without_a_matching_session_is_reported() {
+        let (other, _receiver) = mpsc::channel::<SessionRequest>(1);
+        let error = dispatch_command(
+            vec![handle(1, other)],
+            SessionCommand::SessionUpdate {
+                metrics: Default::default(),
+            },
+            Some(SessionId(9)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DaemonError::NoMatchingSession), "{error:?}");
     }
 }

@@ -12,7 +12,7 @@
 pub mod discovery;
 pub use discovery::{
     DiscoveryCtx, DiscoveryDirection, DiscoveryInfo, DiscoveryItemError,
-    MAX_DISCOVERY_EXTENSION_BYTES, MAX_DISCOVERY_EXTENSION_ITEMS,
+    MAX_DISCOVERY_EXTENSION_BYTES, MAX_DISCOVERY_EXTENSION_ITEMS, MAX_DISCOVERY_SIGNAL_BYTES,
 };
 
 use std::any::Any;
@@ -72,6 +72,7 @@ pub trait ExtensionCtx {
 
 /// Why an extension's session-termination request was not queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TerminationRequestError {
     Unsupported,
     SessionClosing,

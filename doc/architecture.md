@@ -183,10 +183,11 @@ embedders should use `dlep-daemon` instead. Each role:
    via `dlep_daemon::tls::{client_config, server_config}` and hands it to
    the builder. The modem starts its `[radio]` adapter, if configured, and
    registers it as the link-control backend (`src/radio.rs`).
-6. Builds and spawns the daemon. The router then starts discovery (or
-   connects to its static peers) and runs an event loop that connects to
-   modems as `PeerDiscovered` arrives (deduplicated by address) and logs
-   session lifecycle; the modem's accept loop starts on `spawn`.
+6. Builds and spawns the daemon. In discovery mode the router runs an event
+   loop that connects to modems as `PeerDiscovered` arrives (deduplicated by
+   address); in static mode a separate driver connects and reconnects each
+   configured peer. Both log session lifecycle; the modem's accept loop starts
+   on `spawn`.
 7. Registers SIGINT/SIGTERM before opening networking resources and calls
    `daemon.shutdown().await` on either signal. The router races shutdown against
    its entire startup/event driver, including the bounded pool of concurrent
@@ -299,8 +300,10 @@ identity, negotiated extensions, phase, effective metrics, peer addresses, and
 destinations with metrics, addresses, and pending/up/withdrawn phases. Only
 established sessions are included; they remain while terminating and are removed
 on completion, I/O failure, or cancellation. A daemon-wide generation increases
-only when retained state changes. Per-session Arc values keep consumer snapshot
-clones cheap. Read and clone the initial value and each new value, releasing watch
+only when retained state changes. Sessions and destinations are held in `Arc`s:
+consumer snapshot clones are cheap, and a session republishes only the
+destinations that changed, reusing the previous `Arc` for the rest, so a busy
+destination does not copy every other destination's addresses on each update. Read and clone the initial value and each new value, releasing watch
 borrows before awaiting. Coalescing preserves current state, not transient
 command outcomes, extension payloads, or historical termination reasons; older
 broadcast events must not be applied over a newer snapshot.
@@ -341,8 +344,9 @@ items, and the FSM receives the validated core projection. Observation events
 can therefore precede `PeerDiscovered`.
 
 Outgoing hooks append only non-core/non-reserved TLVs. Shared budgets allow 32
-items and 4096 bytes per signal, including headers, with an additional UDP size
-bound. Core fields and send targets cannot be replaced. Incoming contexts expose
+items and 1024 bytes per signal, including headers, and cap the encoded signal
+at 1452 bytes so it fits a peer's 1500-byte receive buffer without
+fragmentation. Core fields and send targets cannot be replaced. Incoming contexts expose
 metadata/events without send or session-control capabilities. Discovery data is
 unauthenticated; normal session negotiation remains mandatory for TCP hooks.
 The original low-level discovery runner keeps its no-hook behavior; an explicit
@@ -413,10 +417,11 @@ TLS identity and re-resolves on every call. `connect_static_with_server_name`
 sets an explicit identity for a numeric endpoint; `connect_static` retains IP
 verification. All use the shared connection budget, and callers wait for
 `SessionUp` before sending commands. The CLI accepts named `static_peers` and
-`--peer` endpoints and retries by configured identity. Numeric-only configurations
-retain the discovery-capable driver; configurations containing DNS peers use a
-static driver with bounded resolution and per-endpoint reservations. Both read
-retained connection state rather than depending on lifecycle broadcasts.
+`--peer` endpoints and retries by configured identity. Static mode uses one
+driver for numeric, DNS, and named-zone peers, with bounded resolution and
+per-endpoint reservations; discovery mode uses the offer-driven event loop.
+Both share one backoff policy and read retained connection state rather than
+depending on lifecycle broadcasts.
 
 The modem-side API is symmetric, with `add_destination`, `update_destination` and `drop_destination` taking the place of `start_discovery` / `connect_static`. `ModemBuilder::link_control` registers the backend that answers router Link Characteristics Requests; without one they are denied.
 

@@ -3,19 +3,27 @@ use crate::runtime::EventTx;
 use dlep_core::{DataItem, RawDataItem, Signal, SignalType};
 use dlep_ext::{
     DiscoveryCtx, DiscoveryDirection, DiscoveryInfo, DiscoveryItemError, DlepExtension, ExtHandled,
-    ExtensionRegistry, MAX_DISCOVERY_EXTENSION_BYTES, MAX_DISCOVERY_EXTENSION_ITEMS, Role,
+    ExtensionRegistry, MAX_DISCOVERY_EXTENSION_BYTES, MAX_DISCOVERY_EXTENSION_ITEMS,
+    MAX_DISCOVERY_SIGNAL_BYTES, Role,
 };
 use std::{
     any::Any,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-const MAX_SIGNAL_BYTES: usize = 65_507;
+const MAX_SIGNAL_BYTES: usize = MAX_DISCOVERY_SIGNAL_BYTES;
+// Every signal a hook can build must fit the receive buffer of a peer.
+const _: () = assert!(MAX_SIGNAL_BYTES <= dlep_net::discovery::MAX_DATAGRAM_BYTES);
 
 pub(crate) struct DiscoveryHooks {
     role: Role,
     extensions: Vec<Arc<dyn DlepExtension>>,
+    /// Set once a plugin's hook panics; that plugin is skipped afterwards.
+    disabled: Vec<AtomicBool>,
 }
 
 impl Default for DiscoveryHooks {
@@ -23,6 +31,7 @@ impl Default for DiscoveryHooks {
         Self {
             role: Role::Router,
             extensions: Vec::new(),
+            disabled: Vec::new(),
         }
     }
 }
@@ -33,15 +42,39 @@ fn extension_type(item: &RawDataItem) -> bool {
 
 impl DiscoveryHooks {
     pub(crate) fn new(registry: &ExtensionRegistry, role: Role) -> Self {
+        let extensions: Vec<_> = registry
+            .iter()
+            .filter(|extension| {
+                !extension.advertised_ids().is_empty() && extension.supports_discovery()
+            })
+            .cloned()
+            .collect();
+        let disabled = extensions.iter().map(|_| AtomicBool::new(false)).collect();
         Self {
             role,
-            extensions: registry
-                .iter()
-                .filter(|extension| {
-                    !extension.advertised_ids().is_empty() && extension.supports_discovery()
-                })
-                .cloned()
-                .collect(),
+            extensions,
+            disabled,
+        }
+    }
+
+    /// Run one plugin hook. Discovery input is unauthenticated and shared by
+    /// every peer, so a panicking plugin is disabled for the rest of this
+    /// discovery task instead of stopping discovery. Returns `None` when the
+    /// plugin is disabled or panicked.
+    fn call<R>(&self, index: usize, hook: impl FnOnce() -> R) -> Option<R> {
+        if self.disabled[index].load(Ordering::Relaxed) {
+            return None;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+            Ok(result) => Some(result),
+            Err(_) => {
+                self.disabled[index].store(true, Ordering::Relaxed);
+                tracing::error!(
+                    extension = index,
+                    "discovery extension hook panicked; disabling it for discovery"
+                );
+                None
+            }
         }
     }
 
@@ -105,15 +138,23 @@ impl DiscoveryHooks {
         };
         for item in &signal.data_items {
             if let DataItem::Unknown(raw) = item {
-                if !self.extensions.iter().any(|extension| {
-                    extension.on_discovery_data_item(&signal, raw, &mut ctx) == ExtHandled::Handled
-                }) {
+                // Items of a disabled plugin are unclaimed and discard the signal.
+                if !self
+                    .extensions
+                    .iter()
+                    .enumerate()
+                    .any(|(index, extension)| {
+                        self.call(index, || {
+                            extension.on_discovery_data_item(&signal, raw, &mut ctx)
+                        }) == Some(ExtHandled::Handled)
+                    })
+                {
                     return None;
                 }
             }
         }
-        for extension in &self.extensions {
-            extension.on_discovery_signal(&signal, &mut ctx);
+        for (index, extension) in self.extensions.iter().enumerate() {
+            self.call(index, || extension.on_discovery_signal(&signal, &mut ctx));
         }
         Some(core)
     }
@@ -154,8 +195,22 @@ impl DiscoveryHooks {
             count: 0,
             bytes: 0,
         };
-        for extension in &self.extensions {
-            extension.on_discovery_send(expected, &mut ctx);
+        for (index, extension) in self.extensions.iter().enumerate() {
+            let (count, bytes, wire_bytes) = (ctx.count, ctx.bytes, ctx.wire_bytes);
+            let items = ctx
+                .signal
+                .as_ref()
+                .map_or(0, |signal| signal.data_items.len());
+            if self
+                .call(index, || extension.on_discovery_send(expected, &mut ctx))
+                .is_none()
+            {
+                // Discard partial additions from a panicking plugin.
+                (ctx.count, ctx.bytes, ctx.wire_bytes) = (count, bytes, wire_bytes);
+                if let Some(signal) = ctx.signal.as_mut() {
+                    signal.data_items.truncate(items);
+                }
+            }
         }
     }
 }
@@ -429,5 +484,80 @@ mod tests {
             assert!(!dlep_fsm::discovery_common::valid_signal(&signal));
             assert_eq!(plugin.inspected.load(Ordering::SeqCst), 0);
         }
+    }
+
+    /// Adds one item, then panics on its first send and first received item.
+    struct Faulty {
+        ids: Vec<ExtensionId>,
+        calls: AtomicUsize,
+    }
+    impl DlepExtension for Faulty {
+        fn advertised_ids(&self) -> &[dlep_core::ExtensionId] {
+            &self.ids
+        }
+        fn supports_discovery(&self) -> bool {
+            true
+        }
+        fn on_discovery_send(&self, _: SignalType, ctx: &mut dyn DiscoveryCtx) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ctx.add_data_item(raw(30, 8)).unwrap();
+            panic!("injected discovery send failure");
+        }
+        fn on_discovery_data_item(
+            &self,
+            _: &Signal,
+            _: &RawDataItem,
+            _: &mut dyn DiscoveryCtx,
+        ) -> ExtHandled {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("injected discovery receive failure");
+        }
+    }
+
+    #[test]
+    fn panicking_plugin_is_disabled_without_affecting_other_plugins() {
+        let faulty = Arc::new(Faulty {
+            ids: vec![ExtensionId(0xF021)],
+            calls: AtomicUsize::new(0),
+        });
+        let healthy = Plugin::new(vec![raw(21, 4)], Some(DataItemType(21)));
+        let mut registry = ExtensionRegistry::new();
+        registry.register(faulty.clone());
+        registry.register(healthy.clone());
+        let hooks = DiscoveryHooks::new(&registry, Role::Router);
+        let (events, _) = crate::runtime::new_event_channel();
+        for _ in 0..2 {
+            let mut signal = build_peer_discovery("router");
+            hooks.send(&mut signal, None, None, None, &events);
+            // The panicking plugin's partial addition is discarded; the
+            // healthy plugin still adds its item.
+            assert_eq!(
+                signal
+                    .data_items
+                    .iter()
+                    .filter_map(|item| match item {
+                        DataItem::Unknown(raw) => Some(raw.type_id),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                [DataItemType(21)]
+            );
+        }
+        assert_eq!(
+            faulty.calls.load(Ordering::SeqCst),
+            1,
+            "disabled after panic"
+        );
+
+        // Receive hooks of the disabled plugin are skipped as well.
+        let hooks = DiscoveryHooks::new(&registry, Role::Modem);
+        let signal = build_peer_discovery("router").with_item(DataItem::Unknown(raw(21, 0)));
+        assert!(
+            receive(&hooks, signal.clone()).is_some(),
+            "first call panics"
+        );
+        assert!(receive(&hooks, signal).is_some());
+        assert_eq!(faulty.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(healthy.inspected.load(Ordering::SeqCst), 2);
     }
 }

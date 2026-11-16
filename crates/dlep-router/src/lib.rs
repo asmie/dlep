@@ -3,10 +3,11 @@ mod connect;
 mod static_peers;
 
 use connect::ConnectAttempts;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -15,6 +16,7 @@ use dlep_daemon::{
     RouterDaemon, ScopedPeer, check_router_config, load_toml_config,
 };
 use tokio::sync::broadcast::{Receiver, error::RecvError};
+use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -170,7 +172,7 @@ where
     let result = tokio::select! {
         biased;
         _ = shutdown.recv() => Ok(()),
-        result = run_configured(&daemon, &mut events, mode, &static_peers, &named_peers, &scoped_peers) => result,
+        result = run(&daemon, &mut events, mode, &static_peers, &named_peers, &scoped_peers) => result,
         result = async {
             match &mut adapter {
                 Some(adapter) => adapter.run(&daemon).await,
@@ -193,7 +195,9 @@ where
     result.and(shutdown_result)
 }
 
-async fn run_configured(
+/// Static mode hands every configured peer (numeric, DNS, or named zone) to
+/// the static driver; discovery mode connects to offered modems.
+async fn run(
     daemon: &RouterDaemon,
     events: &mut Receiver<DaemonEvent>,
     mode: DiscoveryMode,
@@ -201,61 +205,36 @@ async fn run_configured(
     names: &[NamedPeer],
     scoped: &[ScopedPeer],
 ) -> Result<()> {
-    if matches!(mode, DiscoveryMode::Static) && (!names.is_empty() || !scoped.is_empty()) {
-        static_peers::run(daemon, events, addresses, names, scoped).await;
-        Ok(())
-    } else {
-        run(daemon, events, mode, addresses).await
-    }
-}
-
-async fn run(
-    daemon: &RouterDaemon,
-    events: &mut Receiver<DaemonEvent>,
-    mode: DiscoveryMode,
-    static_peers: &[SocketAddr],
-) -> Result<()> {
     match mode {
         DiscoveryMode::Static => {
             anyhow::ensure!(
-                !static_peers.is_empty(),
+                !(addresses.is_empty() && names.is_empty() && scoped.is_empty()),
                 "mode = \"static\" requires at least one entry in static_peers"
             );
+            static_peers::run(daemon, events, addresses, names, scoped).await;
         }
         DiscoveryMode::Discovery => {
             daemon
                 .start_discovery()
                 .await
                 .context("starting discovery")?;
+            run_event_loop(daemon, events).await;
         }
     }
-
-    let peers = if matches!(mode, DiscoveryMode::Static) {
-        static_peers
-    } else {
-        &[]
-    };
-    run_event_loop(daemon, events, peers).await;
     Ok(())
 }
 
-/// Connect to modems as discovery finds them,
+/// Discovery mode: connect to modems as discovery finds them,
 /// log session lifecycle, and re-dial peers whose session dropped.
 ///
 /// `connected` tracks registered sessions; `attempts` reserves endpoints while
 /// TCP/TLS is pending, so discovery and retries cannot dial a modem twice.
 /// A dropped peer is removed from it — without that, the dedup check would
 /// permanently suppress re-connection to a modem that restarted.
-async fn run_event_loop(
-    daemon: &RouterDaemon,
-    events: &mut Receiver<DaemonEvent>,
-    static_peers: &[SocketAddr],
-) {
-    let pinned: HashSet<_> = static_peers.iter().copied().collect();
+async fn run_event_loop(daemon: &RouterDaemon, events: &mut Receiver<DaemonEvent>) {
     let mut connected: HashSet<SocketAddr> = HashSet::new();
     let mut reconnect = ReconnectQueue::default();
     let mut attempts = ConnectAttempts::default();
-    let mut startup: VecDeque<_> = static_peers.iter().copied().collect();
     let mut states = daemon.connection_states();
     let mut establishments = HashMap::new();
     let mut refresh = true;
@@ -266,12 +245,11 @@ async fn run_event_loop(
             let snapshot = states.borrow_and_update().clone();
             prune_reconnect_state(
                 &snapshot,
-                &pinned,
                 &mut establishments,
                 &mut connected,
                 &mut reconnect,
             );
-            attempts.retain_retries(|peer| snapshot.contains_key(peer) || pinned.contains(peer));
+            attempts.retain_retries(|peer| snapshot.contains_key(peer));
             reconcile_connections(
                 &snapshot,
                 &mut establishments,
@@ -286,18 +264,6 @@ async fn run_event_loop(
         for peer in attempts.endpoints() {
             reconnect.suspend(peer);
         }
-        let mut startup_capacity = attempts.capacity().min(daemon.connection_capacity());
-        while startup_capacity > 0 {
-            let Some(peer) = startup.pop_front() else {
-                break;
-            };
-            if !connected.contains(&peer)
-                && !reconnect.contains(&peer)
-                && attempts.start_static(daemon, peer)
-            {
-                startup_capacity -= 1;
-            }
-        }
         // Leave excess due peers queued without advancing their attempt count.
         // A full pool waits for completion rather than spinning on past deadlines.
         let next_due = if attempts.capacity() > 0 && daemon.connection_capacity() > 0 {
@@ -307,7 +273,7 @@ async fn run_event_loop(
         };
         let retry_tick = async move {
             match next_due {
-                Some(at) => tokio::time::sleep_until(at.into()).await,
+                Some(at) => tokio::time::sleep_until(at).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -342,7 +308,7 @@ async fn run_event_loop(
                     reconnect.suspend(&peer);
                     if connected.contains(&peer) || attempts.contains(&peer) { continue; }
                     tracing::info!(addr = %peer, "reconnecting to modem");
-                    attempts.start_static(daemon, peer);
+                    attempts.start_retry(daemon, peer);
                 }
             }
             evt = events.recv() => match evt {
@@ -374,11 +340,9 @@ async fn run_event_loop(
     }
 }
 
-/// Expiry/eviction is authoritative for discovered peers. Static endpoints
-/// with no successful TCP connection still need retry state outside the snapshot.
+/// Expiry/eviction is authoritative for discovered peers.
 fn prune_reconnect_state(
     states: &HashMap<SocketAddr, PeerConnectionState>,
-    pinned: &HashSet<SocketAddr>,
     establishments: &mut HashMap<SocketAddr, u64>,
     connected: &mut HashSet<SocketAddr>,
     reconnect: &mut ReconnectQueue,
@@ -387,7 +351,7 @@ fn prune_reconnect_state(
     connected.retain(|peer| states.contains_key(peer));
     reconnect
         .entries
-        .retain(|peer, _| states.contains_key(peer) || pinned.contains(peer));
+        .retain(|peer, _| states.contains_key(peer));
 }
 
 /// Reconcile retained state, never replay potentially stale broadcast events.
@@ -423,13 +387,22 @@ const RECONNECT_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// Peers whose session dropped and that we intend to dial again, each with an
-/// exponentially-growing delay.
+/// exponentially-growing delay. Discovery keys retries by endpoint; the static
+/// driver keys them by configured peer, so both modes share one backoff policy.
 ///
 /// The clock is passed in rather than read from `Instant::now()` internally so
 /// the scheduling logic is unit-testable without sleeping.
-#[derive(Debug, Default)]
-struct ReconnectQueue {
-    entries: HashMap<SocketAddr, ReconnectEntry>,
+#[derive(Debug)]
+struct ReconnectQueue<K = SocketAddr> {
+    entries: HashMap<K, ReconnectEntry>,
+}
+
+impl<K> Default for ReconnectQueue<K> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -440,43 +413,43 @@ struct ReconnectEntry {
     due: Option<Instant>,
 }
 
-impl ReconnectQueue {
-    /// `attempts` = retries already made; 0 yields the base delay.
-    fn backoff_for(attempts: u32) -> Duration {
-        // `checked_shl`-free: cap the shift before it can overflow, then clamp.
-        let shift = attempts.min(16);
-        RECONNECT_BASE
-            .saturating_mul(1u32 << shift)
-            .min(RECONNECT_MAX)
-    }
+/// `attempts` = retries already made; 0 yields the base delay.
+fn backoff_for(attempts: u32) -> Duration {
+    // `checked_shl`-free: cap the shift before it can overflow, then clamp.
+    let shift = attempts.min(16);
+    RECONNECT_BASE
+        .saturating_mul(1u32 << shift)
+        .min(RECONNECT_MAX)
+}
 
+impl<K: Copy + Ord + Hash> ReconnectQueue<K> {
     /// Queue a dropped peer. A peer already queued keeps its accumulated
     /// backoff, so a flapping modem cannot rewind itself to the base delay by
     /// dropping repeatedly. A failed initialization resumes the retained
     /// backoff from the time connection failure or session closure is observed.
-    fn schedule(&mut self, addr: SocketAddr, now: Instant) {
+    fn schedule(&mut self, addr: K, now: Instant) {
         self.entries
             .entry(addr)
             .and_modify(|entry| {
                 if entry.due.is_none() {
-                    entry.due = Some(now + Self::backoff_for(entry.attempts));
+                    entry.due = Some(now + backoff_for(entry.attempts));
                 }
             })
             .or_insert_with(|| ReconnectEntry {
                 attempts: 0,
-                due: Some(now + Self::backoff_for(0)),
+                due: Some(now + backoff_for(0)),
             });
     }
 
     #[cfg(test)]
-    fn take_due(&mut self, now: Instant) -> Vec<SocketAddr> {
+    fn take_due(&mut self, now: Instant) -> Vec<K> {
         self.take_due_limited(now, usize::MAX)
     }
 
     /// Hand out the oldest due peers up to available capacity. The caller
     /// suspends their deadlines while connecting, then schedules failed
     /// attempts from completion time. Only SessionUp clears their history.
-    fn take_due_limited(&mut self, now: Instant, limit: usize) -> Vec<SocketAddr> {
+    fn take_due_limited(&mut self, now: Instant, limit: usize) -> Vec<K> {
         let mut due: Vec<_> = self
             .entries
             .iter()
@@ -489,7 +462,7 @@ impl ReconnectQueue {
             .map(|(_, addr)| {
                 let entry = self.entries.get_mut(&addr).unwrap();
                 entry.attempts = entry.attempts.saturating_add(1);
-                entry.due = Some(now + Self::backoff_for(entry.attempts));
+                entry.due = Some(now + backoff_for(entry.attempts));
                 addr
             })
             .collect()
@@ -497,18 +470,18 @@ impl ReconnectQueue {
 
     /// Stop retrying a peer — call on `SessionUp` so the next drop starts a
     /// fresh backoff sequence.
-    fn forget(&mut self, addr: &SocketAddr) {
+    fn forget(&mut self, addr: &K) {
         self.entries.remove(addr);
     }
 
     /// Retain attempts without a runnable deadline during initialization.
-    fn suspend(&mut self, addr: &SocketAddr) {
+    fn suspend(&mut self, addr: &K) {
         if let Some(entry) = self.entries.get_mut(addr) {
             entry.due = None;
         }
     }
 
-    fn contains(&self, addr: &SocketAddr) -> bool {
+    fn contains(&self, addr: &K) -> bool {
         self.entries.contains_key(addr)
     }
 
@@ -583,31 +556,25 @@ mod tests {
     }
 
     #[test]
-    fn eviction_bounds_all_retry_maps_and_preserves_static_peers_without_snapshots() {
+    fn eviction_bounds_all_retry_maps() {
+        // Configured static peers live in the static driver; discovery retry
+        // state follows the snapshot and never outlives an evicted endpoint.
         let now = Instant::now();
         let mut reconnect = ReconnectQueue::default();
         let mut seen = HashMap::new();
         let mut connected = HashSet::new();
-        let pinned = HashSet::from([addr(1)]);
-        reconnect.schedule(addr(1), now);
         for port in 2..1002 {
             let peer = SocketAddr::from(([192, 0, 2, 2], port));
             let states = HashMap::from([(peer, PeerConnectionState::default())]);
-            prune_reconnect_state(&states, &pinned, &mut seen, &mut connected, &mut reconnect);
+            prune_reconnect_state(&states, &mut seen, &mut connected, &mut reconnect);
             reconcile_connections(&states, &mut seen, &mut connected, &mut reconnect, now);
             assert_eq!(seen.len(), 1);
-            assert_eq!(reconnect.entries.len(), 2);
-            assert!(reconnect.contains(&addr(1)));
+            assert_eq!(reconnect.entries.len(), 1);
+            assert!(reconnect.contains(&peer));
         }
-        prune_reconnect_state(
-            &HashMap::new(),
-            &pinned,
-            &mut seen,
-            &mut connected,
-            &mut reconnect,
-        );
+        prune_reconnect_state(&HashMap::new(), &mut seen, &mut connected, &mut reconnect);
         assert!(seen.is_empty() && connected.is_empty());
-        assert_eq!(reconnect.take_due(now + RECONNECT_BASE), vec![addr(1)]);
+        assert!(reconnect.entries.is_empty());
     }
 
     #[test]
@@ -782,13 +749,13 @@ mod tests {
 
     #[test]
     fn backoff_doubles_from_base_and_saturates_at_cap() {
-        assert_eq!(ReconnectQueue::backoff_for(0), RECONNECT_BASE);
-        assert_eq!(ReconnectQueue::backoff_for(1), Duration::from_secs(2));
-        assert_eq!(ReconnectQueue::backoff_for(2), Duration::from_secs(4));
-        assert_eq!(ReconnectQueue::backoff_for(3), Duration::from_secs(8));
+        assert_eq!(backoff_for(0), RECONNECT_BASE);
+        assert_eq!(backoff_for(1), Duration::from_secs(2));
+        assert_eq!(backoff_for(2), Duration::from_secs(4));
+        assert_eq!(backoff_for(3), Duration::from_secs(8));
         // Far past the cap, and past what shifting a u32 could hold.
-        assert_eq!(ReconnectQueue::backoff_for(50), RECONNECT_MAX);
-        assert_eq!(ReconnectQueue::backoff_for(u32::MAX), RECONNECT_MAX);
+        assert_eq!(backoff_for(50), RECONNECT_MAX);
+        assert_eq!(backoff_for(u32::MAX), RECONNECT_MAX);
     }
 
     #[test]
@@ -956,7 +923,16 @@ mod reconnect_runtime_tests {
         let driver_daemon = daemon.clone();
         let mut events = daemon.subscribe();
         let driver = tokio::spawn(async move {
-            run_event_loop(&driver_daemon, &mut driver_daemon.subscribe(), &peers).await;
+            run(
+                &driver_daemon,
+                &mut driver_daemon.subscribe(),
+                DiscoveryMode::Static,
+                &peers,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
         });
         let (mut peer, _) = timeout(WAIT, first.accept()).await.unwrap().unwrap();
         initialize(&mut peer, false).await;
@@ -1009,7 +985,7 @@ mod reconnect_runtime_tests {
         let driver_daemon = daemon.clone();
         let (offers, mut event_feed) = tokio::sync::broadcast::channel(16);
         let driver = tokio::spawn(async move {
-            run_event_loop(&driver_daemon, &mut event_feed, &[]).await;
+            run_event_loop(&driver_daemon, &mut event_feed).await;
         });
         drop(listener);
         drop(peer);
@@ -1169,11 +1145,13 @@ mod reconnect_runtime_tests {
                     &mut events,
                     DiscoveryMode::Static,
                     &[slow_addr, healthy],
+                    &[],
+                    &[],
                 )
                 .await
                 .unwrap();
             } else {
-                run_event_loop(&driver, &mut events, &[]).await;
+                run_event_loop(&driver, &mut events).await;
             }
         });
         if !static_mode {
@@ -1272,9 +1250,16 @@ mod reconnect_runtime_tests {
         let mut events = daemon.subscribe();
         let driver = daemon.clone();
         let task = tokio::spawn(async move {
-            run(&driver, &mut events, DiscoveryMode::Static, &peers)
-                .await
-                .unwrap();
+            run(
+                &driver,
+                &mut events,
+                DiscoveryMode::Static,
+                &peers,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
         });
         let mut sockets = Vec::new();
         for listener in &listeners[..connect::MAX_CONNECT_ATTEMPTS] {
@@ -1314,9 +1299,16 @@ mod reconnect_runtime_tests {
         let driver = daemon.clone();
         let started = Instant::now();
         let task = tokio::spawn(async move {
-            run(&driver, &mut events, DiscoveryMode::Static, &[addr])
-                .await
-                .unwrap();
+            run(
+                &driver,
+                &mut events,
+                DiscoveryMode::Static,
+                &[addr],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         let listener = TcpListener::bind(addr).await.unwrap();
@@ -1374,7 +1366,7 @@ mod reconnect_runtime_tests {
         let driver = daemon.clone();
         let started = Instant::now();
         tasks.spawn(async move {
-            run_event_loop(&driver, &mut events, &[]).await;
+            run_event_loop(&driver, &mut events).await;
         });
         let (peer, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
         assert!(started.elapsed() >= RECONNECT_BASE - Duration::from_millis(100));
@@ -1432,7 +1424,7 @@ mod reconnect_runtime_tests {
         });
         let driver = daemon.clone();
         tasks.spawn(async move {
-            run_event_loop(&driver, &mut events, &[]).await;
+            run_event_loop(&driver, &mut events).await;
         });
 
         daemon.connect_static(addr).await.unwrap();
