@@ -131,6 +131,13 @@ impl DiscoverySocket {
         let bind_addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, params.port).into();
         sock.bind(&bind_addr.into())?;
         if params.join_group {
+            // XNU's IP_ADD_MEMBERSHIP reads ip_mreq, even when passed the
+            // longer ip_mreqn. Its trailing interface index is ignored; an
+            // unspecified address can join a route-selected interface instead.
+            // Use the resolved IPv4 address so membership follows our selection.
+            #[cfg(target_os = "macos")]
+            sock.join_multicast_v4(&params.group_v4, &address)?;
+            #[cfg(not(target_os = "macos"))]
             if let Some(interface) = interface {
                 sock.join_multicast_v4_n(
                     &params.group_v4,

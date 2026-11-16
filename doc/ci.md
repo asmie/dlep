@@ -40,21 +40,26 @@ and rejection of strict TCP enforcement until explicitly disabled. This is
 experimental macOS support; it does not validate physical-link multicast,
 adapters, or strict TCP GTSM reset monitoring. The original seven loopback cases
 passed natively for `43f0ffd` in [CI](https://github.com/asmie/dlep/actions/runs/43921858827).
-The IPv4 multicast/reply-source case added with the FreeBSD port awaits the next
-native run. This job also checks the launchd service definitions with
+The IPv4 multicast/reply-source case added with the FreeBSD port timed out for
+`e45c057` in [CI](https://github.com/asmie/dlep/actions/runs/43944207775), while the
+original seven cases still passed. XNU reads `ip_mreq` for `IP_ADD_MEMBERSHIP`
+and ignores `ip_mreqn`'s trailing interface index. The fix joins by resolved
+interface address; this case stays enabled and requires a native rerun before
+0.3.0. This job also checks the launchd service definitions with
 `plutil -lint`; it does not load them into the runner's service manager.
 
 The FreeBSD job uses a VM action pinned to commit
 `811efaaac0668df8bfb8308c3ec997b5ab50037b`, running FreeBSD 15.1. It installs Rust
 and native build tools, copies the checkout into a temporary work directory,
 and runs checks as an ordinary user. It tests the portable protocol crates,
-builds workspace libraries/commands, and runs `portable_transport`, including
+checks workspace libraries/commands, and runs `portable_transport`, including
 IPv4 multicast destination-to-unicast address recovery and reply-source checks.
 The strict default must fail explicitly, and the opt-out keeps outbound TTL/hop
-limit and inbound UDP checks. Native FreeBSD results are pending. Local cross
-type-checks bypass native crypto compilation in a temporary copy and are not
-native build/runtime evidence. Other BSD variants and physical-link multicast
-are outside this job's scope. The VM also validates both rc.d scripts with
+limit and inbound UDP checks. These checks, including all eight transport
+cases, passed natively for `e45c057` in
+[CI](https://github.com/asmie/dlep/actions/runs/43944207775).
+Other BSD variants and physical-link multicast are outside this job's scope.
+The VM also validates both rc.d scripts with
 `/bin/sh -n`; native service lifecycle behavior remains unverified.
 
 ## Release validation

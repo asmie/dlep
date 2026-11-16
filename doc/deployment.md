@@ -54,6 +54,10 @@ below apply only to Linux.
 Discovery uses `IP_PKTINFO` to retain the ingress interface and selects a usable
 IPv4 address on that interface because Darwin leaves `ipi_spec_dst` empty.
 Selected IPv4 egress uses `IP_BOUND_IF` plus the preferred source address;
+group membership uses the resolved interface address. XNU reads `ip_mreq` for
+`IP_ADD_MEMBERSHIP` and ignores the trailing interface index in `ip_mreqn`;
+passing an unspecified address can select another interface through routing.
+See Apple's [multicast membership implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_mcast.c).
 IPv6 retains scoped packet information. Apple reports IPv4 TTL as one byte and
 IPv6 hop limit as an integer; both are required and checked before decoding.
 See Apple's [receive control-message implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/ip_input.c)
@@ -63,7 +67,9 @@ Native macOS CI builds the workspace commands and runs unprivileged
 IPv4/IPv6 plaintext/TLS sessions, destination delivery, and discovery unicast
 metadata checks. Those checks passed for `43f0ffd` in
 [CI](https://github.com/asmie/dlep/actions/runs/43921858827). Physical-link
-multicast and strict TCP reset monitoring remain follow-up work.
+multicast and strict TCP reset monitoring remain follow-up work. The added
+multicast/reply-source case timed out for `e45c057`; the interface-address
+membership correction awaits a native rerun and remains a 0.3.0 release gate.
 
 ### FreeBSD transport
 
@@ -90,12 +96,12 @@ IPv4 TTL, so no unsupported IPv4 option is applied to IPv6 TCP sockets. See
 FreeBSD's [IPv4 socket interface](https://github.com/freebsd/freebsd-src/blob/main/share/man/man4/ip.4)
 and [IPv6 socket options](https://github.com/freebsd/freebsd-src/blob/main/sys/netinet6/ip6_output.c).
 
-The new FreeBSD 15.1 VM job builds all workspace libraries/commands, tests the
+The FreeBSD 15.1 VM job checks all workspace libraries/commands, tests the
 portable protocol crates, and runs unprivileged loopback TCP/TLS and discovery
-metadata cases. Native FreeBSD results are pending until this change is pushed.
-Local Rust type-checks bypass native crypto compilation in an isolated temporary
-copy; they do not establish native build/runtime support. Physical-link multicast,
-strict TCP reset monitoring, and other BSD variants remain outside this evidence.
+metadata cases. These checks and all eight transport cases passed natively for
+`e45c057` in [CI](https://github.com/asmie/dlep/actions/runs/43944207775).
+Physical-link multicast, strict TCP reset monitoring, and other BSD variants
+remain outside this evidence.
 
 ### Shell completions
 

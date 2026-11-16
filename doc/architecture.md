@@ -601,8 +601,10 @@ Simultaneous IPv4/IPv6 discovery is complete in chunk 78. The remaining larger
 scope follow-up is full non-Linux daemon transport. Chunk 79 adds an experimental
 macOS path with explicit TCP enforcement opt-out; native build/loopback checks
 passed for `43f0ffd`. Chunk 82 adds an experimental FreeBSD path with native
-checks pending. Strict TCP monitoring on these platforms and other operating
-systems remains open. Physical-link multicast needs native deployment evidence.
+checks passed for `e45c057`. Chunk 85 corrects macOS IPv4 multicast membership;
+its native regression rerun remains a release gate. Strict TCP monitoring on
+these platforms and other operating systems remains open. Physical-link
+multicast needs native deployment evidence.
 Chunk 83 adds native service definitions for both experimental platforms;
 service-manager lifecycle validation remains pending.
 Chunk 84 adds opt-in JSON logging for both standalone roles and the launcher.
@@ -1580,17 +1582,18 @@ The order of work was:
     smoke scenarios verify named/numeric aliases do not open duplicate sessions
     before or after modem restart.
 
-82. Experimental FreeBSD transport. **Implemented; native validation pending** —
+82. Experimental FreeBSD transport. **Done for the opt-out path** —
     the explicit TCP GTSM opt-out now permits the FreeBSD transport path. IPv4
     discovery uses `IP_RECVIF`/`IP_RECVDSTADDR`, restores usable unicast local
     addresses after multicast probes, and selects replies with `IP_SENDSRCADDR`.
     IPv6 TCP sets hop limits without unsupported IPv4 options. Missing metadata
-    is rejected before signal decoding. A pinned FreeBSD 15.1 VM job builds
+    is rejected before signal decoding. A pinned FreeBSD 15.1 VM job checks
     production targets and runs portable protocol and loopback cases as an
     ordinary user. A shared multicast/reply-source case accompanies existing
-    IPv4/IPv6 TCP/TLS, TTL, and interface checks. Rust cross-checking bypasses
-    native crypto compilation in an isolated temporary copy; native FreeBSD
-    results and physical-link behavior remain unverified until native execution.
+    IPv4/IPv6 TCP/TLS, TTL, and interface checks. Protocol tests, production
+    target checks, and all eight native transport cases passed for `e45c057` in
+    [CI](https://github.com/asmie/dlep/actions/runs/43944207775).
+    Physical-link behavior and strict TCP monitoring remain outside that evidence.
 
 83. Native service definitions. **Implemented; native lifecycle validation pending** —
     both roles have macOS launchd and FreeBSD rc.d definitions, using a dedicated
@@ -1610,6 +1613,16 @@ The order of work was:
     to both formats. Help, configuration checks, and stderr diagnostics retain
     their formats. Release smoke exercises both CLI/environment paths, generated
     completions, JSON records during mutual-TLS sessions, and SIGTERM shutdown.
+
+85. macOS multicast membership correction. **Implemented; native rerun pending** —
+    the added multicast/reply-source case timed out in native CI for `e45c057`.
+    XNU's `IP_ADD_MEMBERSHIP` handler reads `ip_mreq` and ignores the trailing
+    interface index in `ip_mreqn`, allowing an unspecified address to select
+    another interface through routing. macOS now joins using the resolved
+    interface address. Linux/FreeBSD retain indexed membership. The regression
+    remains enabled with its original timeout; a passing native rerun is required
+    before 0.3.0. All other jobs in the `e45c057` CI run passed, including the
+    first native FreeBSD transport job.
 
 ---
 

@@ -2,7 +2,8 @@
 
 Linux router daemon for DLEP (RFC 8175), with discovery, TLS, and reconnect support.
 Experimental macOS/FreeBSD transport requires `[network].gtsm_enforce = false`.
-Native macOS loopback checks passed; native FreeBSD validation is pending.
+Native FreeBSD transport checks passed. The original macOS loopback checks passed;
+its multicast membership fix awaits a native rerun.
 
 Requires Rust 1.85 or newer.
 

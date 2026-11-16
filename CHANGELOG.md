@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed macOS IPv4 multicast group membership to use the resolved interface
+  address. XNU ignores the trailing interface index in an `ip_mreqn` membership
+  request, which could join another interface and leave selected-interface
+  discovery waiting indefinitely. The existing multicast/reply-source regression
+  remains enabled; native validation of this fix is pending.
 - Added `--log-format text|json` and `DLEP_LOG_FORMAT` to both daemons and the
   combined launcher. JSON tracing records are emitted one per line on stdout,
   with typed event fields, timestamps, levels, and targets. Text remains the
@@ -19,8 +24,9 @@
   probes, and selects reply sources with `IP_SENDSRCADDR`. IPv6 TCP configures
   outbound hop limits without applying unsupported IPv4 socket options.
   Strict TCP enforcement remains Linux-only. A pinned FreeBSD VM CI job adds
-  native build and unprivileged loopback checks; native FreeBSD results are
-  pending. Native macOS checks have now passed for `43f0ffd`.
+  native build and unprivileged loopback checks, which passed for `e45c057`.
+  The original seven native macOS checks passed for `43f0ffd`; the later
+  multicast membership correction above awaits a native rerun.
 - Router CLI/configuration peers accept named IPv6 zones such as
   `[fe80::1%eth0]:854`. Every connection attempt resolves the interface afresh,
   preserving reconnect backoff and endpoint deduplication. TLS verifies the
