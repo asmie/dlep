@@ -109,6 +109,25 @@ def main():
             seeds['session_sequence'][f'structured-{mode}-{name}'] = bytes([mode]) + b''.join(
                 bytes([op]) + data for op, data in commands)
 
+    delayed = {
+        'metrics-held-ack': [(0x45, normal), (0x47, payload(value=2000)),
+            (0x4d, None), (0x4c, None), (0x4e, None)],
+        'desired-addresses': [(0x46, normal), (0x46, payload(number=2)),
+            (0x46, clear), (0x4d, None), (0x4c, None), (0x4e, None)],
+        'pending-destination-up': [(1, normal), (3, payload(value=2000)),
+            (0x40, payload(number=2)), (0x4d, None), (0x4c, None), (0x4e, None)],
+        'withdraw-and-announce': [(1, normal), (0x4e, None), (0x82, normal),
+            (0x4c, None), (3, payload(value=2000)), (0x4d, None),
+            (0xc2, payload(mask=3)), (0x4e, None)],
+        'link-with-delayed-update': [(1, normal), (0x4e, None),
+            (0xc3, payload(flags=7)), (0x4c, None), (3, payload(value=2000)),
+            (0x44, normal), (0x4d, None), (0x4e, None)],
+    }
+    for mode in [37, 39, 45, 47, 61, 63]:
+        for name, commands in delayed.items():
+            seeds['session_sequence'][f'delayed-{mode}-{name}'] = bytes([mode]) + b''.join(
+                bytes([op]) + (data or b'') for op, data in commands)
+
     for target, inputs in seeds.items():
         root = Path("fuzz/corpus") / target
         root.mkdir(parents=True, exist_ok=True)

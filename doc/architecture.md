@@ -1308,6 +1308,16 @@ The order of work was:
     link completion under both MAC formats; CI runs it before fuzzing. No
     production behavior changes are needed for this validation expansion.
 
+68. Delayed session delivery fuzzing. **Done** — the session harness queues
+    encoded messages independently in each direction and can deliver one or
+    drain both on command. FIFO order is retained within a direction, while
+    application commands exercise busy transactions before acknowledgements
+    arrive. Thirty added seeds cover queued metrics, desired addresses, pending
+    Destination Up, withdrawal/Announce, and deferred link replies. A focused test
+    requires latest metric/address convergence and ordered destination updates
+    under both MAC formats. Existing immediate-delivery seeds remain supported.
+    The model does not simulate socket timing, packet loss, or reconnection.
+
 ---
 
 ## 10. Open questions / risks

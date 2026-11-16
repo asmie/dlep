@@ -53,6 +53,9 @@ jobs:
       - name: Verify structured session inputs reach protocol outcomes
         if: matrix.target == 'session_sequence'
         run: cargo test --manifest-path fuzz/Cargo.toml --test structured_sessions --locked --offline
+      - name: Verify delayed delivery and acknowledgement handling
+        if: matrix.target == 'session_sequence'
+        run: cargo test --manifest-path fuzz/Cargo.toml --test delayed_sessions --locked --offline
       - name: Run bounded AddressSanitizer fuzzing
         env:
           CARGO_NET_OFFLINE: 'true'

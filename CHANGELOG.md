@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Session fuzzing can now hold encoded peer messages and deliver them later in
+  each direction's original order. New seeds and harness checks exercise metric
+  coalescing, desired-address corrections, pending destination changes, and link
+  replies while acknowledgements remain queued.
 - Session fuzzing now generates structured metrics, IPv4/IPv6 address changes,
   Announce hints, and link-characteristic requests/replies, including deferred
   replies and invalid command recovery. A harness test verifies that generated

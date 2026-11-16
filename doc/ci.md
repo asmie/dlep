@@ -514,6 +514,12 @@ Configuration selects optional metric support and deferred replies; invalid
 percentages and duration overflow exercise command rejection. CI first runs a
 focused harness test requiring actual address updates and successful deferred
 link completion for both MAC formats, then executes the session fuzz run.
+Queued-delivery mode holds encoded messages in separate ordered directions,
+allowing commands while replies remain pending. Payload-free controls deliver
+one message or drain the queues, and every input drains at completion. A second
+harness test requires metric/address coalescing behind held acknowledgements
+and destination-update ordering for both MAC formats. This models FSM event
+ordering; socket timing and packet loss remain outside the target.
 `discovery_sequence` adds raw-signal injection and real request/offer exchanges
 through both discovery FSMs, including timers and restarts. It checks emitted
 signal serialization, reply targets, usable and unique endpoints, TLS/IPv6

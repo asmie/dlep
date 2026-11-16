@@ -31,7 +31,7 @@ limit includes an eight-byte signal header plus the largest 16-bit body.
 `session_sequence` runs the synchronous router and modem FSMs together. Its
 first byte selects EUI-48/EUI-64 (bit 1), real versus incomplete initialization
 (bit 0), structured payloads (bit 2), optional metric support (bit 3), and deferred
-link replies (bit 4). Up to 64 following operations select a recipient
+link replies (bit 4), and queued wire delivery (bit 5). Up to 64 following operations select a recipient
 (bit 7), a destination number (bits 4–5), and an operation (bits 0–3):
 
 | Code | Event |
@@ -42,8 +42,9 @@ link replies (bit 4). Up to 64 following operations select a recipient
 | 8–11 | Heartbeat, missed-heartbeat, initialization, or termination timer |
 | 12–15 | Shutdown, TCP close, protocol error, or consumed extension message |
 
-Each action batch checks that emitted messages encode and decode, then delivers
-them to the other FSM. A 128-batch budget detects response loops. Inputs stop at
+Each action batch checks that emitted messages encode and decode, then queues
+them for the other FSM. Basic mode drains the queues immediately. A 256-round
+budget (up to two messages per round) detects response loops. Inputs stop at
 64 operations, including after closure. Basic modes 0–3 keep the original
 default metrics and empty addresses. This checks panic freedom, message serialization, and bounded
 responses. It does not assert complete protocol semantics or fuzz transports,
@@ -57,6 +58,15 @@ addresses, 7 queued metrics, 8 defaults, 9 destination add, 10 destination metri
 and 11 destination drop. Other extended codes fall back to the basic operation.
 Raw-message injection retains its two-byte length format when bit 6 is clear.
 Basic add/update/defaults/queue/address commands also use the payload values.
+
+When both structured payloads and queued delivery are enabled, extended codes
+12, 13, and 14 are payload-free controls: deliver one router-to-modem message,
+deliver one modem-to-router message, or drain both queues. Direction queues
+preserve wire order, while application events may run before acknowledgement
+delivery. Initialization completes immediately when requested by mode bit 0,
+and every input ends by draining remaining messages. Delivery on an empty queue
+is a no-op. These queues model FSM event ordering, without simulating TCP
+timing, packet loss, connection re-establishment, or runtime socket cleanup.
 
 | Payload bytes | Meaning |
 | --- | --- |
@@ -76,8 +86,13 @@ rejection paths; valid payloads reach real protocol transactions. The focused
 with both MAC formats. CI runs it before the session fuzz target. Run locally:
 
 ```sh
-cargo test --manifest-path fuzz/Cargo.toml --test structured_sessions --locked --offline
+cargo test --manifest-path fuzz/Cargo.toml --test structured_sessions --test delayed_sessions --locked --offline
 ```
+
+The delayed-delivery test requires held acknowledgements to release coalesced
+metrics and desired addresses, while destination updates retain their order.
+Both MAC formats must reach the latest router state. CI runs both harness tests
+before the session fuzz target.
 
 `discovery_sequence` drives the router and modem discovery FSMs without sockets.
 The mode byte selects IPv4/IPv6 source (bit 0), IPv4/IPv6 advertised endpoint
@@ -110,7 +125,7 @@ accept a truncated frame. The 65,545-byte limit covers two selectors, a maximum
 The reference stops at the first malformed frame, matching the transport's
 failure behavior. It does not exercise socket I/O, TLS, or async backpressure.
 
-The seed generator writes 19 codec, 130 session, 184 discovery, and 90 framing starting inputs, covering
+The seed generator writes 19 codec, 160 session, 184 discovery, and 90 framing starting inputs, covering
 initialization, destination lifecycle, unknown items, duplicates, truncation,
 invalid prefixes/UTF-8, maximum body lengths, both MAC formats, and teardown.
 Discovery seeds include default ports, interleaved equivalent connection points,
@@ -120,6 +135,9 @@ headers/bodies, malformed messages between valid frames, and maximum lengths.
 Thirty structured session seeds cover address replacement/removal, Announce
 hints, grants/denials, invalid inputs followed by valid reports, optional metric
 support, both MAC formats, and deferred versus immediate link replies.
+Thirty further delayed-delivery seeds exercise held session acknowledgements,
+desired-address replacement/clear, pending Destination Up, withdrawal/Announce,
+and link replies alongside queued metric updates.
 Generated corpora, artifacts, and builds are ignored. Rerunning the generator
 restores starting seeds and preserves newly discovered corpus entries.
 
