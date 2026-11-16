@@ -1,8 +1,8 @@
 # dlep-modem
 
 Linux modem daemon for DLEP (RFC 8175), with discovery, TLS, and graceful shutdown.
-Experimental macOS transport requires `[network].gtsm_enforce = false`;
-native macOS validation is pending.
+Experimental macOS/FreeBSD transport requires `[network].gtsm_enforce = false`.
+Native macOS loopback checks passed; native FreeBSD validation is pending.
 
 Requires Rust 1.85 or newer.
 

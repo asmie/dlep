@@ -108,7 +108,14 @@ impl DiscoverySocket {
         sock.set_nonblocking(true)?;
         gtsm::set_send_ttl(&sock, false)?;
         gtsm::enable_recv_ttl(&sock, false)?;
+        #[cfg(not(target_os = "freebsd"))]
         nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)?;
+        #[cfg(target_os = "freebsd")]
+        {
+            use nix::sys::socket::{setsockopt, sockopt};
+            setsockopt(&sock, sockopt::Ipv4RecvIf, &true)?;
+            setsockopt(&sock, sockopt::Ipv4RecvDstAddr, &true)?;
+        }
         sock.set_multicast_loop_v4(params.multicast_loop)?;
         sock.set_multicast_if_v4(&address)?;
         // Darwin gives pktinfo's interface precedence over its source address.
@@ -241,6 +248,7 @@ impl DiscoverySocket {
         send_datagram(&self.fd, &bytes, |fd, bytes| {
             use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg};
             let nix_addr = SockaddrStorage::from(dest);
+            #[cfg(not(target_os = "freebsd"))]
             let info = self.interface.map(|i| nix::libc::in_pktinfo {
                 #[cfg(not(target_os = "macos"))]
                 ipi_ifindex: i.index as _,
@@ -251,6 +259,10 @@ impl DiscoverySocket {
                 },
                 ipi_addr: nix::libc::in_addr { s_addr: 0 },
             });
+            #[cfg(target_os = "freebsd")]
+            let info = self.interface.map(|i| nix::libc::in_addr {
+                s_addr: u32::from_ne_bytes(i.address.octets()),
+            });
             let info_v6 = self.interface_v6.and_then(|i| {
                 Some(nix::libc::in6_pktinfo {
                     ipi6_ifindex: ifindex_to_pktinfo(i.index)?,
@@ -259,9 +271,11 @@ impl DiscoverySocket {
                     },
                 })
             });
-            let controls: Vec<_> = info
-                .as_ref()
-                .map(ControlMessage::Ipv4PacketInfo)
+            #[cfg(not(target_os = "freebsd"))]
+            let v4_control = info.as_ref().map(ControlMessage::Ipv4PacketInfo);
+            #[cfg(target_os = "freebsd")]
+            let v4_control = info.as_ref().map(ControlMessage::Ipv4SendSrcAddr);
+            let controls: Vec<_> = v4_control
                 .into_iter()
                 .chain(info_v6.as_ref().map(ControlMessage::Ipv6PacketInfo))
                 .collect();
@@ -313,7 +327,15 @@ impl DiscoverySocket {
         // Linux reports IPv4 TTL as int; Darwin uses one byte in IP_RECVTTL.
         // IPv6 hop limits are int on both. Reserve the larger representation.
         let mut payload = [0u8; 1500];
+        #[cfg(not(target_os = "freebsd"))]
         let mut cmsg_space = nix::cmsg_space!(i32, nix::libc::in_pktinfo, nix::libc::in6_pktinfo);
+        #[cfg(target_os = "freebsd")]
+        let mut cmsg_space = nix::cmsg_space!(
+            i32,
+            nix::libc::sockaddr_dl,
+            nix::libc::in_addr,
+            nix::libc::in6_pktinfo
+        );
 
         loop {
             let mut guard = self.fd.readable().await?;
@@ -359,11 +381,20 @@ impl DiscoverySocket {
                     if let Some(value) = received_ttl(&cmsg) {
                         ttl = Some(value);
                     }
+                    #[cfg(not(target_os = "freebsd"))]
                     if let ControlMessageOwned::Ipv4PacketInfo(info) = cmsg {
                         local = Some(IpAddr::V4(Ipv4Addr::from(
                             info.ipi_spec_dst.s_addr.to_ne_bytes(),
                         )));
                         interface_index = Some(info.ipi_ifindex as u32);
+                    }
+                    #[cfg(target_os = "freebsd")]
+                    if let ControlMessageOwned::Ipv4RecvIf(info) = cmsg {
+                        interface_index = Some(u32::from(info.sdl_index));
+                    }
+                    #[cfg(target_os = "freebsd")]
+                    if let ControlMessageOwned::Ipv4RecvDstAddr(info) = cmsg {
+                        local = Some(IpAddr::V4(Ipv4Addr::from(info.s_addr.to_ne_bytes())));
                     }
                     if let ControlMessageOwned::Ipv6PacketInfo(info) = cmsg {
                         let index = ifindex_from_pktinfo(info.ipi6_ifindex);
@@ -411,12 +442,16 @@ impl DiscoverySocket {
                         tokio::task::yield_now().await;
                         continue;
                     }
-                    // Darwin's IPv4 pktinfo leaves ipi_spec_dst unspecified.
-                    // Resolve a usable unicast address on the actual ingress
-                    // interface, retaining the configured preference if any.
-                    #[cfg(target_os = "macos")]
+                    // Darwin leaves ipi_spec_dst empty; FreeBSD reports the
+                    // destination, which may be multicast. Resolve a usable
+                    // ingress unicast address, preserving a selected preference.
+                    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
                     let local = match local {
-                        Some(IpAddr::V4(addr)) if addr.is_unspecified() => {
+                        Some(IpAddr::V4(addr))
+                            if addr.is_unspecified()
+                                || addr.is_multicast()
+                                || addr.is_broadcast() =>
+                        {
                             Some(IpAddr::V4(match self.interface {
                                 Some(interface) => interface.address,
                                 None => {
@@ -431,6 +466,8 @@ impl DiscoverySocket {
                         }
                         other => other,
                     };
+                    let local = local
+                        .ok_or_else(|| io::Error::other("missing packet interface information"))?;
                     let buf = BytesMut::from(&payload[..bytes_read]);
                     let signal = self
                         .codec
@@ -440,9 +477,7 @@ impl DiscoverySocket {
                         signal,
                         from,
                         ttl,
-                        local_addr: local.ok_or_else(|| {
-                            io::Error::other("missing packet interface information")
-                        })?,
+                        local_addr: local,
                         interface_index,
                     });
                 }
@@ -458,8 +493,10 @@ fn received_ttl(cmsg: &nix::sys::socket::ControlMessageOwned) -> Option<u8> {
     match cmsg {
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
         ControlMessageOwned::Ipv6HopLimit(value) => u8::try_from(*value).ok(),
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         ControlMessageOwned::Ipv4Ttl(value) => u8::try_from(*value).ok(),
+        #[cfg(target_os = "freebsd")]
+        ControlMessageOwned::Ipv4Ttl(value) => Some(*value),
         // nix exposes Darwin's IP_RECVTTL message as Unknown. XNU sends the
         // one-byte IP header field, unlike Linux's int-valued IP_TTL message.
         #[cfg(target_os = "macos")]

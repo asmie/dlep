@@ -2,7 +2,7 @@
 
 `.github/workflows/ci.yml` runs formatting and workflow validation, clippy, a
 Linux workspace build/test, a Rust 1.85.0 check of all targets and features,
-macOS protocol/opt-out transport checks, and instrumented Linux tests. Cargo commands
+macOS/FreeBSD protocol and opt-out transport checks, and instrumented Linux tests. Cargo commands
 use the committed lockfile. Jobs have read-only repository permissions and
 deadlines; new pushes cancel obsolete runs for the same branch or pull request.
 
@@ -38,8 +38,22 @@ target. Those unprivileged loopback cases exercise IPv4/IPv6 plaintext and TLS
 sessions, destination delivery, UDP TTL/interface metadata, low-TTL filtering,
 and rejection of strict TCP enforcement until explicitly disabled. This is
 experimental macOS support; it does not validate physical-link multicast,
-adapters, or strict TCP GTSM reset monitoring. Native execution is pending for
-the first change enabling this job; Linux results are not macOS evidence.
+adapters, or strict TCP GTSM reset monitoring. The original seven loopback cases
+passed natively for `43f0ffd` in [CI](https://github.com/asmie/dlep/actions/runs/43921858827).
+The IPv4 multicast/reply-source case added with the FreeBSD port awaits the next
+native run.
+
+The FreeBSD job uses a VM action pinned to commit
+`811efaaac0668df8bfb8308c3ec997b5ab50037b`, running FreeBSD 15.1. It installs Rust
+and native build tools, copies the checkout into a temporary work directory,
+and runs checks as an ordinary user. It tests the portable protocol crates,
+builds workspace libraries/commands, and runs `portable_transport`, including
+IPv4 multicast destination-to-unicast address recovery and reply-source checks.
+The strict default must fail explicitly, and the opt-out keeps outbound TTL/hop
+limit and inbound UDP checks. Native FreeBSD results are pending. Local cross
+type-checks bypass native crypto compilation in a temporary copy and are not
+native build/runtime evidence. Other BSD variants and physical-link multicast
+are outside this job's scope.
 
 ## Release validation
 

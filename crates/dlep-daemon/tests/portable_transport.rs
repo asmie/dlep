@@ -1,4 +1,4 @@
-//! Unprivileged loopback coverage for the macOS transport path and Linux opt-out.
+//! Unprivileged loopback coverage for macOS/FreeBSD transport and Linux opt-out.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -146,6 +146,44 @@ async fn discovery_retains_ttl_local_address_and_ingress_interface_on_both_famil
         assert_eq!(received.local_addr, ip);
         assert_eq!(Some(received.interface_index), receiver.interface_index());
     }
+}
+
+#[tokio::test]
+async fn multicast_discovery_resolves_a_unicast_local_address_and_reply_source() {
+    let mut params = DiscoveryParams {
+        group_v4: dlep_core::DISCOVERY_IPV4_GROUP,
+        interface_v4: Ipv4Addr::LOCALHOST,
+        port: 0,
+        group_port: None,
+        multicast_loop: true,
+        join_group: true,
+    };
+    let receiver = DiscoverySocket::bind(&params).unwrap();
+    params.join_group = false;
+    params.group_port = Some(receiver.local_port());
+    let sender = DiscoverySocket::bind(&params).unwrap();
+    sender
+        .send_to_group(&Signal::new(SignalType::PEER_DISCOVERY))
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(3), receiver.recv_with_metadata())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(Some(received.interface_index), receiver.interface_index());
+    assert_eq!(received.ttl, 255);
+    receiver
+        .send_unicast(&Signal::new(SignalType::PEER_OFFER), received.from)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(3), sender.recv_with_metadata())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(reply.signal.signal_type, SignalType::PEER_OFFER);
+    assert_eq!(reply.ttl, 255);
 }
 
 #[tokio::test]

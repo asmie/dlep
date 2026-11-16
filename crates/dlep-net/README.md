@@ -1,11 +1,13 @@
 # dlep-net
 
 UDP discovery, TCP/TLS transport, framing, and GTSM for DLEP (RFC 8175).
-Linux strict TCP reset monitoring requires CAP_NET_RAW. Experimental macOS
+Linux strict TCP reset monitoring requires CAP_NET_RAW. Experimental macOS/FreeBSD
 transport requires `Connector::with_gtsm(false)` and the acceptor's
 `plain_with_gtsm` / `tls_with_gtsm` constructors with `enforce = false`.
 Outbound TTL/hop limit 255 and inbound discovery checks remain enabled. Strict TCP enforcement
-fails explicitly on macOS. Native macOS runtime validation is pending.
+fails explicitly on both platforms. Native macOS loopback checks passed;
+native FreeBSD validation is pending. FreeBSD uses separate IPv4 ingress/
+destination control messages and `IP_SENDSRCADDR` for unicast reply sources.
 
 Requires Rust 1.85 or newer.
 

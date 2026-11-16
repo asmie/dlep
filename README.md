@@ -64,10 +64,11 @@ responsibilities and the design rationale.
 ## Build
 
 Requires Rust **1.85** or newer (edition 2024). Linux supports the full transport,
-including strict TCP GTSM. An experimental macOS path requires explicitly setting
+including strict TCP GTSM. Experimental macOS and FreeBSD paths require explicitly setting
 `[network].gtsm_enforce = false`; TCP/TLS and discovery retain outbound TTL/hop
 limit 255, and discovery still checks received TTLs. The core, FSM, and extension
-API are portable. See [macOS setup](doc/deployment.md#macos-transport).
+API are portable. See [macOS setup](doc/deployment.md#macos-transport) and
+[FreeBSD setup](doc/deployment.md#freebsd-transport).
 
 ```bash
 cargo build --workspace --locked
@@ -75,7 +76,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 Run network tests using the [isolated namespace command below](#network-tests).
-CI also checks Rust 1.85, protocol crates and opt-out transport on macOS,
+CI also checks Rust 1.85, protocol crates and opt-out transport on macOS/FreeBSD,
 coverage, workflow syntax, and dependency advisories. See [CI documentation](doc/ci.md) for job scope,
 local commands, coverage artifacts, and the guarded audit exception.
 

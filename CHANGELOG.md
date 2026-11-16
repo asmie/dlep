@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added an experimental FreeBSD transport path with explicit
+  `[network].gtsm_enforce = false`. Discovery uses native IPv4 interface and
+  destination control messages, resolves usable local addresses for multicast
+  probes, and selects reply sources with `IP_SENDSRCADDR`. IPv6 TCP configures
+  outbound hop limits without applying unsupported IPv4 socket options.
+  Strict TCP enforcement remains Linux-only. A pinned FreeBSD VM CI job adds
+  native build and unprivileged loopback checks; native FreeBSD results are
+  pending. Native macOS checks have now passed for `43f0ffd`.
 - Router CLI/configuration peers accept named IPv6 zones such as
   `[fe80::1%eth0]:854`. Every connection attempt resolves the interface afresh,
   preserving reconnect backoff and endpoint deduplication. TLS verifies the
@@ -26,7 +34,7 @@
   and usable local addresses. Strict TCP enforcement remains Linux-only;
   configuration checks and both builders now reject it early on other platforms.
   `ConfigCheckError` gains a `Transport` variant. Native macOS build and loopback
-  checks are added to CI; native runtime results are pending.
+  checks are added to CI and passed for `43f0ffd`.
 - Both daemons support simultaneous IPv4/IPv6 discovery with
   `[network].discovery_dual_stack = true` or `--dual-stack-discovery`.
   An explicit interface with usable addresses in both families is required.

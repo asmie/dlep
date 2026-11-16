@@ -7,7 +7,7 @@ and unit files live in [`examples/`](../examples/).
 ## 1. Build and install
 
 Requires Rust 1.85+ (edition 2024). Linux supports strict TCP GTSM. Experimental
-macOS transport requires an explicit TCP enforcement opt-out as described below.
+macOS and FreeBSD transport require an explicit TCP enforcement opt-out as described below.
 See [CI documentation](ci.md) for validation scope.
 
 Install version 0.2.0 from crates.io after publication:
@@ -59,12 +59,43 @@ IPv6 hop limit as an integer; both are required and checked before decoding.
 See Apple's [receive control-message implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/ip_input.c)
 and [IPv6 socket-option implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet6/ip6_output.c).
 
-Native macOS CI now builds the workspace commands and runs unprivileged
+Native macOS CI builds the workspace commands and runs unprivileged
 IPv4/IPv6 plaintext/TLS sessions, destination delivery, and discovery unicast
-metadata checks. Native results are pending for this change; local Linux
-checks do not validate macOS runtime behavior or multicast on physical links.
-Strict TCP reset monitoring on macOS and transport support for other operating
-systems remain follow-up work.
+metadata checks. Those checks passed for `43f0ffd` in
+[CI](https://github.com/asmie/dlep/actions/runs/43921858827). Physical-link
+multicast and strict TCP reset monitoring remain follow-up work.
+
+### FreeBSD transport
+
+The experimental FreeBSD path also requires an explicit opt-out in each daemon:
+
+```toml
+[network]
+gtsm_enforce = false
+```
+
+The strict default fails configuration checks and startup; it is never disabled
+automatically. TLS verification and outbound TTL/hop limit 255 remain enabled,
+and discovery still requires a received value of 255 before decoding. Use UDP
+and TCP ports above 1023 for an ordinary user. Linux capabilities and systemd
+examples do not apply to FreeBSD.
+
+IPv4 discovery obtains ingress scope from `IP_RECVIF` and destination addresses
+from `IP_RECVDSTADDR`. Multicast destinations are replaced with a usable unicast
+address on the ingress interface for wildcard TCP offers. Multicast egress uses
+the configured interface; unicast replies select its configured source address
+with `IP_SENDSRCADDR` and follow the system routing table. IPv6 retains scoped
+packet information. As on macOS, the IPv6 unicast-hop option also sets mapped
+IPv4 TTL, so no unsupported IPv4 option is applied to IPv6 TCP sockets. See
+FreeBSD's [IPv4 socket interface](https://github.com/freebsd/freebsd-src/blob/main/share/man/man4/ip.4)
+and [IPv6 socket options](https://github.com/freebsd/freebsd-src/blob/main/sys/netinet6/ip6_output.c).
+
+The new FreeBSD 15.1 VM job builds all workspace libraries/commands, tests the
+portable protocol crates, and runs unprivileged loopback TCP/TLS and discovery
+metadata cases. Native FreeBSD results are pending until this change is pushed.
+Local Rust type-checks bypass native crypto compilation in an isolated temporary
+copy; they do not establish native build/runtime support. Physical-link multicast,
+strict TCP reset monitoring, and other BSD variants remain outside this evidence.
 
 ### Shell completions
 

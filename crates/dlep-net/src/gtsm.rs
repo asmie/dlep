@@ -35,10 +35,10 @@ pub fn configure_tcp<F: std::os::fd::AsFd>(sock: &F, is_v6: bool, enforce: bool)
     let socket = socket2::SockRef::from(sock);
     if is_v6 {
         socket.set_unicast_hops_v6(REQUIRED_TTL.into())?;
-        // A dual-stack listener also sends IPv4 SYN-ACKs. Darwin copies the
-        // IPv6 hop option into the mapped IPv4 TTL; setting IP_TTL on an IPv6
-        // socket there fails with EINVAL. Linux needs both options.
-        #[cfg(not(target_os = "macos"))]
+        // Darwin and FreeBSD copy the IPv6 hop option into mapped IPv4 TTL;
+        // setting IP_TTL on their IPv6 sockets fails with EINVAL. Linux needs
+        // both options for a dual-stack listener's IPv4 SYN-ACKs.
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
         socket.set_ttl(REQUIRED_TTL.into())?;
     } else {
         socket.set_ttl(REQUIRED_TTL.into())?;

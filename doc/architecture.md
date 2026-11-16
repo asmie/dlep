@@ -599,9 +599,10 @@ Named IPv6 interface zones for static peers are complete in chunk 81.
 
 Simultaneous IPv4/IPv6 discovery is complete in chunk 78. The remaining larger
 scope follow-up is full non-Linux daemon transport. Chunk 79 adds an experimental
-macOS path with explicit TCP enforcement opt-out and native CI coverage;
-native results are pending. Strict TCP monitoring on macOS and other operating
-systems remain open. Physical-link multicast needs native deployment evidence.
+macOS path with explicit TCP enforcement opt-out; native build/loopback checks
+passed for `43f0ffd`. Chunk 82 adds an experimental FreeBSD path with native
+checks pending. Strict TCP monitoring on these platforms and other operating
+systems remains open. Physical-link multicast needs native deployment evidence.
 
 Device-specific radio integration needs a selected device and its control API.
 The generic radio adapter and link-control backend are already available.
@@ -1533,7 +1534,7 @@ The order of work was:
     checks, and cleanup. Release smoke covers the combined launcher discovering
     both modem families without duplicate sessions.
 
-79. Experimental macOS transport. **Implemented; native validation pending** —
+79. Experimental macOS transport. **Done for the opt-out path** —
     TCP/TLS supports explicit `gtsm_enforce = false`, retaining outbound TTL/hop
     limit 255. Darwin IPv6 sockets use the hop option for both IPv6 and mapped
     IPv4 sends. Discovery handles native IPv4 TTL/IPv6 hop-limit control
@@ -1541,11 +1542,10 @@ The order of work was:
     source/interface selection. Configuration checks and both builders reject
     unsupported strict TCP enforcement before networking. The macOS job now
     checks workspace libraries/binaries and runs loopback session, TLS,
-    destination, and UDP metadata cases. Linux checks cover the shared paths;
-    a local Rust cross-check bypasses native crypto compilation in an isolated
-    temporary copy because this host has no macOS SDK. It is type-check evidence,
-    not a native build or runtime result. Full strict transport portability and
-    real-link multicast validation remain open.
+    destination, and UDP metadata cases. Those seven native loopback checks
+    passed for `43f0ffd` in [CI](https://github.com/asmie/dlep/actions/runs/43921858827).
+    Full strict transport portability and real-link multicast validation remain
+    open; a passing loopback job is not physical-link deployment evidence.
 
 80. Configurable Peer Offer retries. **Done** — modem-only `[discovery]`
     settings opt in to 0–5 extra unicast offers at intervals of at least one
@@ -1576,6 +1576,18 @@ The order of work was:
     flow, and rejection of an interface-name DNS certificate. Standalone/launcher
     smoke scenarios verify named/numeric aliases do not open duplicate sessions
     before or after modem restart.
+
+82. Experimental FreeBSD transport. **Implemented; native validation pending** —
+    the explicit TCP GTSM opt-out now permits the FreeBSD transport path. IPv4
+    discovery uses `IP_RECVIF`/`IP_RECVDSTADDR`, restores usable unicast local
+    addresses after multicast probes, and selects replies with `IP_SENDSRCADDR`.
+    IPv6 TCP sets hop limits without unsupported IPv4 options. Missing metadata
+    is rejected before signal decoding. A pinned FreeBSD 15.1 VM job builds
+    production targets and runs portable protocol and loopback cases as an
+    ordinary user. A shared multicast/reply-source case accompanies existing
+    IPv4/IPv6 TCP/TLS, TTL, and interface checks. Rust cross-checking bypasses
+    native crypto compilation in an isolated temporary copy; native FreeBSD
+    results and physical-link behavior remain unverified until native execution.
 
 ---
 
