@@ -95,6 +95,26 @@ typos and settings for the wrong role (such as `[metrics]` on the router).
 Finish each edit with `--check-config` to validate timer values, interfaces,
 metrics, and TLS material as well.
 
+Network flags override the loaded TOML for both `--check-config` and startup:
+
+```sh
+dlep modem --config /etc/dlep/modem.toml --interface radio0 \
+  --bind-addr 192.0.2.10 --tcp-port 1854 --discovery-port 1854
+dlep router --config /etc/dlep/router.toml --interface radio0 \
+  --bind-addr 192.0.2.1 --discovery-port 1854
+```
+
+The standalone commands accept the same flags. `--bind-addr` takes a bare IPv4
+or IPv6 address; select the interface separately for IPv6 scope. On the modem,
+it controls the TCP listener and discovery address. On the router, it selects
+the local discovery address/family; it does not set the TCP source address.
+`--discovery-port` controls the modem UDP listener and router multicast
+destination. Routers use an ephemeral source port and obtain each TCP address
+and port from `--peer` or a Peer Offer; `--tcp-port` is therefore modem-only.
+Its value may be zero to request an allocated TCP listen port, which discovery
+advertises. Ports are numeric values from 0 to 65535; use a nonzero matching
+discovery port for deployment (zero is useful only for ephemeral/local setups).
+
 An optional router `[adapter]` section runs an external integration process;
 `command` is an absolute executable path and `args` defaults to `[]`.
 `--check-config` checks the section and command file without running it. The

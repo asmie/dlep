@@ -103,12 +103,19 @@ dlep-router --config /etc/dlep/router.toml
 dlep-modem  --config /etc/dlep/modem.toml
 ```
 
+Network settings can also be overridden with `--bind-addr`, `--discovery-port`,
+and the modem's `--tcp-port`; see the [deployment guide](doc/deployment.md#3-configuration).
+See the [feature backlog](doc/architecture.md#feature-backlog) for remaining
+product work and its scope.
+
 CLI flags shared by both binaries:
 
 | Flag           | Purpose                                                  |
 |----------------|----------------------------------------------------------|
 | `--config`     | Path to the TOML config file.                            |
 | `--interface`  | Select the discovery interface (overrides config).        |
+| `--bind-addr` | Override the local discovery address; also the modem's TCP listen address. |
+| `--discovery-port` | Override the discovery destination/listen port.      |
 | `--log-level`  | Override the `DLEP_LOG` filter (`info`, `debug`, …).       |
 | `--no-tls`     | Force plain TCP regardless of config.                    |
 | `--cert`, `--key` | Override the TLS identity files.                     |
@@ -121,6 +128,8 @@ Logging precedence is `--log-level`, then `DLEP_LOG`, then `info`; `RUST_LOG`
 is not read. `--config` also accepts `-c` and the role-specific
 `DLEP_ROUTER_CONFIG` / `DLEP_MODEM_CONFIG` environment variable; an explicit flag
 wins. Router-only `--peer ADDR` is repeatable and selects static connections.
+Modem-only `--tcp-port PORT` overrides its listener; zero selects an allocated
+port. Routers use the TCP port supplied by each peer endpoint or offer.
 See the [deployment guide](doc/deployment.md#3-configuration) for details.
 
 A minimal plaintext development configuration for either role (select an

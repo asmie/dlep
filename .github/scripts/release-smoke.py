@@ -90,9 +90,11 @@ termination_timeout_ms = 1000
                 for flag in ("--help", "-h"):
                     help_text = self.run(command + [flag]).stdout
                     for option in ("--config", "--interface", "--log-level", "--no-tls", "--cert",
-                                   "--key", "--ca-bundle", "--check-config", "--help", "--version"):
+                                   "--key", "--ca-bundle", "--bind-addr", "--discovery-port",
+                                   "--check-config", "--help", "--version"):
                         assert option in help_text, (role, option)
                     assert ("--peer" in help_text) == (role == "router")
+                    assert ("--tcp-port" in help_text) == (role == "modem")
                 for flag in ("--version", "-V"):
                     assert self.version in self.run(command + [flag]).stdout
                 path = self.config(f"check-{role}-{unified}", mutual=True)
@@ -110,8 +112,23 @@ termination_timeout_ms = 1000
                     assert "invalid log level" not in result.stderr
                 result = self.run(command + ["--no-tls", "--check-config"], env={"DLEP_LOG": "[broken"})
                 assert "invalid log level" in result.stderr
-                for flag in ("--config", "--interface", "--log-level", "--cert", "--key", "--ca-bundle"):
+                for flag in ("--config", "--interface", "--log-level", "--cert", "--key", "--ca-bundle",
+                             "--bind-addr", "--discovery-port"):
                     self.run(command + [flag], expected=2)
+                for value in ("hostname.invalid", "[::1]", "fe80::1%lo", "127.0.0.1:854"):
+                    self.run(command + ["--bind-addr", value, "--check-config"], expected=2)
+                for value in ("-1", "65536", "not-a-port"):
+                    self.run(command + ["--discovery-port", value, "--check-config"], expected=2)
+                wrong_bind = self.config(f"wrong-bind-{role}-{unified}", ip="192.0.2.123")
+                self.run(command + ["-c", str(wrong_bind), "--no-tls"] + common, expected=1)
+                self.run(command + ["-c", str(wrong_bind), "--no-tls", "--bind-addr", "127.0.0.1",
+                                    "--discovery-port", "65535"] + common)
+                if role == "modem":
+                    self.run(command + ["--tcp-port"], expected=2)
+                    for value in ("-1", "65536", "not-a-port"):
+                        self.run(command + ["--tcp-port", value, "--check-config"], expected=2)
+                else:
+                    self.run(command + ["--tcp-port", "854"], expected=2)
                 self.run(command + ["--unknown-flag"], expected=2)
                 self.run(command + ["--config", "missing-config.toml", "--check-config"], expected=1)
                 self.run(command + ["--config", str(path), "--no-tls", "--check-config"], expected=1)
@@ -157,14 +174,18 @@ termination_timeout_ms = 1000
         modems = []
         addresses = []
         for index in range(peers):
-            path = self.config(f"{name}-modem-{index}", ip, port, mutual=tls)
-            command = self.command("modem", unified) + ["--config", str(path), "--interface", "lo", "--log-level", "info"]
+            path = self.config(f"{name}-modem-{index}", "192.0.2.123", 1, mutual=tls)
+            path.write_text(path.read_text().replace("tcp_port = 0", "tcp_port = 1"))
+            command = self.command("modem", unified) + ["--config", str(path), "--interface", "lo", "--log-level", "info",
+                "--bind-addr", ip, "--tcp-port", "0", "--discovery-port", str(port)]
             command += self.tls_flags("modem") if tls else ["--no-tls"]
             modem = self.start(f"{name}-modem-{index}", command)
             addresses.append(self.wait_log(modem, r"modem listening on (\S+)"))
+            assert not addresses[-1].endswith(":1"), addresses[-1]
             modems.append(modem)
-        path = self.config(f"{name}-router", ip, port)
-        command = self.command("router", unified) + ["-c", str(path), "--interface", "lo", "--log-level", "info"]
+        path = self.config(f"{name}-router", "192.0.2.123", 1)
+        command = self.command("router", unified) + ["-c", str(path), "--interface", "lo", "--log-level", "info",
+            "--bind-addr", ip, "--discovery-port", str(port)]
         command += self.tls_flags("router") if tls else ["--no-tls"]
         if not discovery:
             for address in addresses:

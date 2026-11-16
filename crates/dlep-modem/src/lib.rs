@@ -19,6 +19,18 @@ struct Cli {
     #[arg(long)]
     interface: Option<String>,
 
+    /// Override the TCP listen and discovery address (network.bind_addr).
+    #[arg(long, value_name = "IP")]
+    bind_addr: Option<std::net::IpAddr>,
+
+    /// Override the TCP listen port; 0 selects a port automatically.
+    #[arg(long, value_name = "PORT")]
+    tcp_port: Option<u16>,
+
+    /// Override the discovery listen port (network.discovery_port).
+    #[arg(long, value_name = "PORT")]
+    discovery_port: Option<u16>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, env = "DLEP_LOG", default_value = "info")]
     log_level: String,
@@ -146,6 +158,15 @@ fn init_tracing(requested: &str) {
 }
 
 fn apply_overrides(cfg: &mut ModemConfig, cli: &Cli) {
+    if let Some(addr) = cli.bind_addr {
+        cfg.shared.network.bind_addr = addr;
+    }
+    if let Some(port) = cli.tcp_port {
+        cfg.shared.network.tcp_port = port;
+    }
+    if let Some(port) = cli.discovery_port {
+        cfg.shared.network.discovery_port = port;
+    }
     if let Some(iface) = &cli.interface {
         cfg.shared.network.interface = Some(iface.clone());
     }

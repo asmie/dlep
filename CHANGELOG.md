@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Both CLIs now accept `--bind-addr` and `--discovery-port` overrides; the modem
+  also accepts `--tcp-port`, including zero for an allocated listen port. These
+  override TOML for startup and `--check-config`, including through `dlep router`
+  and `dlep modem`. Router TCP endpoints retain their configured/offered ports.
 - Session fuzzing can now hold encoded peer messages and deliver them later in
   each direction's original order. New seeds and harness checks exercise metric
   coalescing, desired-address corrections, pending destination changes, and link
