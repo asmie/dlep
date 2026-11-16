@@ -2,10 +2,6 @@
 
 ## 0.3.0 — 2026-11-16
 
-Release candidate prepared on this date; not yet published. Native macOS
-validation of the multicast membership fix and green CI on the final release
-commit are still required before publication.
-
 ### Highlights
 
 - External radio and router adapters connect real integration processes to
@@ -61,17 +57,18 @@ commit are still required before publication.
 
 ### Support and validation limits
 
-- Linux is the fully supported transport platform. Native FreeBSD protocol,
-  production-target, and eight loopback transport checks passed for `e45c057`.
-  The original seven macOS transport cases passed; the multicast membership
-  correction still requires a native rerun. Neither result establishes
+- Linux is the fully supported transport platform. Native macOS and FreeBSD
+  protocol, production-target, and eight loopback transport checks passed for
+  `23fc269` in [CI](https://github.com/asmie/dlep/actions/runs/43951117081), including
+  the macOS multicast membership correction. Neither result establishes
   physical-link multicast behavior or native service-manager lifecycle support.
 - Strict TCP monitoring on non-Linux platforms, device-specific radio drivers,
   and independent TLS interoperability remain outside this release's validation.
   Generic process adapters and library integration hooks are available.
-- Final release evidence must come from the `0.3.0` archives and their installed
-  commands. Existing development results do not replace that final validation.
-  See [release validation](doc/ci.md#release-validation) for the commands.
+- Local 0.3.0 archive validation passed 648 tests, installed all three commands,
+  and passed 297 CLI/certificate checks plus 11 session scenarios. Hosted
+  packaging and installed-command checks also passed for `23fc269`. See
+  [release validation](doc/ci.md#release-validation) for the commands.
 
 ### Detailed changes
 
@@ -79,7 +76,7 @@ commit are still required before publication.
   address. XNU ignores the trailing interface index in an `ip_mreqn` membership
   request, which could join another interface and leave selected-interface
   discovery waiting indefinitely. The existing multicast/reply-source regression
-  remains enabled; native validation of this fix is pending.
+  remains enabled and passed natively for `23fc269`.
 - Added `--log-format text|json` and `DLEP_LOG_FORMAT` to both daemons and the
   combined launcher. JSON tracing records are emitted one per line on stdout,
   with typed event fields, timestamps, levels, and targets. Text remains the
@@ -97,9 +94,8 @@ commit are still required before publication.
   probes, and selects reply sources with `IP_SENDSRCADDR`. IPv6 TCP configures
   outbound hop limits without applying unsupported IPv4 socket options.
   Strict TCP enforcement remains Linux-only. A pinned FreeBSD VM CI job adds
-  native build and unprivileged loopback checks, which passed for `e45c057`.
-  The original seven native macOS checks passed for `43f0ffd`; the later
-  multicast membership correction above awaits a native rerun.
+  production-target and unprivileged loopback checks. All eight native transport
+  cases passed on FreeBSD and macOS for `23fc269`.
 - Router CLI/configuration peers accept named IPv6 zones such as
   `[fe80::1%eth0]:854`. Every connection attempt resolves the interface afresh,
   preserving reconnect backoff and endpoint deduplication. TLS verifies the
@@ -124,7 +120,7 @@ commit are still required before publication.
   and usable local addresses. Strict TCP enforcement remains Linux-only;
   configuration checks and both builders now reject it early on other platforms.
   `ConfigCheckError` gains a `Transport` variant. Native macOS build and loopback
-  checks are added to CI and passed for `43f0ffd`.
+  checks are added to CI and passed for `23fc269`, including multicast discovery.
 - Both daemons support simultaneous IPv4/IPv6 discovery with
   `[network].discovery_dual_stack = true` or `--dual-stack-discovery`.
   An explicit interface with usable addresses in both families is required.

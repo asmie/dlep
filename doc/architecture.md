@@ -599,10 +599,10 @@ Named IPv6 interface zones for static peers are complete in chunk 81.
 
 Simultaneous IPv4/IPv6 discovery is complete in chunk 78. The remaining larger
 scope follow-up is full non-Linux daemon transport. Chunk 79 adds an experimental
-macOS path with explicit TCP enforcement opt-out; native build/loopback checks
-passed for `43f0ffd`. Chunk 82 adds an experimental FreeBSD path with native
-checks passed for `e45c057`. Chunk 85 corrects macOS IPv4 multicast membership;
-its native regression rerun remains a release gate. Strict TCP monitoring on
+macOS path with explicit TCP enforcement opt-out; chunk 82 adds an experimental
+FreeBSD path. Native production-target and all eight loopback transport checks
+passed on both platforms for `23fc269`, including chunk 85's macOS IPv4
+multicast membership correction. Strict TCP monitoring on
 these platforms and other operating systems remains open. Physical-link
 multicast needs native deployment evidence.
 Chunk 83 adds native service definitions for both experimental platforms;
@@ -1614,25 +1614,28 @@ The order of work was:
     their formats. Release smoke exercises both CLI/environment paths, generated
     completions, JSON records during mutual-TLS sessions, and SIGTERM shutdown.
 
-85. macOS multicast membership correction. **Implemented; native rerun pending** —
+85. macOS multicast membership correction. **Done** —
     the added multicast/reply-source case timed out in native CI for `e45c057`.
     XNU's `IP_ADD_MEMBERSHIP` handler reads `ip_mreq` and ignores the trailing
     interface index in `ip_mreqn`, allowing an unspecified address to select
     another interface through routing. macOS now joins using the resolved
     interface address. Linux/FreeBSD retain indexed membership. The regression
-    remains enabled with its original timeout; a passing native rerun is required
-    before 0.3.0. All other jobs in the `e45c057` CI run passed, including the
-    first native FreeBSD transport job.
+    remains enabled with its original timeout and passed natively for `23fc269`
+    in [CI](https://github.com/asmie/dlep/actions/runs/43951117081). All eight native
+    transport cases passed on macOS and FreeBSD; the original release blocker is
+    resolved.
 
-86. Prepare 0.3.0 release candidate. **Prepared; final CI pending** — all eight
+86. Prepare 0.3.0 release candidate. **Validated** — all eight
     packages and internal dependency requirements use `0.3.0`. Workspace and
     fuzz lockfiles refresh only local package versions. Installation/library
     examples target 0.3.0, and dated release notes summarize features, migration
     requirements, and platform validation limits. Local rehearsal verified all
     eight archives, 648 archived Rust tests, and three installed 0.3.0 commands.
     Workspace and installed builds each passed 297 CLI/certificate checks and
-    11 session scenarios. Native macOS validation of chunk 85 and a green final
-    release-commit CI run remain publication gates.
+    11 session scenarios. Native macOS/FreeBSD jobs, release packaging/smoke,
+    both independent peers, Linux tests/coverage, formatting, clippy, MSRV, audit,
+    and fuzz smoke all passed for `23fc269`. Final documentation edits still
+    need clean-commit CI before publication.
     No packages, tags, or releases are published by this preparation.
 
 ---

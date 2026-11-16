@@ -38,14 +38,12 @@ target. Those unprivileged loopback cases exercise IPv4/IPv6 plaintext and TLS
 sessions, destination delivery, UDP TTL/interface metadata, low-TTL filtering,
 and rejection of strict TCP enforcement until explicitly disabled. This is
 experimental macOS support; it does not validate physical-link multicast,
-adapters, or strict TCP GTSM reset monitoring. The original seven loopback cases
-passed natively for `43f0ffd` in [CI](https://github.com/asmie/dlep/actions/runs/43921858827).
-The IPv4 multicast/reply-source case added with the FreeBSD port timed out for
-`e45c057` in [CI](https://github.com/asmie/dlep/actions/runs/43944207775), while the
-original seven cases still passed. XNU reads `ip_mreq` for `IP_ADD_MEMBERSHIP`
-and ignores `ip_mreqn`'s trailing interface index. The fix joins by resolved
-interface address; this case stays enabled and requires a native rerun before
-0.3.0. This job also checks the launchd service definitions with
+adapters, or strict TCP GTSM reset monitoring. All eight loopback cases passed
+natively for `23fc269` in [CI](https://github.com/asmie/dlep/actions/runs/43951117081),
+including the IPv4 multicast/reply-source regression. XNU reads `ip_mreq` for
+`IP_ADD_MEMBERSHIP` and ignores `ip_mreqn`'s trailing interface index; joining by
+resolved interface address corrects the timeout seen for `e45c057`.
+This job also checks the launchd service definitions with
 `plutil -lint`; it does not load them into the runner's service manager.
 
 The FreeBSD job uses a VM action pinned to commit
@@ -56,13 +54,24 @@ checks workspace libraries/commands, and runs `portable_transport`, including
 IPv4 multicast destination-to-unicast address recovery and reply-source checks.
 The strict default must fail explicitly, and the opt-out keeps outbound TTL/hop
 limit and inbound UDP checks. These checks, including all eight transport
-cases, passed natively for `e45c057` in
-[CI](https://github.com/asmie/dlep/actions/runs/43944207775).
+cases, passed natively for `23fc269` in
+[CI](https://github.com/asmie/dlep/actions/runs/43951117081).
 Other BSD variants and physical-link multicast are outside this job's scope.
 The VM also validates both rc.d scripts with
 `/bin/sh -n`; native service lifecycle behavior remains unverified.
 
 ## Release validation
+
+The committed 0.3.0 candidate `23fc269` passed all jobs in
+[CI](https://github.com/asmie/dlep/actions/runs/43951117081),
+[dependency audit](https://github.com/asmie/dlep/actions/runs/43951117054), and
+[fuzz smoke](https://github.com/asmie/dlep/actions/runs/43951117259). This includes
+native macOS/FreeBSD transport, packaging and installed-command smoke checks,
+both independent peers, MSRV, and Linux coverage. The local release rehearsal
+also executed 648 tests from eight extracted 0.3.0 archives and installed all
+three commands. Workspace and installed builds each passed 297 CLI/certificate
+checks and 11 session scenarios. Any final release edits still need a green
+clean-commit CI run; validation does not publish packages or create tags.
 
 Use current stable Cargo for workspace packaging (validated with Cargo 1.100),
 Python 3.12+, OpenSSL, and Linux with `iproute2`/`unshare`. Run these checks from

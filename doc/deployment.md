@@ -63,13 +63,12 @@ IPv6 hop limit as an integer; both are required and checked before decoding.
 See Apple's [receive control-message implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/ip_input.c)
 and [IPv6 socket-option implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet6/ip6_output.c).
 
-Native macOS CI builds the workspace commands and runs unprivileged
-IPv4/IPv6 plaintext/TLS sessions, destination delivery, and discovery unicast
-metadata checks. Those checks passed for `43f0ffd` in
-[CI](https://github.com/asmie/dlep/actions/runs/43921858827). Physical-link
-multicast and strict TCP reset monitoring remain follow-up work. The added
-multicast/reply-source case timed out for `e45c057`; the interface-address
-membership correction awaits a native rerun and remains a 0.3.0 release gate.
+Native macOS CI checks the workspace commands and runs unprivileged
+IPv4/IPv6 plaintext/TLS sessions, destination delivery, discovery metadata, and
+multicast/reply-source checks. All eight transport cases passed for `23fc269` in
+[CI](https://github.com/asmie/dlep/actions/runs/43951117081), validating the
+interface-address membership correction. Physical-link multicast and strict TCP
+reset monitoring remain follow-up work.
 
 ### FreeBSD transport
 
@@ -99,7 +98,7 @@ and [IPv6 socket options](https://github.com/freebsd/freebsd-src/blob/main/sys/n
 The FreeBSD 15.1 VM job checks all workspace libraries/commands, tests the
 portable protocol crates, and runs unprivileged loopback TCP/TLS and discovery
 metadata cases. These checks and all eight transport cases passed natively for
-`e45c057` in [CI](https://github.com/asmie/dlep/actions/runs/43944207775).
+`23fc269` in [CI](https://github.com/asmie/dlep/actions/runs/43951117081).
 Physical-link multicast, strict TCP reset monitoring, and other BSD variants
 remain outside this evidence.
 

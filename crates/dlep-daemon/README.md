@@ -3,9 +3,8 @@
 Embeddable asynchronous router and modem runtime for DLEP (RFC 8175).
 Linux strict TCP GTSM requires CAP_NET_RAW. Experimental macOS/FreeBSD transport requires
 `config.shared.network.gtsm_enforce = false`; configuration checks and builders
-reject the strict default before startup. Native FreeBSD transport checks passed.
-The original macOS loopback checks passed; its multicast membership fix awaits
-a native rerun.
+reject the strict default before startup. Native macOS/FreeBSD loopback transport
+checks passed, including multicast discovery.
 
 Requires Rust 1.85 or newer.
 
