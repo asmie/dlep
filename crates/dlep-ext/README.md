@@ -89,11 +89,11 @@ discovery and session callbacks concurrently.
 
 ```toml
 [dependencies]
-dlep-ext = "0.2.0"
+dlep-ext = "0.3.0"
 ```
 
 See the [workspace documentation](https://github.com/asmie/dlep),
 [deployment guide](https://github.com/asmie/dlep/blob/master/doc/deployment.md),
-and [0.2.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
+and [0.3.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
 
 Licensed under MIT; see [LICENSE](LICENSE).

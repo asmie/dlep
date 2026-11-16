@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "dlep-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "ipnet",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "dlep-fsm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "dlep-core",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "dlep-net"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "dlep-core",

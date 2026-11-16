@@ -1,6 +1,79 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-11-16
+
+Release candidate prepared on this date; not yet published. Native macOS
+validation of the multicast membership fix and green CI on the final release
+commit are still required before publication.
+
+### Highlights
+
+- External radio and router adapters connect real integration processes to
+  destination, metric, address, Announce, and Link Characteristics workflows.
+  Retained snapshots, bounded queues, replay, resynchronization, and command
+  completion notices support recovery after backpressure or event loss.
+- Routers gain destination admission policy, DNS peers with hostname-based TLS
+  verification, and named IPv6 interface zones. Modems can advertise secured
+  media and configure bounded Peer Offer retries. Both roles can opt into
+  simultaneous IPv4/IPv6 discovery.
+- Extensions gain configured factories, bounded pre-session discovery hooks,
+  and negotiated session-termination requests.
+- All commands gain shell completions, network overrides, and opt-in JSON
+  logging. Native service definitions accompany experimental macOS/FreeBSD
+  transport; strict TCP GTSM remains Linux-only.
+- Protocol/runtime fixes preserve newer state across deferred updates, link
+  replies, replay, address batching, withdrawal, and reconnect races.
+  Independent-peer interoperability checks and release-archive validation
+  accompany the implementation.
+
+### Migration from 0.2
+
+- Upgrade the launcher and component crates together to `0.3.0`; their internal
+  dependency requirements now select the `0.3` series. Rust **1.85** remains the
+  minimum supported version.
+- Public configuration structs gained fields. For full Rust initializers,
+  account for `SharedConfig.extensions`, `NetworkConfig.discovery_dual_stack`,
+  router `destinations` / `named_peers` / `scoped_peers` / `adapter`, and modem
+  `radio` / `discovery` / `secured_medium`. Use `..Default::default()` where
+  suitable. `SessionConfig.defer_link_characteristics`,
+  `SessionSnapshot.local_addresses`, and the `secured_medium` field on
+  `PeerInfo` / `PeerOffer` also require updates in exhaustive
+  initializers. Review the detailed changes below for affected types.
+- Update exhaustive matches on daemon/FSM events, commands, configuration-check
+  errors, and `PeerEndpoint` variants. New completion events expose peer replies
+  separately from local command acceptance; an accepted command does not imply
+  that the peer applied it. Deferred link-control implementations must eventually
+  answer each pending request or let session cleanup cancel it.
+- TOML keeps numeric, DNS, and named-zone peers in one `static_peers` list.
+  Rust configuration stores them in separate numeric, named, and scoped vectors.
+  New optional settings have defaults; unknown sections/keys remain errors.
+  `[extensions.NAME]` needs an explicitly registered factory in an embedding
+  application; bundled commands reject unregistered extension settings.
+- Adapter consumers must handle retained replacement snapshots, membership
+  refreshes, event-gap notices, and the new response notices described in the
+  [radio](doc/radio-adapter.md) and [router](doc/router-adapter.md) protocols.
+  Recover current state from snapshots after event loss; historical command
+  outcomes cannot be reconstructed from a membership refresh.
+- Linux retains strict TCP GTSM and TLS defaults. Experimental macOS/FreeBSD
+  requires explicit `network.gtsm_enforce = false`; discovery still validates
+  received TTL/hop limit 255. Native service examples use port 1854 and mutual
+  TLS. Text logging remains the default; JSON is opt-in.
+
+### Support and validation limits
+
+- Linux is the fully supported transport platform. Native FreeBSD protocol,
+  production-target, and eight loopback transport checks passed for `e45c057`.
+  The original seven macOS transport cases passed; the multicast membership
+  correction still requires a native rerun. Neither result establishes
+  physical-link multicast behavior or native service-manager lifecycle support.
+- Strict TCP monitoring on non-Linux platforms, device-specific radio drivers,
+  and independent TLS interoperability remain outside this release's validation.
+  Generic process adapters and library integration hooks are available.
+- Final release evidence must come from the `0.3.0` archives and their installed
+  commands. Existing development results do not replace that final validation.
+  See [release validation](doc/ci.md#release-validation) for the commands.
+
+### Detailed changes
 
 - Fixed macOS IPv4 multicast group membership to use the resolved interface
   address. XNU ignores the trailing interface index in an `ip_mreqn` membership

@@ -33,7 +33,7 @@ The implementation deliberately does **not** aim to:
 ## 3. Workspace layout
 
 The repository is a Cargo workspace with the root `dlep` launcher and seven
-component crates under `crates/`, all released together as version 0.2.0:
+component crates under `crates/`, all released together as version 0.3.0:
 
 ```
 dlep/
@@ -1623,6 +1623,17 @@ The order of work was:
     remains enabled with its original timeout; a passing native rerun is required
     before 0.3.0. All other jobs in the `e45c057` CI run passed, including the
     first native FreeBSD transport job.
+
+86. Prepare 0.3.0 release candidate. **Prepared; final CI pending** — all eight
+    packages and internal dependency requirements use `0.3.0`. Workspace and
+    fuzz lockfiles refresh only local package versions. Installation/library
+    examples target 0.3.0, and dated release notes summarize features, migration
+    requirements, and platform validation limits. Local rehearsal verified all
+    eight archives, 648 archived Rust tests, and three installed 0.3.0 commands.
+    Workspace and installed builds each passed 297 CLI/certificate checks and
+    11 session scenarios. Native macOS validation of chunk 85 and a green final
+    release-commit CI run remain publication gates.
+    No packages, tags, or releases are published by this preparation.
 
 ---
 

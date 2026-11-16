@@ -16,7 +16,7 @@ The default is no extra offers; retries are bounded and stop when an accepted
 TCP connection is observed.
 
 ```sh
-cargo install dlep-modem --version 0.2.0 --locked
+cargo install dlep-modem --version 0.3.0 --locked
 dlep-modem --help
 ```
 
@@ -29,6 +29,6 @@ TLS is enabled by default. Provision certificates and configure the network befo
 
 See the [workspace documentation](https://github.com/asmie/dlep),
 [deployment guide](https://github.com/asmie/dlep/blob/master/doc/deployment.md),
-and [0.2.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
+and [0.3.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
 
 Licensed under MIT; see [LICENSE](LICENSE).

@@ -20,7 +20,7 @@ destination and link-characteristic commands. See the
 [router adapter protocol](https://github.com/asmie/dlep/blob/master/doc/router-adapter.md).
 
 ```sh
-cargo install dlep-router --version 0.2.0 --locked
+cargo install dlep-router --version 0.3.0 --locked
 dlep-router --help
 ```
 
@@ -28,6 +28,6 @@ TLS is enabled by default. Provision certificates and configure the network befo
 
 See the [workspace documentation](https://github.com/asmie/dlep),
 [deployment guide](https://github.com/asmie/dlep/blob/master/doc/deployment.md),
-and [0.2.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
+and [0.3.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
 
 Licensed under MIT; see [LICENSE](LICENSE).

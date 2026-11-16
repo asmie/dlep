@@ -17,8 +17,8 @@ anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 tokio.workspace = true
-dlep-router = { path = "crates/dlep-router", version = "0.2.0" }
-dlep-modem = { path = "crates/dlep-modem", version = "0.2.0" }
+dlep-router = { path = "crates/dlep-router", version = "0.3.0" }
+dlep-modem = { path = "crates/dlep-modem", version = "0.3.0" }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -31,7 +31,7 @@ members = ["crates/*"]
 default-members = [".", "crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 authors = ["Piotr Olszewski <asmie@asmie.pl>"]
@@ -80,8 +80,8 @@ toml = "0.8"
 anyhow = "1.0.103"
 
 # internal crates
-dlep-core = { path = "crates/dlep-core", version = "0.2.0" }
-dlep-fsm = { path = "crates/dlep-fsm", version = "0.2.0" }
-dlep-net = { path = "crates/dlep-net", version = "0.2.0" }
-dlep-ext = { path = "crates/dlep-ext", version = "0.2.0" }
-dlep-daemon = { path = "crates/dlep-daemon", version = "0.2.0" }
+dlep-core = { path = "crates/dlep-core", version = "0.3.0" }
+dlep-fsm = { path = "crates/dlep-fsm", version = "0.3.0" }
+dlep-net = { path = "crates/dlep-net", version = "0.3.0" }
+dlep-ext = { path = "crates/dlep-ext", version = "0.3.0" }
+dlep-daemon = { path = "crates/dlep-daemon", version = "0.3.0" }

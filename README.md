@@ -82,14 +82,14 @@ local commands, coverage artifacts, and the guarded audit exception.
 
 ## Run
 
-Version **0.2.0** provides a combined launcher and separate role-specific CLIs:
+Version **0.3.0** provides a combined launcher and separate role-specific CLIs:
 
 ```bash
-cargo install dlep --version 0.2.0 --locked
+cargo install dlep --version 0.3.0 --locked
 dlep router --help
 dlep modem --help
 # Alternatively:
-cargo install dlep-router dlep-modem --version 0.2.0 --locked
+cargo install dlep-router dlep-modem --version 0.3.0 --locked
 ```
 
 For a source checkout, `cargo build --release --workspace --locked` builds all

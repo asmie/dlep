@@ -10,13 +10,13 @@ Requires Rust 1.85+ (edition 2024). Linux supports strict TCP GTSM. Experimental
 macOS and FreeBSD transport require an explicit TCP enforcement opt-out as described below.
 See [CI documentation](ci.md) for validation scope.
 
-Install version 0.2.0 from crates.io after publication:
+Install version 0.3.0 from crates.io after publication:
 
 ```bash
-cargo install dlep-router dlep-modem --version 0.2.0 --locked
+cargo install dlep-router dlep-modem --version 0.3.0 --locked
 ```
 
-Alternatively, `cargo install dlep --version 0.2.0 --locked` installs a single
+Alternatively, `cargo install dlep --version 0.3.0 --locked` installs a single
 launcher: `dlep router ...` and `dlep modem ...` accept all the corresponding
 standalone flags and run in-process. When granting capabilities to this combined
 binary, grant `cap_net_raw,cap_net_bind_service=ep` to the installed `dlep` path

@@ -20,11 +20,11 @@ endpoint IP. All paths retain the connector's TLS and GTSM settings.
 
 ```toml
 [dependencies]
-dlep-net = "0.2.0"
+dlep-net = "0.3.0"
 ```
 
 See the [workspace documentation](https://github.com/asmie/dlep),
 [deployment guide](https://github.com/asmie/dlep/blob/master/doc/deployment.md),
-and [0.2.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
+and [0.3.0 release notes](https://github.com/asmie/dlep/blob/master/CHANGELOG.md).
 
 Licensed under MIT; see [LICENSE](LICENSE).
