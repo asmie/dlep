@@ -113,6 +113,7 @@ pub fn check_router_config_with_extensions(
     if matches!(cfg.mode, DiscoveryMode::Static)
         && cfg.static_peers.is_empty()
         && cfg.named_peers.is_empty()
+        && cfg.scoped_peers.is_empty()
     {
         return Err(ConfigCheckError::StaticModeWithoutPeers);
     }

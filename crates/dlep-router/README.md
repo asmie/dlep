@@ -6,6 +6,10 @@ native macOS validation is pending.
 
 Requires Rust 1.85 or newer.
 
+Static IPv6 link-local peers can name an interface, for example
+`--peer '[fe80::1%eth0]:854'` or the same string in TOML `static_peers`.
+Retries resolve the current interface index; TLS verifies the IPv6 address.
+
 Configure `[adapter]` to run an external routing integration process. It receives
 complete session/destination snapshots over JSON Lines and can submit targeted
 destination and link-characteristic commands. See the

@@ -10,7 +10,7 @@ The release job verifies all crates.io archives, fetches the complete locked
 dependency set (including test-only dependencies), compares archived Cargo
 targets with the source workspace, compiles their test targets in an isolated
 extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
-under `target/release-install`, then checks every CLI flag and seven local
+under `target/release-install`, then checks every CLI flag and nine local
 plaintext/mutual-TLS session scenarios in a disposable network namespace.
 It does not publish packages. See [release validation](#release-validation).
 Package verification alone does not populate every development dependency;
@@ -77,7 +77,10 @@ discovery, and plaintext discovery through the combined launcher. Two DNS
 scenarios use CLI and TOML names with DNS-only certificates and reconnect after
 modem restart. A runtime case injects changing resolver answers to verify fresh
 lookup, hostname verification, and IPv4-to-IPv6 reconnection without changing
-host resolver configuration. A combined-launcher dual-discovery scenario keeps
+host resolver configuration. Two scoped IPv6 scenarios use named interfaces in
+CLI/TOML peers with IP certificates, include a duplicate numeric alias, and
+reconnect after modem restart without extra sessions. A runtime case verifies
+recovery after a failed interface lookup without invoking DNS. A combined-launcher dual-discovery scenario keeps
 exactly two sessions to IPv4-only and IPv6-only modems. Sessions cross
 heartbeat intervals and must shut down cleanly on SIGINT/SIGTERM. All network
 changes occur in disposable namespaces. Use the sudo alternative in the network

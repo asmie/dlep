@@ -140,7 +140,9 @@ is not read. `--config` also accepts `-c` and the role-specific
 wins. Router-only `--peer ADDR` is repeatable and selects static connections.
 It accepts `modem.example:854`, IPv4 `192.0.2.10:854`, or bracketed IPv6
 `[2001:db8::10]:854`; the port is required. TOML `static_peers` accepts the same
-forms. DNS peers use the requested hostname for TLS verification and SNI, and
+forms, including link-local peers such as `[fe80::1%eth0]:854`. Named interfaces
+are resolved on every connection attempt; numeric scope IDs still work. Zones
+select the route while TLS verifies the IPv6 address. DNS peers use the requested hostname for TLS verification and SNI, and
 each retry calls the system resolver again. `--check-config` validates names
 without resolving them.
 Modem-only `--tcp-port PORT` overrides its listener; zero selects an allocated

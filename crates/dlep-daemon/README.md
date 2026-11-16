@@ -28,6 +28,12 @@ within 15 seconds. Events use the connected numeric endpoint; applications own
 reconnection and resolve again by calling `connect_named` again. Wait for
 `SessionUp` after connecting before issuing session commands.
 
+`ScopedPeer::new(ipv6, "eth0", port)` represents a link-local peer with a named
+interface. `connect_scoped(&peer)` resolves that interface afresh and verifies
+the IPv6 IP SAN. Configured peers use `RouterConfig.scoped_peers`; serialization
+combines them with numeric/DNS peers in TOML `static_peers`. Full router struct
+initializers need the new field or a default.
+
 Applications can configure plugins with `[extensions.NAME]` tables, stored in
 `config.shared.extensions`. Register a matching factory on either daemon builder:
 

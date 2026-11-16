@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Router CLI/configuration peers accept named IPv6 zones such as
+  `[fe80::1%eth0]:854`. Every connection attempt resolves the interface afresh,
+  preserving reconnect backoff and endpoint deduplication. TLS verifies the
+  IPv6 IP SAN, never the interface name; config checks do not resolve zones.
+  Library callers gain `ScopedPeer` and `RouterDaemon::connect_scoped`.
+  `PeerEndpoint` gains a `Scoped` variant, and full `RouterConfig` initializers
+  need the new `scoped_peers` field or a default. Serialization still uses the
+  single TOML `static_peers` list. Existing numeric scopes remain supported.
 - Modems can configure bounded Peer Offer retransmissions using
   `[discovery].offer_retries` (0–5, default 0) and `offer_retry_interval_ms`
   (minimum/default 1000). Retries preserve each probe's endpoint/interface,

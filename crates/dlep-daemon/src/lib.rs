@@ -37,7 +37,7 @@ pub use events::{
 pub use extensions::{ExtensionCatalog, ExtensionConfig, ExtensionSetupError, ExtensionsConfig};
 pub use link_control::{LinkControl, LinkControlReply, LinkRequest, LinkResponse};
 pub use modem::{ModemBuilder, ModemDaemon};
-pub use peer::{NamedPeer, PeerEndpoint};
+pub use peer::{NamedPeer, PeerEndpoint, ScopedPeer};
 pub use router::{RouterBuilder, RouterDaemon};
 pub use state::{
     DaemonSnapshot, DestinationPhase, DestinationSnapshot, SessionPhase, SessionSnapshot,

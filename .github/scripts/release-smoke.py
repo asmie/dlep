@@ -55,6 +55,11 @@ class Smoke:
         self.run(["openssl", "x509", "-req", "-in", str(self.root / "modem.csr"),
                   "-CA", str(self.root / "ca.pem"), "-CAkey", str(self.root / "ca.key"), "-CAcreateserial",
                   "-out", str(self.root / "dns-modem.pem"), "-days", "1", "-extfile", str(dns_extensions)])
+        scoped_extensions = self.root / "scoped-extensions.cnf"
+        scoped_extensions.write_text(extensions.read_text().replace("IP:127.0.0.1,IP:::1", "IP:fe80::1"))
+        self.run(["openssl", "x509", "-req", "-in", str(self.root / "modem.csr"),
+                  "-CA", str(self.root / "ca.pem"), "-CAkey", str(self.root / "ca.key"), "-CAcreateserial",
+                  "-out", str(self.root / "scoped-modem.pem"), "-days", "1", "-extfile", str(scoped_extensions)])
 
     def tls_flags(self, role):
         return ["--ca-bundle", str(self.root / "ca.pem"), "--cert", str(self.root / f"{role}.pem"),
@@ -162,6 +167,13 @@ termination_timeout_ms = 1000
                 if role == "router":
                     self.run(command + ["--peer", "127.0.0.1:854", "--peer", "[::1]:854", "--no-tls", "--check-config"])
                     self.run(command + ["--peer", "does-not-exist.invalid:854", "--no-tls", "--check-config"])
+                    for peer in ("[fe80::1%dlep-missing]:854", "[fe80::1%3]:854"):
+                        self.run(command + ["--peer", peer, "--no-tls", "--check-config"])
+                    scoped = self.config(f"scoped-check-{unified}")
+                    scoped.write_text("mode='static'\nstatic_peers=['[fe80::1%dlep-missing]:854']\n" + scoped.read_text())
+                    self.run(command + ["--config", str(scoped), "--no-tls"] + common)
+                    for peer in ("[::1%lo]:854", "[fe80::1%]:854", "[fe80::1%4294967296]:854"):
+                        self.run(command + ["--peer", peer, "--check-config"], expected=2)
                     named = self.config(f"named-check-{unified}")
                     named.write_text("mode='static'\nstatic_peers=['does-not-exist.invalid:854']\n" + named.read_text())
                     self.run(command + ["--config", str(named)] + common + self.tls_flags(role))
@@ -316,33 +328,45 @@ printf '%s\n' "${COMPREPLY[@]}"
                 child.kill()
                 child.wait(timeout=5)
 
-    def dns_session(self, unified):
-        name = f"dns-reconnect-{unified}"
-        modem_flags = ["--interface", "lo", "--bind-addr", "127.0.0.1", "--discovery-port", "0"]
+    def identity_session(self, unified, scoped=False):
+        kind = "scoped" if scoped else "dns"
+        name = f"{kind}-reconnect-{unified}"
+        interface = "dlep-test" if scoped else "lo"
+        ip = "fe80::1" if scoped else "127.0.0.1"
+        modem_flags = ["--interface", interface, "--bind-addr", ip, "--discovery-port", "0"]
         modem_flags += self.tls_flags("modem")
         cert_index = modem_flags.index("--cert")
-        modem_flags[cert_index + 1] = str(self.root / "dns-modem.pem")
+        modem_flags[cert_index + 1] = str(self.root / f"{kind}-modem.pem")
         command = self.command("modem", unified) + modem_flags
         modem = self.start(f"{name}-modem", command + ["--tcp-port", "0"])
         address = self.wait_log(modem, r"modem listening on (\S+)")
         port = address.rsplit(":", 1)[1]
         path = self.config(f"{name}-router")
-        flags = ["--config", str(path), "--interface", "lo"] + self.tls_flags("router")
+        flags = ["--config", str(path), "--interface", interface, "--bind-addr", ip] + self.tls_flags("router")
+        peer = f"[fe80::1%dlep-test]:{port}" if scoped else f"localhost:{port}"
+        peers = [peer, address] if scoped else [peer]
         if unified:
-            path.write_text(f"mode='static'\nstatic_peers=['localhost:{port}']\n" + path.read_text())
+            path.write_text(f"mode='static'\nstatic_peers={peers!r}\n" + path.read_text())
         else:
-            flags += ["--peer", f"localhost:{port}"]
+            for peer in peers:
+                flags += ["--peer", peer]
         router = self.start(f"{name}-router", self.command("router", unified) + flags)
         self.wait_log(router, r"session up")
         assert address in router[1].read_text()
         assert "tls=true" in router[1].read_text()
+        if scoped:
+            time.sleep(2.2)
+            assert len(re.findall(r"session up", router[1].read_text())) == 1
         self.stop(modem)
         replacement = self.start(f"{name}-replacement", command + ["--tcp-port", port])
         self.wait_log(replacement, r"modem listening on (\S+)")
         self.wait_log(router, r"session up", count=2)
+        if scoped:
+            time.sleep(2.2)
+            assert len(re.findall(r"session up", router[1].read_text())) == 2
         self.stop(router, signal.SIGINT)
         self.stop(replacement)
-        print(f"PASS session: {name} (DNS-only certificate, {'config' if unified else 'CLI'} peer, reconnect)", flush=True)
+        print(f"PASS session: {name} ({'named zone plus numeric alias' if scoped else 'DNS-only certificate'}, {'config' if unified else 'CLI'} peer, reconnect)", flush=True)
 
 
 def main():
@@ -361,10 +385,12 @@ def main():
             smoke.session("launcher-ipv6-mutual-tls", True, "::1", True)
             smoke.session("standalone-ipv4-discovery-mutual-tls", False, "127.0.0.1", True, discovery=True)
             smoke.session("launcher-ipv4-discovery-plaintext", True, "127.0.0.1", False, discovery=True)
-            smoke.dns_session(False)
-            smoke.dns_session(True)
+            smoke.identity_session(False)
+            smoke.identity_session(True)
+            smoke.identity_session(False, scoped=True)
+            smoke.identity_session(True, scoped=True)
             smoke.session("launcher-dual-discovery-two-families", True, "0.0.0.0", False, discovery=True, peers=2, dual=True)
-            print(json.dumps({"cli_and_certificate_checks": smoke.checked, "session_scenarios": 7, "version": args.version}))
+            print(json.dumps({"cli_and_certificate_checks": smoke.checked, "session_scenarios": 9, "version": args.version}))
         except BaseException:
             for child, log in smoke.children:
                 print(f"--- {log.name}: {child.args}\n{log.read_text()}", flush=True)

@@ -595,6 +595,7 @@ areas below. Validation should continue to accompany features.
 Extension termination, factory settings, and standard-signal discovery hooks are
 complete in chunks 75–77. Arbitrary rustls configurations can already be supplied
 through builders; custom TLS verification does not require weakening defaults.
+Named IPv6 interface zones for static peers are complete in chunk 81.
 
 Simultaneous IPv4/IPv6 discovery is complete in chunk 78. The remaining larger
 scope follow-up is full non-Linux daemon transport. Chunk 79 adds an experimental
@@ -1560,6 +1561,21 @@ The order of work was:
     verify independent endpoints and scoped advertisements, then establish TLS.
     Release smoke enables retries in discovery scenarios without duplicate
     sessions and rejects invalid settings before startup.
+
+81. Named IPv6 static-peer interfaces. **Done** — CLI and TOML endpoints accept
+    `[fe80::1%eth0]:PORT`, with validated case-sensitive names retained as
+    `ScopedPeer` identities. Each attempt resolves the interface afresh without
+    DNS, allowing retry after missing devices and changed indices. Config checks
+    remain syntax-only for peer zones. `connect_scoped` exposes the same library
+    behavior, while existing numeric scope IDs keep their path. TLS verifies the
+    bare IPv6 IP SAN; the interface is never an identity or SNI name. Static
+    scheduling shares admission, endpoint reservations, retries, cancellation,
+    and retained numeric history with existing peers. Router configuration gains
+    `scoped_peers`, serialized through the same TOML list. Cases cover missing
+    interfaces, malformed input, round trips, reconnects, scoped destination
+    flow, and rejection of an interface-name DNS certificate. Standalone/launcher
+    smoke scenarios verify named/numeric aliases do not open duplicate sessions
+    before or after modem restart.
 
 ---
 

@@ -1,5 +1,19 @@
 use std::net::{IpAddr, SocketAddr};
 
+/// Maximum interface-name length on the current platform, excluding NUL.
+pub const MAX_INTERFACE_NAME_BYTES: usize = nix::libc::IFNAMSIZ - 1;
+
+/// Resolve an interface name without selecting an address or imposing multicast
+/// requirements. Call for each connection attempt; indices can change.
+pub fn interface_index(name: &str) -> std::io::Result<u32> {
+    nix::net::if_::if_nametoindex(name).map_err(|error| {
+        std::io::Error::new(
+            std::io::Error::from(error).kind(),
+            format!("cannot resolve interface {name:?}: {error}"),
+        )
+    })
+}
+
 /// Identifies a network interface for multicast socket binding.
 #[derive(Clone, Debug)]
 pub enum InterfaceSpec {

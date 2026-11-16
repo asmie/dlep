@@ -244,3 +244,53 @@ async fn modem_offer_retry_settings_validate_round_trip_and_reject_router_use() 
     assert!(toml::from_str::<ModemConfig>("[discovery]\noffer_retries=256").is_err());
     assert!(toml::from_str::<ModemConfig>("[discovery]\noffer_retry_interval=1000").is_err());
 }
+
+#[test]
+fn named_ipv6_zones_parse_offline_and_round_trip_separately_from_dns() {
+    use dlep_daemon::{PeerEndpoint, ScopedPeer};
+    let text = "mode='static'\nstatic_peers=['[fe80::1%Radio0]:1854','[fe80::2%3]:854','radio.example:854']\n[network]\nuse_tls=false\ngtsm_enforce=false";
+    let config: RouterConfig = toml::from_str(text).unwrap();
+    check_router_config(&config).unwrap();
+    assert_eq!(config.static_peers.len(), 1);
+    assert_eq!(config.named_peers.len(), 1);
+    let peer = &config.scoped_peers[0];
+    assert_eq!(
+        peer.address(),
+        "fe80::1".parse::<std::net::Ipv6Addr>().unwrap()
+    );
+    assert_eq!(peer.interface(), "Radio0");
+    assert_eq!(peer.port(), 1854);
+    assert_eq!(peer.to_string(), "[fe80::1%Radio0]:1854");
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(!serialized.contains("scoped_peers"));
+    let copy: RouterConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(copy.scoped_peers, config.scoped_peers);
+    let missing = ScopedPeer::new("fe80::1".parse().unwrap(), "dlep-missing", 854).unwrap();
+    assert!(missing.resolve().is_err());
+    for invalid in [
+        "[fe80::1%]:854",
+        "[fe80::1%bad name]:854",
+        "[fe80::1%bad%name]:854",
+        "[fe80::1%bad/name]:854",
+        "[fe80::1%bad\0name]:854",
+        "[fe80::1%interface-too-long]:854",
+        "[::1%lo]:854",
+        "[2001:db8::1%eth0]:854",
+        "[ff02::1%eth0]:854",
+        "[::%eth0]:854",
+        "[127.0.0.1%eth0]:854",
+        "[fe80::1%4294967296]:854",
+        "[fe80::1%eth0]:65536",
+        "[fe80::1%eth0]:+854",
+        "[fe80::1%eth0]",
+        "fe80::1%eth0:854",
+    ] {
+        assert!(
+            invalid.parse::<PeerEndpoint>().is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+    // A zone-only static configuration is valid even before its device exists.
+    let only: RouterConfig = toml::from_str("mode='static'\nstatic_peers=['[fe80::1%dlep-missing]:854']\n[network]\nuse_tls=false\ngtsm_enforce=false").unwrap();
+    check_router_config(&only).unwrap();
+}

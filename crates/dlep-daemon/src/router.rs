@@ -208,6 +208,17 @@ impl RouterDaemon {
         Ok(peer)
     }
 
+    /// Resolve a named IPv6 zone afresh and connect with IP-based TLS identity.
+    /// Returns before DLEP initialization; callers own automatic reconnection.
+    pub async fn connect_scoped(
+        &self,
+        peer: &crate::ScopedPeer,
+    ) -> Result<SocketAddr, DaemonError> {
+        let address = peer.resolve()?;
+        self.connect_static(address).await?;
+        Ok(address)
+    }
+
     fn connection_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, DaemonError> {
         self.session_slots
             .clone()

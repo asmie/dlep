@@ -332,6 +332,8 @@ pub struct RouterConfig {
     pub static_peers: Vec<SocketAddr>,
     /// Configured DNS peers; serialized alongside numeric `static_peers`.
     pub named_peers: Vec<crate::NamedPeer>,
+    /// IPv6 link-local peers with named zones; serialized in `static_peers`.
+    pub scoped_peers: Vec<crate::ScopedPeer>,
     #[serde(default = "default_router_peer_description")]
     pub peer_description: String,
 }
@@ -346,6 +348,7 @@ impl Default for RouterConfig {
             mode: DiscoveryMode::default(),
             static_peers: Vec::new(),
             named_peers: Vec::new(),
+            scoped_peers: Vec::new(),
             peer_description: default_router_peer_description(),
         }
     }
@@ -658,10 +661,12 @@ impl From<RouterConfigFile> for RouterConfig {
     fn from(file: RouterConfigFile) -> Self {
         let mut static_peers = Vec::new();
         let mut named_peers = Vec::new();
+        let mut scoped_peers = Vec::new();
         for peer in file.static_peers {
             match peer {
                 crate::PeerEndpoint::Address(addr) => static_peers.push(addr),
                 crate::PeerEndpoint::Named(peer) => named_peers.push(peer),
+                crate::PeerEndpoint::Scoped(peer) => scoped_peers.push(peer),
             }
         }
         Self {
@@ -677,6 +682,7 @@ impl From<RouterConfigFile> for RouterConfig {
             mode: file.mode,
             static_peers,
             named_peers,
+            scoped_peers,
             peer_description: file.peer_description,
         }
     }
@@ -702,6 +708,12 @@ impl From<RouterConfig> for RouterConfigFile {
                         .named_peers
                         .into_iter()
                         .map(crate::PeerEndpoint::Named),
+                )
+                .chain(
+                    config
+                        .scoped_peers
+                        .into_iter()
+                        .map(crate::PeerEndpoint::Scoped),
                 )
                 .collect(),
             peer_description: config.peer_description,

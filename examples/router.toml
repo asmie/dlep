@@ -12,6 +12,9 @@ mode = "discovery"
 # static_peers = ["192.0.2.10:854"]
 # DNS peers are re-resolved on retries; TLS checks the hostname's DNS SAN.
 # static_peers = ["modem.example:854", "[2001:db8::10]:854"]
+# Link-local zones may name a local interface; retries resolve its current index.
+# TLS still checks the IPv6 IP SAN, never the interface name.
+# static_peers = ["[fe80::1%eth0]:854"]
 
 # Free-text description sent in the Peer Type data item.
 peer_description = "dlep-router"

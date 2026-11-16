@@ -1,4 +1,4 @@
-//! Static connections keyed by configured identity, rather than DNS answers.
+//! Static connections keyed by configured identity, rather than DNS/zone answers.
 //! Numeric-only configurations retain the existing discovery-capable driver.
 
 use std::{
@@ -13,6 +13,7 @@ use std::{
 
 use dlep_daemon::{
     DaemonError, DaemonEvent, NamedPeer, PeerConnectionState, PeerEndpoint, RouterDaemon,
+    ScopedPeer,
 };
 use dlep_net::transport::{HOST_CONNECT_TIMEOUT, MAX_RESOLVED_ENDPOINTS};
 use tokio::sync::broadcast::{Receiver, error::RecvError};
@@ -67,6 +68,7 @@ type Attempt<'a> = (
 type Reservations = Arc<Mutex<HashSet<SocketAddr>>>;
 type Resolution = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 type Resolver = dyn Fn(NamedPeer) -> Resolution + Send + Sync;
+type ZoneResolver = dyn Fn(&ScopedPeer) -> std::io::Result<SocketAddr> + Send + Sync;
 
 fn system_resolve(peer: NamedPeer) -> Resolution {
     Box::pin(async move {
@@ -94,11 +96,13 @@ async fn connect(
     peer: PeerEndpoint,
     reservations: Reservations,
     resolve: &Resolver,
+    zone: &ZoneResolver,
 ) -> Result<Connected, DaemonError> {
     let work = async {
         let addresses = match &peer {
             PeerEndpoint::Address(addr) => vec![*addr],
             PeerEndpoint::Named(name) => resolve(name.clone()).await?,
+            PeerEndpoint::Scoped(peer) => vec![zone(peer)?],
         };
         let states = daemon.connection_states();
         let mut error = DaemonError::Config("peer has no available addresses".into());
@@ -118,7 +122,9 @@ async fn connect(
                 reservations: reservations.clone(),
             };
             let result = match &peer {
-                PeerEndpoint::Address(_) => daemon.connect_static(addr).await,
+                PeerEndpoint::Address(_) | PeerEndpoint::Scoped(_) => {
+                    daemon.connect_static(addr).await
+                }
                 PeerEndpoint::Named(name) => {
                     daemon
                         .connect_static_with_server_name(addr, name.host())
@@ -150,8 +156,18 @@ pub async fn run(
     events: &mut Receiver<DaemonEvent>,
     addresses: &[SocketAddr],
     names: &[NamedPeer],
+    scoped: &[ScopedPeer],
 ) {
-    run_with_resolver(daemon, events, addresses, names, &system_resolve).await;
+    run_with_resolver(
+        daemon,
+        events,
+        addresses,
+        names,
+        scoped,
+        &system_resolve,
+        &ScopedPeer::resolve,
+    )
+    .await;
 }
 
 async fn run_with_resolver(
@@ -159,13 +175,16 @@ async fn run_with_resolver(
     events: &mut Receiver<DaemonEvent>,
     addresses: &[SocketAddr],
     names: &[NamedPeer],
+    scoped: &[ScopedPeer],
     resolve: &Resolver,
+    zone: &ZoneResolver,
 ) {
     let peers: BTreeSet<_> = addresses
         .iter()
         .copied()
         .map(PeerEndpoint::Address)
         .chain(names.iter().cloned().map(PeerEndpoint::Named))
+        .chain(scoped.iter().cloned().map(PeerEndpoint::Scoped))
         .collect();
     let mut entries: Vec<_> = peers
         .into_iter()
@@ -217,6 +236,7 @@ async fn run_with_resolver(
                     entry.peer.clone(),
                     reservations.clone(),
                     resolve,
+                    zone,
                 )),
             ));
         }
@@ -292,6 +312,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_retries_refresh_failed_lookups_and_reconnect_without_dns() {
+        use dlep_net::tls::test_helpers::self_signed_for_ip;
+        let pki = self_signed_for_ip("fe80::1".parse().unwrap());
+        let server = server_config_for(pki.cert_der, pki.key_der);
+        let mut config = ModemConfig::default();
+        config.shared.network.bind_addr = "fe80::1".parse().unwrap();
+        config.shared.network.interface = Some("dlep-test".into());
+        config.shared.network.tcp_port = 0;
+        config.shared.network.discovery_port = 0;
+        let first = ModemDaemon::builder()
+            .config(config.clone())
+            .with_rustls_server(server.clone())
+            .spawn()
+            .await
+            .unwrap();
+        let address = first.local_addr();
+        config.shared.network.tcp_port = address.port();
+        let mut router_config = RouterConfig::default();
+        router_config.limits.max_sessions = 4;
+        let router = Arc::new(
+            RouterDaemon::builder()
+                .config(router_config)
+                .with_rustls_client(client_config_for(pki.roots))
+                .spawn()
+                .await
+                .unwrap(),
+        );
+        let mut events = router.subscribe();
+        let driver = router.clone();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let seen = lookups.clone();
+        let task = tokio::spawn(async move {
+            let dns = |_: NamedPeer| -> Resolution { panic!("a named zone must never enter DNS") };
+            let zone = move |peer: &ScopedPeer| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "interface not yet present",
+                    ))
+                } else {
+                    peer.resolve()
+                }
+            };
+            let peer =
+                ScopedPeer::new("fe80::1".parse().unwrap(), "dlep-test", address.port()).unwrap();
+            run_with_resolver(
+                &driver,
+                &mut driver.subscribe(),
+                &[],
+                &[],
+                &[peer],
+                &dns,
+                &zone,
+            )
+            .await;
+        });
+        assert_eq!(up(&mut events).await, address);
+        assert!(lookups.load(Ordering::SeqCst) >= 2);
+        first.shutdown().await.unwrap();
+        let second = ModemDaemon::builder()
+            .config(config)
+            .with_rustls_server(server)
+            .spawn()
+            .await
+            .unwrap();
+        assert_eq!(up(&mut events).await, address);
+        assert!(lookups.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            router.connection_states().borrow()[&address].active_sessions,
+            1
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        Arc::try_unwrap(router)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        second.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn retries_resolve_again_and_keep_tls_identity_when_the_address_changes() {
         let pki = self_signed_for_dns("radio.test.invalid");
         let server = server_config_for(pki.cert_der, pki.key_der);
@@ -354,7 +457,9 @@ mod tests {
                 &mut driver.subscribe(),
                 &[],
                 &[NamedPeer::new("radio.test.invalid", port).unwrap()],
+                &[],
                 &resolve,
+                &ScopedPeer::resolve,
             )
             .await;
         });
@@ -408,7 +513,9 @@ mod tests {
                 &mut driver.subscribe(),
                 &[addr, addr],
                 &[name.clone(), name],
+                &[],
                 &resolve,
+                &ScopedPeer::resolve,
             )
             .await;
         });
@@ -463,7 +570,16 @@ mod tests {
             let names: Vec<_> = (0..20)
                 .map(|i| NamedPeer::new(&format!("radio{i}.test.invalid"), 854).unwrap())
                 .collect();
-            run_with_resolver(&driver, &mut driver.subscribe(), &[], &names, &resolve).await;
+            run_with_resolver(
+                &driver,
+                &mut driver.subscribe(),
+                &[],
+                &names,
+                &[],
+                &resolve,
+                &ScopedPeer::resolve,
+            )
+            .await;
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while active.load(Ordering::SeqCst) < 2 {

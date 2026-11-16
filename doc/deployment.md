@@ -237,9 +237,10 @@ pending jobs; the OS resolver may finish its underlying blocking work afterward.
 
 Rust callers keep numeric peers in `RouterConfig.static_peers` and add validated
 DNS peers with `RouterConfig.named_peers.push(NamedPeer::new("modem.example", 854)?)`.
-Serialization writes both lists into TOML `static_peers`; `named_peers` is not a
-separate TOML setting. The library handle does not automatically connect either
-list; embedders own connection scheduling.
+Serialization combines numeric, DNS, and named-zone lists into TOML
+`static_peers`; `named_peers` and `scoped_peers` are not separate TOML settings.
+The library handle does not automatically connect these lists; embedders own
+connection scheduling. See [named IPv6 interfaces](#named-ipv6-peer-interfaces).
 
 An optional router `[adapter]` section runs an external integration process;
 `command` is an absolute executable path and `args` defaults to `[]`.
@@ -250,6 +251,47 @@ session address, announce, withdrawal, and link-characteristic commands. See the
 [example consumer](../examples/router-adapter.py). Routing policy stays in the
 adapter. It shares the service sandbox and user, with ambient capabilities
 cleared; provision access to your routing service explicitly.
+
+### Named IPv6 peer interfaces
+
+Static link-local peers can use an interface name instead of its current numeric
+scope ID:
+
+```sh
+dlep router --config /etc/dlep/router.toml --peer '[fe80::1%eth0]:854'
+```
+
+```toml
+mode = "static"
+static_peers = ["[fe80::1%eth0]:854"]
+```
+
+The name is case-sensitive and local to the router. It selects the destination
+zone; it does not bind the TCP source address or set the discovery interface.
+Names are resolved to an interface index on every connection attempt, including
+retries after missing devices or dropped sessions. A recreated interface can
+therefore use a new index without editing configuration. Resolution errors use
+the existing reconnect backoff. `--check-config` checks syntax without querying
+the named peer interface, so the device may be absent during validation.
+
+Named zones require a unicast IPv6 link-local address and a nonempty interface
+name within the platform's name-length limit. Numeric scopes such as
+`[fe80::1%3]:854` retain their existing behavior. This is endpoint syntax, not
+URI syntax; `%` is written literally. `--bind-addr` still takes a bare IP and
+uses the separate `--interface` setting for discovery/listener scope.
+
+TLS verifies the bare IPv6 address against an IP SAN. The interface name is
+never a DNS identity or SNI value. Numeric and named-zone entries resolving to
+the same endpoint share connection reservations, preventing duplicate sessions.
+Connection limits, initialization deadlines, backoff, cancellation, and bounded
+numeric history also apply. Events and adapter snapshots retain numeric scope
+IDs in their connected endpoint.
+
+Rust callers use `ScopedPeer::new(ipv6, "eth0", port)` and
+`RouterDaemon::connect_scoped(&peer)`, or add it to `RouterConfig.scoped_peers`
+for the bundled driver's startup scheduling. `ScopedPeer::resolve()` performs a
+fresh interface lookup without DNS; custom callers own reconnect scheduling.
+Full `RouterConfig` initializers need the new `scoped_peers` field or a default.
 
 ### Configured extension factories
 
@@ -355,7 +397,7 @@ metadata, even if a discovery offer advertised a different value.
 | Section | Field | Default | Meaning |
 |---|---|---|---|
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |
-| top level (router) | `static_peers` | `[]` | static modem endpoints: `HOST:PORT`, `IPv4:PORT`, or `[IPv6]:PORT` |
+| top level (router) | `static_peers` | `[]` | static modem endpoints: `HOST:PORT`, `IPv4:PORT`, `[IPv6]:PORT`, or `[fe80::IP%INTERFACE]:PORT` |
 | top level | `peer_description` | binary name | Peer Type data item text |
 | top level (modem) | `secured_medium` | `false` | Modem declaration of access control on the shared RF medium; independent of TLS |
 | `[extensions.NAME]` | plugin-defined | none | Settings for a named factory registered by an embedded application |
