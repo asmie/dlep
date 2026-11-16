@@ -22,7 +22,7 @@ class Smoke:
         self.root = root
         self.version = version
         self.env = dict(os.environ, TOKIO_WORKER_THREADS="2", NO_COLOR="1")
-        for key in ("DLEP_LOG", "DLEP_ROUTER_CONFIG", "DLEP_MODEM_CONFIG"):
+        for key in ("DLEP_LOG", "DLEP_LOG_FORMAT", "DLEP_ROUTER_CONFIG", "DLEP_MODEM_CONFIG"):
             self.env.pop(key, None)
         self.checked = 0
         self.children = []
@@ -99,7 +99,7 @@ termination_timeout_ms = 1000
                 command = self.command(role, unified)
                 for flag in ("--help", "-h"):
                     help_text = self.run(command + [flag]).stdout
-                    for option in ("--config", "--interface", "--log-level", "--no-tls", "--cert",
+                    for option in ("--config", "--interface", "--log-level", "--log-format", "--no-tls", "--cert",
                                    "--key", "--ca-bundle", "--bind-addr", "--discovery-port",
                                    "--check-config", "--dual-stack-discovery", "--generate-completions", "--help", "--version"):
                         assert option in help_text, (role, option)
@@ -122,6 +122,14 @@ termination_timeout_ms = 1000
                     assert "invalid log level" not in result.stderr
                 result = self.run(command + ["--no-tls", "--check-config"], env={"DLEP_LOG": "[broken"})
                 assert "invalid log level" in result.stderr
+                for log_format in ("text", "json"):
+                    result = self.run(command + ["--no-tls", "--check-config", "--log-format", log_format],
+                                      env={"DLEP_LOG_FORMAT": "invalid"})
+                    assert result.stdout == "configuration OK\n"
+                self.run(command + ["--log-format", "invalid"], expected=2)
+                self.run(command + ["--log-format"], expected=2)
+                self.run(command + ["--no-tls", "--check-config"], expected=2,
+                         env={"DLEP_LOG_FORMAT": "invalid"})
                 result = self.run(command + ["--dual-stack-discovery", "--no-tls", "--check-config"], expected=1)
                 assert "explicit interface" in result.stderr
                 self.run(command + ["--dual-stack-discovery", "--interface", "dlep-test", "--no-tls", "--check-config"])
@@ -239,19 +247,21 @@ printf '%s\n' "${COMPREPLY[@]}"
                     assert ("--peer" in options) == (role == "router")
                     assert ("--tcp-port" in options) == (role == "modem")
                     assert shells == complete(role, "--generate-completions", "")
+                    assert {"text", "json"} == complete(role, "--log-format", "")
             else:
                 options = complete("--")
                 assert "--dual-stack-discovery" in options
                 assert "--config" in options
                 assert ("--peer" in options) == (binary == "dlep-router")
+                assert {"text", "json"} == complete("--log-format", "")
                 assert ("--tcp-port" in options) == (binary == "dlep-modem")
             assert shells == complete("--generate-completions", "")
         print("PASS shell completions: five generators, launcher/standalone names and Bash behavior", flush=True)
 
-    def start(self, name, command):
+    def start(self, name, command, env=None):
         log = self.root / f"{name}.log"
         with log.open("w") as output:
-            child = subprocess.Popen(command, env=self.env, stdout=output, stderr=subprocess.STDOUT)
+            child = subprocess.Popen(command, env=self.env | (env or {}), stdout=output, stderr=subprocess.STDOUT)
         entry = (child, log)
         self.children.append(entry)
         return entry
@@ -328,6 +338,57 @@ printf '%s\n' "${COMPREPLY[@]}"
                 child.kill()
                 child.wait(timeout=5)
 
+    def json_session(self, unified):
+        name = f"json-logging-{unified}"
+        description = 'radio "quoted"\nsecond line'
+        path = self.config(f"{name}-modem", mutual=True)
+        path.write_text(f"peer_description={json.dumps(description)}\n" + path.read_text())
+        modem_flags = [] if unified else ["--log-format", "json"]
+        modem = self.start(f"{name}-modem", self.command("modem", unified) + modem_flags +
+                           ["--config", str(path), "--interface", "lo"] + self.tls_flags("modem"),
+                           env={"DLEP_LOG_FORMAT": "json" if unified else "text"})
+
+        def wait_event(entry, prefix):
+            child, log = entry
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                assert child.poll() is None, (child.args, child.returncode, log.read_text())
+                # Ignore the trailing partial record if a concurrent write is in progress.
+                for line in log.read_text().splitlines(keepends=True):
+                    if line.endswith("\n"):
+                        event = json.loads(line)
+                        if event["fields"].get("message", "").startswith(prefix):
+                            return event
+                time.sleep(0.02)
+            raise AssertionError(("JSON log timeout", prefix, log.read_text()))
+
+        listening = wait_event(modem, "modem listening on ")
+        address = listening["fields"]["message"].removeprefix("modem listening on ")
+        startup = wait_event(modem, "starting dlep-modem")
+        assert startup["fields"]["peer"] == description, startup
+        assert startup["fields"]["tls"] is True, startup
+        assert startup["fields"]["port"] == 0, startup
+        path = self.config(f"{name}-router")
+        router_flags = ["--log-format", "json"] if unified else []
+        router = self.start(f"{name}-router", self.command("router", unified) + router_flags +
+                            ["--config", str(path), "--interface", "lo", "--peer", address] + self.tls_flags("router"),
+                            env={"DLEP_LOG_FORMAT": "text" if unified else "json"})
+        connected = wait_event(router, "session up")
+        assert connected["fields"]["addr"] == address, connected
+        assert connected["fields"]["tls"] is True, connected
+        self.stop(router)
+        self.stop(modem)
+        for child, log in (router, modem):
+            text = log.read_text()
+            assert "\x1b" not in text, text
+            events = [json.loads(line) for line in text.splitlines()]
+            assert any(event["fields"].get("message") == "shutdown requested" for event in events), events
+            for event in events:
+                assert event["level"] in {"INFO", "WARN", "ERROR"}, event
+                assert isinstance(event["timestamp"], str) and isinstance(event["target"], str), event
+                assert isinstance(event["fields"], dict), event
+        print(f"PASS session: {name} (JSON fields, escaping, CLI/environment precedence, TLS, SIGTERM)", flush=True)
+
     def identity_session(self, unified, scoped=False):
         kind = "scoped" if scoped else "dns"
         name = f"{kind}-reconnect-{unified}"
@@ -390,7 +451,9 @@ def main():
             smoke.identity_session(False, scoped=True)
             smoke.identity_session(True, scoped=True)
             smoke.session("launcher-dual-discovery-two-families", True, "0.0.0.0", False, discovery=True, peers=2, dual=True)
-            print(json.dumps({"cli_and_certificate_checks": smoke.checked, "session_scenarios": 9, "version": args.version}))
+            smoke.json_session(False)
+            smoke.json_session(True)
+            print(json.dumps({"cli_and_certificate_checks": smoke.checked, "session_scenarios": 11, "version": args.version}))
         except BaseException:
             for child, log in smoke.children:
                 print(f"--- {log.name}: {child.args}\n{log.read_text()}", flush=True)

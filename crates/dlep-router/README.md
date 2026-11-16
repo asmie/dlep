@@ -6,6 +6,9 @@ Native macOS loopback checks passed; native FreeBSD validation is pending.
 
 Requires Rust 1.85 or newer.
 
+Use `--log-format json` or `DLEP_LOG_FORMAT=json` for structured tracing records
+on stdout. Text remains the default; `--log-level` controls either format.
+
 Static IPv6 link-local peers can name an interface, for example
 `--peer '[fe80::1%eth0]:854'` or the same string in TOML `static_peers`.
 Retries resolve the current interface index; TLS verifies the IPv6 address.

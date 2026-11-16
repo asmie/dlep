@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added `--log-format text|json` and `DLEP_LOG_FORMAT` to both daemons and the
+  combined launcher. JSON tracing records are emitted one per line on stdout,
+  with typed event fields, timestamps, levels, and targets. Text remains the
+  default; explicit CLI format overrides the environment. Configuration-check
+  output and stderr diagnostics retain their existing formats.
 - Added launchd and FreeBSD rc.d service definitions for both daemons, with
   dedicated service users, supervised restarts, logging, and graceful SIGTERM
   shutdown. Shared native-platform configurations use port 1854, mutual TLS,

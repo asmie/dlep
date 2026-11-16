@@ -6,6 +6,9 @@ Native macOS loopback checks passed; native FreeBSD validation is pending.
 
 Requires Rust 1.85 or newer.
 
+Use `--log-format json` or `DLEP_LOG_FORMAT=json` for structured tracing records
+on stdout. Text remains the default; `--log-level` controls either format.
+
 Optional `[discovery]` settings `offer_retries = 2` and
 `offer_retry_interval_ms = 1000` repeat an offer after its immediate response.
 The default is no extra offers; retries are bounded and stop when an accepted

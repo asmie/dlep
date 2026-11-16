@@ -127,6 +127,7 @@ CLI flags shared by both binaries:
 | `--bind-addr` | Override the local discovery address; also the modem's TCP listen address. |
 | `--discovery-port` | Override the discovery destination/listen port.      |
 | `--log-level`  | Override the `DLEP_LOG` filter (`info`, `debug`, …).       |
+| `--log-format` | Select `text` (default) or JSON Lines; overrides `DLEP_LOG_FORMAT`. |
 | `--no-tls`     | Force plain TCP regardless of config.                    |
 | `--cert`, `--key` | Override the TLS identity files.                     |
 | `--ca-bundle` | Override the trusted CA bundle.                          |
@@ -136,7 +137,10 @@ CLI flags shared by both binaries:
 | `--version` / `-V` | Show the installed version.                         |
 
 Logging precedence is `--log-level`, then `DLEP_LOG`, then `info`; `RUST_LOG`
-is not read. `--config` also accepts `-c` and the role-specific
+is not read. Set `--log-format json` or `DLEP_LOG_FORMAT=json` for structured
+tracing records on stdout, with timestamp, level, target, and nested `fields`.
+Help, completions, configuration-check output, and stderr diagnostics keep their
+normal formats. `--config` also accepts `-c` and the role-specific
 `DLEP_ROUTER_CONFIG` / `DLEP_MODEM_CONFIG` environment variable; an explicit flag
 wins. Router-only `--peer ADDR` is repeatable and selects static connections.
 It accepts `modem.example:854`, IPv4 `192.0.2.10:854`, or bracketed IPv6

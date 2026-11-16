@@ -653,6 +653,42 @@ opening sockets. Heartbeat and discovery intervals below 1000 ms are rejected
 least 1 ms. Errors name the field, minimum, and supplied value. Zero does not
 disable a timer.
 
+### Structured logging
+
+Both standalone daemons and `dlep router` / `dlep modem` accept
+`--log-format text|json`. Precedence is the CLI flag, then `DLEP_LOG_FORMAT`,
+then `text`. Invalid formats fail argument parsing before daemon startup.
+The existing `--log-level` / `DLEP_LOG` filter applies to either format.
+
+```sh
+dlep router --config /usr/local/etc/dlep/router.toml --log-format json
+# Or set the service environment:
+DLEP_LOG_FORMAT=json dlep-modem --config /usr/local/etc/dlep/modem.toml
+```
+
+JSON mode writes one tracing event per line to stdout without ANSI escapes.
+Records contain `timestamp`, `level`, `target`, and a `fields` object containing
+the message and event values. Numbers and booleans retain their types; quoted
+or multiline descriptions are escaped within one physical line. For example:
+
+```json
+{"timestamp":"2026-11-16T12:00:00Z","level":"INFO","fields":{"message":"session up","addr":"192.0.2.10:1854","tls":true},"target":"dlep_router"}
+```
+
+Additional fields and span context may appear. Event messages and event-specific
+fields are operational logs, not a versioned state API; use the router adapter
+for retained session/destination state. The format uses
+[tracing-subscriber's JSON formatter](https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/fmt/format/struct.Json.html).
+
+Help/version, shell completions, and the `configuration OK` result remain plain
+command output. CLI errors, invalid-filter warnings, and inherited adapter
+stderr keep their existing diagnostic formats. Collect tracing stdout separately
+if the collector requires every line to be JSON. In systemd use a drop-in with
+`Environment=DLEP_LOG_FORMAT=json`; for launchd add `DLEP_LOG_FORMAT` to the
+plist's `EnvironmentVariables` dictionary. FreeBSD's rc.d environment override
+is `dlep_router_env="DLEP_LOG_FORMAT=json"` (or `dlep_modem_env`); the supervisor
+still prefixes its syslog output.
+
 ## 4. Socket privileges
 
 The modem listens on the DLEP well-known port (854, UDP and TCP), which normally

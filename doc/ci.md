@@ -102,6 +102,13 @@ heartbeat intervals and must shut down cleanly on SIGINT/SIGTERM. All network
 changes occur in disposable namespaces. Use the sudo alternative in the network
 test instructions when user namespaces are unavailable.
 
+Two JSON-logging scenarios check both roles through the standalone commands and
+combined launcher during mutual-TLS sessions. They cover CLI/environment format
+precedence, typed fields, escaped multiline descriptions, complete JSON records,
+log filtering, and graceful SIGTERM shutdown. CLI checks reject invalid formats,
+preserve plain configuration-check output, and exercise generated format-value
+completions.
+
 Extension runtime checks cover termination requests from negotiated session,
 message, data-item, and destination hooks. They verify IPv4/IPv6 and both roles,
 session isolation, protocol-error precedence, and exactly-once cleanup. Paused

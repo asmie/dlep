@@ -17,6 +17,12 @@ use dlep_daemon::{
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing_subscriber::EnvFilter;
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
 /// DLEP (RFC 8175) router-side daemon.
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -48,6 +54,10 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, env = "DLEP_LOG", default_value = "info")]
     log_level: String,
+
+    /// Log format: text or newline-delimited JSON.
+    #[arg(long, value_enum, env = "DLEP_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
 
     /// Disable TLS — development only.
     #[arg(long)]
@@ -98,7 +108,7 @@ where
         std::io::Write::write_all(&mut std::io::stdout().lock(), &script)?;
         return Ok(());
     }
-    init_tracing(&cli.log_level);
+    init_tracing(&cli.log_level, cli.log_format);
 
     let mut config: RouterConfig =
         load_toml_config(cli.config.as_deref()).context("loading router configuration")?;
@@ -508,7 +518,7 @@ impl ReconnectQueue {
     }
 }
 
-fn init_tracing(requested: &str) {
+fn init_tracing(requested: &str, format: LogFormat) {
     let filter = match EnvFilter::try_new(requested) {
         Ok(f) => f,
         Err(err) => {
@@ -516,7 +526,11 @@ fn init_tracing(requested: &str) {
             EnvFilter::new("info")
         }
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+    match format {
+        LogFormat::Text => subscriber.init(),
+        LogFormat::Json => subscriber.json().with_ansi(false).init(),
+    }
 }
 
 fn apply_overrides(cfg: &mut RouterConfig, cli: &Cli) {

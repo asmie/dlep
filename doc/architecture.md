@@ -605,6 +605,7 @@ checks pending. Strict TCP monitoring on these platforms and other operating
 systems remains open. Physical-link multicast needs native deployment evidence.
 Chunk 83 adds native service definitions for both experimental platforms;
 service-manager lifecycle validation remains pending.
+Chunk 84 adds opt-in JSON logging for both standalone roles and the launcher.
 
 Device-specific radio integration needs a selected device and its control API.
 The generic radio adapter and link-control backend are already available.
@@ -1600,6 +1601,15 @@ The order of work was:
     an unwanted restart. Installation, permissions, log handling, and service
     controls are documented. CI checks native syntax; actual service-manager
     lifecycle and physical-link behavior still require native execution.
+
+84. Structured CLI logging. **Done** — `--log-format text|json` and
+    `DLEP_LOG_FORMAT` select tracing output for both roles and the launcher.
+    The CLI overrides the environment; text remains the default. JSON records
+    preserve typed event fields, escaped descriptions, timestamps, levels,
+    targets, and span context without ANSI escapes. Existing log filters apply
+    to both formats. Help, configuration checks, and stderr diagnostics retain
+    their formats. Release smoke exercises both CLI/environment paths, generated
+    completions, JSON records during mutual-TLS sessions, and SIGTERM shutdown.
 
 ---
 
