@@ -4,7 +4,7 @@
 
 use std::fs::File;
 use std::net::SocketAddr;
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -89,15 +89,17 @@ impl Node {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control");
         let listener = UnixListener::bind(&socket).unwrap();
-        let script = dir.path().join("adapter.py");
-        std::fs::write(&script, include_str!("support/pipeline_adapter.py")).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Execute a read-only fixture through Python. Forked parallel tests
+        // can inherit a temporary script's write handle until exec, causing
+        // ETXTBSY if the kernel is asked to execute that generated file.
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/pipeline_adapter.py");
         let final_state = dir.path().join("final.json");
         let config_path = dir.path().join("config.toml");
         let section = if role == "modem" { "radio" } else { "adapter" };
         let adapter_role = if role == "modem" { "radio" } else { "router" };
         std::fs::write(&config_path, format!(
-            "{config}\n[{section}]\ncommand = {script:?}\nargs = [{adapter_role:?}, {socket:?}, {final_state:?}]\n"
+            "{config}\n[{section}]\ncommand = \"/usr/bin/env\"\nargs = [\"python3\", {script:?}, {adapter_role:?}, {socket:?}, {final_state:?}]\n"
         )).unwrap();
         let output = dir.path().join("daemon.log");
         let file = File::create(&output).unwrap();

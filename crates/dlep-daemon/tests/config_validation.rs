@@ -212,3 +212,35 @@ fn explicit_termination_override_is_preserved_in_toml_and_runtime() {
         );
     }
 }
+
+#[tokio::test]
+async fn modem_offer_retry_settings_validate_round_trip_and_reject_router_use() {
+    assert_eq!(ModemConfig::default().discovery.offer_retries, 0);
+    let text = "[network]\nuse_tls=false\ngtsm_enforce=false\n[discovery]\noffer_retries=2\noffer_retry_interval_ms=1000\n";
+    let config: ModemConfig = toml::from_str(text).unwrap();
+    check_modem_config(&config).unwrap();
+    let copy: ModemConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(copy.discovery.offer_retries, 2);
+    assert_eq!(copy.discovery.offer_retry_interval_ms, 1000);
+    assert!(toml::from_str::<RouterConfig>(text).is_err());
+    for (retries, interval) in [(6, 1000), (2, 999), (0, 0)] {
+        let mut invalid = config.clone();
+        invalid.discovery.offer_retries = retries;
+        invalid.discovery.offer_retry_interval_ms = interval;
+        assert!(
+            check_modem_config(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("discovery.offer_")
+        );
+        assert!(
+            ModemDaemon::builder()
+                .config(invalid)
+                .spawn()
+                .await
+                .is_err()
+        );
+    }
+    assert!(toml::from_str::<ModemConfig>("[discovery]\noffer_retries=256").is_err());
+    assert!(toml::from_str::<ModemConfig>("[discovery]\noffer_retry_interval=1000").is_err());
+}

@@ -58,6 +58,8 @@ pub enum ConfigCheckError {
     Interface(#[source] std::io::Error),
     #[error("unsupported network configuration: {0}")]
     Transport(#[source] std::io::Error),
+    #[error("invalid modem discovery configuration: {0}")]
+    Discovery(String),
     #[error("invalid modem metrics: {0}")]
     Metrics(String),
     #[error("invalid [radio] adapter: {0}")]
@@ -133,6 +135,9 @@ pub fn check_modem_config_with_extensions(
 ) -> Result<(), ConfigCheckError> {
     dlep_net::gtsm::validate_tcp_enforcement(cfg.shared.network.gtsm_enforce)
         .map_err(ConfigCheckError::Transport)?;
+    cfg.discovery
+        .validate()
+        .map_err(ConfigCheckError::Discovery)?;
     catalog.build(&cfg.shared.extensions)?;
     cfg.shared
         .timers

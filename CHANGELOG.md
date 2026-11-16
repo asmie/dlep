@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Modems can configure bounded Peer Offer retransmissions using
+  `[discovery].offer_retries` (0–5, default 0) and `offer_retry_interval_ms`
+  (minimum/default 1000). Retries preserve each probe's endpoint/interface,
+  rerun outgoing extension hooks, and cancel when an accepted TCP connection
+  is observed. Repeated probes cannot extend a burst; each socket retains at
+  most 64 bursts while preserving immediate replies at capacity. Rust modem
+  initializers need the new `discovery` field or a default. The FSM adds
+  `with_offer_retries` and `FsmEvent::AppStopDiscoveryOffers`; config checks add
+  `ConfigCheckError::Discovery`. `ModemDiscoveryState::OfferBurst` now denotes
+  pending retries; an immediate-only reply leaves the FSM listening.
 - Added an experimental macOS transport path with explicit
   `[network].gtsm_enforce = false`: TCP/TLS retains outbound TTL/hop limit 255,
   and discovery handles Darwin TTL control messages, interface/source selection,

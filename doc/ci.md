@@ -110,6 +110,14 @@ cancellation/failure must release both sockets and stop their timers. Config
 checks require an explicit interface with both usable address families; release
 smoke exercises the flag and TOML setting for standalone and launcher roles.
 
+Offer-retry checks cover exact attempt counts, independent peers, repeated
+probes, queue capacity, cancellation, stale expiries, and timer-id exhaustion.
+IPv4/IPv6 runtime cases retain local/interface metadata and extension TLVs,
+recover after discarding the immediate offer, and establish TLS using a retry.
+A paused-time case checks socket send failure, connection suppression before
+hooks, fresh probes after disconnect, and timer cleanup on shutdown. Release
+smoke validates modem-only settings and enables retries in discovery scenarios.
+
 Checkpoint 60 (2026-11-15) passed all eight archives, 591 archived Rust tests
 across 60 suites, three command installations, and 113 CLI/certificate checks
 plus four session scenarios for each build. Formatting, clippy, Rust 1.85,
@@ -483,8 +491,11 @@ live modem still cannot bind the listening endpoint.
 The TCP monitor's filter-setup failure test binds a process-specific abstract
 Unix socket name, verifies it cannot be rebound while owned, then locks its BPF
 filter to force setup failure. Rebinding after the error proves the socket was
-released without competing with parallel tests for an ephemeral TCP port. The
-test also checks that a new packet monitor can still start afterward.
+released without competing with parallel tests for an ephemeral TCP port. It
+allows a bounded wait for forked children to exec and close inherited descriptors;
+a persistent leak still fails. The test also checks that a new packet monitor
+can still start afterward. Adapter pipeline fixtures execute the checked-in
+script through Python to avoid executable temporary-file races with those forks.
 
 The normal workspace and coverage runs include `dlep-daemon/tests/churn.rs`.
 It keeps the same daemons alive for 100 successive sessions per address family

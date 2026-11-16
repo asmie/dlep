@@ -6,6 +6,11 @@ native macOS validation is pending.
 
 Requires Rust 1.85 or newer.
 
+Optional `[discovery]` settings `offer_retries = 2` and
+`offer_retry_interval_ms = 1000` repeat an offer after its immediate response.
+The default is no extra offers; retries are bounded and stop when an accepted
+TCP connection is observed.
+
 ```sh
 cargo install dlep-modem --version 0.2.0 --locked
 dlep-modem --help

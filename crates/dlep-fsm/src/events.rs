@@ -106,6 +106,11 @@ pub enum FsmEvent {
         metrics: Option<LinkMetrics>,
     },
     AppStartDiscovery,
+    /// Cancel the modem offer burst for this probe's UDP endpoint. The runtime
+    /// uses this when it observes an accepted TCP connection from that address.
+    AppStopDiscoveryOffers {
+        peer: PeerHint,
+    },
     AppShutdown {
         reason: StatusCode,
     },

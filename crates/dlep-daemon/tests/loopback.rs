@@ -38,6 +38,7 @@ fn fast_timers() -> TimersConfig {
 
 fn loopback_modem_config() -> ModemConfig {
     ModemConfig {
+        discovery: Default::default(),
         secured_medium: false,
         radio: None,
         metrics: dlep_daemon::MetricsConfig {

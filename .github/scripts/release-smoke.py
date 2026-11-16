@@ -135,6 +135,15 @@ termination_timeout_ms = 1000
                 self.run(command + ["-c", str(wrong_bind), "--no-tls", "--bind-addr", "127.0.0.1",
                                     "--discovery-port", "65535"] + common)
                 if role == "modem":
+                    offer = self.config(f"offer-check-{unified}")
+                    base = offer.read_text()
+                    offer.write_text(base + "\n[discovery]\noffer_retries=2\noffer_retry_interval_ms=1000\n")
+                    self.run(command + ["--config", str(offer), "--no-tls"] + common)
+                    for retries, interval in ((6, 1000), (1, 999)):
+                        offer.write_text(base + f"\n[discovery]\noffer_retries={retries}\noffer_retry_interval_ms={interval}\n")
+                        for check in ([], ["--check-config"]):
+                            result = self.run(command + ["--config", str(offer), "--no-tls"] + check, expected=1)
+                            assert "discovery.offer_" in result.stderr
                     self.run(command + ["--tcp-port"], expected=2)
                     for value in ("-1", "65536", "not-a-port"):
                         self.run(command + ["--tcp-port", value, "--check-config"], expected=2)
@@ -264,6 +273,8 @@ printf '%s\n' "${COMPREPLY[@]}"
         for index in range(peers):
             path = self.config(f"{name}-modem-{index}", "192.0.2.123", 1, mutual=tls)
             path.write_text(path.read_text().replace("tcp_port = 0", "tcp_port = 1"))
+            if discovery:
+                path.write_text(path.read_text() + "\n[discovery]\noffer_retries=2\n")
             modem_ip = ("192.0.2.1", "fe80::1")[index] if dual else ip
             command = self.command("modem", unified) + ["--config", str(path), "--interface", interface, "--log-level", "info",
                 "--bind-addr", modem_ip, "--tcp-port", "0", "--discovery-port", str(port)]

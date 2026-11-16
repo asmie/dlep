@@ -97,7 +97,7 @@ State machines for both the discovery phase and the session phase, on both the r
 | `session_router.rs` | `RouterSessionFsm` (`Closed → SessionInitPending → InSession → Terminating → Terminated`). |
 | `session_modem.rs` | `ModemSessionFsm` (`Listening → AwaitingSessionInit → InSession → Terminating → Terminated`). |
 | `discovery_router.rs` | `RouterDiscoveryFsm` (`Idle → Probing`; offers emit events while probing continues). |
-| `discovery_modem.rs` | `ModemDiscoveryFsm` (`Listening → OfferBurst`). |
+| `discovery_modem.rs` | `ModemDiscoveryFsm`: immediate replies with optional bounded `OfferBurst` retries, independent per endpoint. |
 
 ### 4.3 `dlep-net`
 
@@ -143,7 +143,7 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 | `connections.rs` | Retained router endpoint state via `watch`: active task counts and cumulative successful initializations, updated directly by session guards. Reconnect decisions do not depend on the public event bus. Modem discovery uses a separate reference-counted TCP peer registry with entries removed on last close. |
 | `extensions.rs` | Ordered `ExtensionCatalog` recipes and named startup factories, plugin settings tables, and setup errors. Factories construct validated instances before daemon networking. |
 | `runtime.rs` | Channel plumbing: `EventTx = broadcast::Sender<DaemonEvent>` for the public event bus, `mpsc` for internal commands. `DaemonError` lives here too. |
-| `discovery.rs` | `run_discovery` background task: owns a `DiscoverySocket` + a discovery FSM (router or modem), bridges socket I/O to FSM events, applies GTSM filtering on inbound packets, drives periodic Peer_Discovery resends via `DiscoveryTimers`, and translates `EmittedEvent::PeerDiscovered` into `DaemonEvent::PeerDiscovered`. |
+| `discovery.rs` | `run_discovery` background task: owns a `DiscoverySocket` + a discovery FSM, bridges socket I/O to FSM events, drives router probe and bounded modem offer timers with packet context, and translates `EmittedEvent::PeerDiscovered` into `DaemonEvent::PeerDiscovered`. |
 | `session.rs` | The `SessionFsm` trait that the runtime drives, with blanket impls for the router and modem session FSMs. |
 | `router.rs`, `modem.rs` | `RouterDaemon` / `ModemDaemon` handles plus their builders. Builders take a `Config`, optional rustls config, and any number of extensions. |
 | `cli.rs` | Shared CLI helpers used by both binaries: `load_toml_config<T>(Option<&Path>)` and `ConfigLoadError`. |
@@ -606,9 +606,8 @@ Device-specific radio integration needs a selected device and its control API.
 The generic radio adapter and link-control backend are already available.
 Historical follow-up notes in completed milestones are not automatically open
 items: later chunks already closed packaging, reconnect, mutual TLS, Announce,
-and link-characteristics work. Offer retransmission beyond replies to repeated
-router probes is a separate optional behavior, not an unfinished core session
-feature.
+and link-characteristics work. Optional bounded offer retransmission is complete
+in chunk 80; single-reply discovery remains the default.
 
 ### Completed chunks
 
@@ -1546,6 +1545,21 @@ The order of work was:
     temporary copy because this host has no macOS SDK. It is type-check evidence,
     not a native build or runtime result. Full strict transport portability and
     real-link multicast validation remain open.
+
+80. Configurable Peer Offer retries. **Done** — modem-only `[discovery]`
+    settings opt in to 0–5 extra unicast offers at intervals of at least one
+    second. The default remains an immediate reply per valid probe. Each FSM
+    retains at most 64 bursts keyed by UDP endpoint; repeated probes and
+    capacity exhaustion preserve immediate replies without extending bursts.
+    Distinct, non-reused timer ids ignore stale expiries after cancellation or
+    shutdown. Runtime timers retain each probe's address/interface metadata for
+    wildcard connection points and fresh extension send hooks. Connected-router
+    checks precede retries/hooks and cancel a pending burst during TCP/TLS/DLEP
+    initialization. Failed sends consume attempts. Configuration checks and
+    startup share validation. IPv4/IPv6 cases recover a discarded initial offer,
+    verify independent endpoints and scoped advertisements, then establish TLS.
+    Release smoke enables retries in discovery scenarios without duplicate
+    sessions and rejects invalid settings before startup.
 
 ---
 

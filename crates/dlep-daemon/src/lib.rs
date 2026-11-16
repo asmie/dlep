@@ -25,8 +25,9 @@ pub use cli::{
     check_router_config, check_router_config_with_extensions, load_toml_config,
 };
 pub use config::{
-    DestinationPolicyConfig, DiscoveryMode, MetricsConfig, ModemConfig, NetworkConfig, RadioConfig,
-    RouterAdapterConfig, RouterConfig, RouterLimits, SharedConfig, TimersConfig, TlsConfig,
+    DestinationPolicyConfig, DiscoveryMode, MetricsConfig, ModemConfig, ModemDiscoveryConfig,
+    NetworkConfig, RadioConfig, RouterAdapterConfig, RouterConfig, RouterLimits, SharedConfig,
+    TimersConfig, TlsConfig,
 };
 pub use connections::PeerConnectionState;
 pub use events::{

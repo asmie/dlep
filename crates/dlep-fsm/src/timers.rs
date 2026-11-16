@@ -21,6 +21,6 @@ pub enum TimerKind {
     SessionInit,
     /// Waiting for Session Termination Response.
     Termination,
-    /// Periodic discovery Peer Discovery send.
+    /// Periodic router probes or single-shot modem offer retries.
     Discovery,
 }

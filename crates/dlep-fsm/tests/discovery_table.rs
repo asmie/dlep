@@ -120,7 +120,7 @@ fn modem_listening_replies_to_peer_discovery() {
         signal: discovery,
         from,
     });
-    assert_eq!(fsm.state, ModemDiscoveryState::OfferBurst);
+    assert_eq!(fsm.state, ModemDiscoveryState::Listening);
     let send = actions.iter().find_map(|a| match a {
         FsmAction::SendSignal { signal, target } => Some((signal, target)),
         _ => None,
@@ -147,7 +147,9 @@ fn modem_listening_ignores_peer_offer() {
 
 #[test]
 fn modem_offer_burst_returns_to_listening_after_app_shutdown() {
-    let mut fsm = ModemDiscoveryFsm::new(peer_addr(), "dlep-modem".to_string(), false);
+    let mut fsm = ModemDiscoveryFsm::new(peer_addr(), "dlep-modem".to_string(), false)
+        .with_offer_retries(2, std::time::Duration::from_secs(1))
+        .unwrap();
     let _ = fsm.step(FsmEvent::RecvSignal {
         signal: build_peer_discovery("r"),
         from: peer_addr(),

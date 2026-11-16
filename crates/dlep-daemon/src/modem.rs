@@ -390,6 +390,7 @@ impl ModemBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
+        cfg.discovery.validate().map_err(DaemonError::Config)?;
         dlep_net::gtsm::validate_tcp_enforcement(cfg.shared.network.gtsm_enforce)?;
         let extensions = self
             .extensions
@@ -524,17 +525,22 @@ async fn spawn_modem_discovery(
     let members = sockets
         .into_iter()
         .map(|socket| {
-            (
+            Ok((
                 ModemDiscoveryFsm::new(
                     endpoint,
                     cfg.peer_description.clone(),
                     cfg.shared.network.use_tls,
                 )
-                .with_secured_medium(cfg.secured_medium),
+                .with_secured_medium(cfg.secured_medium)
+                .with_offer_retries(
+                    cfg.discovery.offer_retries,
+                    std::time::Duration::from_millis(cfg.discovery.offer_retry_interval_ms.into()),
+                )
+                .map_err(DaemonError::Config)?,
                 socket,
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, DaemonError>>()?;
 
     let (tx, rx) = mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {

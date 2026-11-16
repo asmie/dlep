@@ -498,9 +498,23 @@ mod platform {
                 .err()
                 .expect("locked filter must reject monitor setup");
             assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-            rebound
-                .bind(&addr)
-                .expect("failed setup must release the owned socket's name");
+            // Parallel tests fork a privilege-dropping child. CLOEXEC closes
+            // its inherited socket only at exec, so the abstract name can
+            // briefly outlive this process's last owner. A real leak must
+            // still fail within a bounded deadline.
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    match rebound.bind(&addr) {
+                        Ok(()) => break,
+                        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("unexpected rebind error: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("failed setup must release the owned socket's name");
             assert!(Monitor::new().is_ok());
         }
 

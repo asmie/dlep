@@ -10,6 +10,12 @@ peer_description = "dlep-modem"
 # Whether the shared RF medium enforces access control; independent of DLEP TLS.
 secured_medium = false
 
+# Optional extra Peer Offers after the immediate reply. Default 0, maximum 5.
+# Repeated probes do not extend an active burst. At most 64 bursts per family.
+# [discovery]
+# offer_retries = 2
+# offer_retry_interval_ms = 1000  # minimum 1000
+
 [network]
 # Match the modem's router-facing link: "eui48" (default) or "eui64".
 mac_address_format = "eui48"

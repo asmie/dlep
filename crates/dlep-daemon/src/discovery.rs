@@ -4,13 +4,9 @@
 //! Peer_Discovery sends and listens for Peer_Offers) and `ModemDaemon::spawn`
 //! (modem-side, listens for Peer_Discovery and replies with Peer_Offer).
 //!
-//! Discovery has a single timer kind (`TimerKind::Discovery`) and one
-//! `TimerId` (`TIMER_DISCOVERY = 10`). The periodic-resend semantics
-//! tolerate one stale firing — if we cancel and the timer's already
-//! pushed an expiry into the channel, the FSM observes
-//! `TimerExpired` in a state where it ignores the event (the catch-all
-//! `_ => Vec::new()` branch). So unlike `session::TimerSet`, no
-//! generation tracking is needed here.
+//! Routers use one periodic probe timer. Optional modem offer bursts use bounded
+//! per-peer single-shot timers with non-reused ids, retaining the probe's packet
+//! metadata for each retry. Cancelled/stale expiries cannot revive a burst.
 
 mod extensions;
 pub(crate) use extensions::DiscoveryHooks;
@@ -78,35 +74,46 @@ impl DiscoveryFsm for dlep_fsm::discovery_modem::ModemDiscoveryFsm {
     }
 }
 
-/// Tracks in-flight timer tasks for the discovery runtime. Mirrors the
-/// shape of `session::TimerSet` but drops the generation-counter machinery
-/// because discovery only ever has one timer in flight at a time, and the
-/// FSM tolerates one stale firing (see module comment).
+#[derive(Clone, Copy, Default)]
+struct PacketContext {
+    local: Option<std::net::IpAddr>,
+    interface_index: Option<u32>,
+    peer: Option<SocketAddr>,
+}
+
+/// Router probe or bounded per-peer modem retry timers. The context belongs to
+/// the originating datagram, so a later peer cannot change a retry's scope.
 #[derive(Default)]
 struct DiscoveryTimers {
-    handles: HashMap<TimerId, JoinHandle<()>>,
+    handles: HashMap<TimerId, (JoinHandle<()>, PacketContext)>,
 }
 
 impl DiscoveryTimers {
     /// Arm a timer at `id`. If a previous handle was registered under the
     /// same id, it is aborted before being replaced — this avoids leaking
     /// a task when the FSM re-arms the same logical timer.
-    fn arm(&mut self, id: TimerId, handle: JoinHandle<()>) {
-        if let Some(old) = self.handles.insert(id, handle) {
+    fn arm(&mut self, id: TimerId, handle: JoinHandle<()>, packet: PacketContext) {
+        if let Some((old, _)) = self.handles.insert(id, (handle, packet)) {
             old.abort();
         }
     }
 
     fn cancel(&mut self, id: TimerId) {
-        if let Some(h) = self.handles.remove(&id) {
+        if let Some((h, _)) = self.handles.remove(&id) {
             h.abort();
         }
+    }
+
+    fn context(&self, id: TimerId) -> PacketContext {
+        self.handles
+            .get(&id)
+            .map_or(PacketContext::default(), |(_, packet)| *packet)
     }
 }
 
 impl Drop for DiscoveryTimers {
     fn drop(&mut self) {
-        for (_, h) in self.handles.drain() {
+        for (_, (h, _)) in self.handles.drain() {
             h.abort();
         }
     }
@@ -120,6 +127,8 @@ impl Drop for DiscoveryTimers {
 /// (`Some(FsmEvent::AppStartDiscovery)`) or leave the modem-side FSM in its
 /// default Listening state (`None`).
 /// A shutdown message or closure of the shutdown channel stops discovery.
+/// Timers started while processing a datagram retain that packet's reply
+/// metadata. Native modem runners additionally cancel offers to connected peers.
 pub async fn run_discovery<F: DiscoveryFsm>(
     fsm: F,
     socket: DiscoverySocket,
@@ -277,8 +286,8 @@ async fn run_discovery_io<F: DiscoveryFsm>(
             &events_tx,
             &mut timers,
             &timer_tx,
-            None,
-            None,
+            PacketContext::default(),
+            connected_routers.as_ref(),
             &hooks,
         )
         .await?;
@@ -306,7 +315,8 @@ async fn run_discovery_io<F: DiscoveryFsm>(
                             continue;
                         };
                         let actions = fsm.step(FsmEvent::RecvSignal { signal, from });
-                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, Some(local_addr), Some(interface_index), &hooks).await?;
+                        let packet = PacketContext { local: Some(local_addr), interface_index: Some(interface_index), peer: Some(from) };
+                        process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, packet, connected_routers.as_ref(), &hooks).await?;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                         // A peer controls its datagram contents. Malformed
@@ -322,8 +332,15 @@ async fn run_discovery_io<F: DiscoveryFsm>(
                 }
             }
             Some((id, kind)) = timer_rx.recv() => {
-                let actions = fsm.step(FsmEvent::TimerExpired(id, kind));
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None, &hooks).await?;
+                let packet = timers.context(id);
+                let event = match packet.peer {
+                    Some(peer) if connected_routers.as_ref().is_some_and(|peers| peers.contains(peer)) => {
+                        FsmEvent::AppStopDiscoveryOffers { peer }
+                    }
+                    _ => FsmEvent::TimerExpired(id, kind),
+                };
+                let actions = fsm.step(event);
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, packet, connected_routers.as_ref(), &hooks).await?;
             }
             // Losing the owner is also shutdown; otherwise the receive loop
             // and periodic probe task outlive the last shutdown sender.
@@ -331,7 +348,7 @@ async fn run_discovery_io<F: DiscoveryFsm>(
                 let actions = fsm.step(FsmEvent::AppShutdown {
                     reason: dlep_core::StatusCode::SHUTTING_DOWN,
                 });
-                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, None, None, &hooks).await?;
+                process_actions(actions, &socket, &events_tx, &mut timers, &timer_tx, PacketContext::default(), connected_routers.as_ref(), &hooks).await?;
                 return Ok(());
             }
         }
@@ -345,10 +362,15 @@ async fn process_actions(
     events_tx: &EventTx,
     timers: &mut DiscoveryTimers,
     timer_tx: &mpsc::Sender<(TimerId, TimerKind)>,
-    local: Option<std::net::IpAddr>,
-    interface_index: Option<u32>,
+    packet: PacketContext,
+    connected_routers: Option<&ConnectedRouters>,
     hooks: &DiscoveryHooks,
 ) -> Result<(), DaemonError> {
+    let PacketContext {
+        local,
+        interface_index,
+        ..
+    } = packet;
     for action in actions {
         match action {
             FsmAction::SendSignal { mut signal, target } => {
@@ -356,6 +378,13 @@ async fn process_actions(
                     SendTarget::DiscoveryGroup => None,
                     SendTarget::Unicast(addr) => Some(*addr),
                 };
+                if signal.signal_type == dlep_core::SignalType::PEER_OFFER
+                    && peer.is_some_and(|addr| {
+                        connected_routers.is_some_and(|peers| peers.contains(addr))
+                    })
+                {
+                    continue;
+                }
                 hooks.send(&mut signal, peer, local, interface_index, events_tx);
                 match target {
                     SendTarget::DiscoveryGroup => {
@@ -415,7 +444,7 @@ async fn process_actions(
                         let _ = tx.send((id, kind)).await;
                     })
                 };
-                timers.arm(id, handle);
+                timers.arm(id, handle, packet);
             }
             FsmAction::CancelTimer(id) => timers.cancel(id),
             FsmAction::ResetHeartbeat { .. } | FsmAction::SendMessage(_) | FsmAction::CloseTcp => {
@@ -665,6 +694,57 @@ mod tests {
     async fn tick(ms: u64) {
         advance(Duration::from_millis(ms)).await;
         settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connected_router_cancels_offer_retries_before_hooks_and_requires_a_fresh_probe() {
+        // The first send fails at the socket, but still consumes one attempt.
+        let (socket, input, observed) = ScriptedIo::new(1);
+        let (stop, rx) = mpsc::channel(1);
+        let (events, _) = crate::runtime::new_event_channel();
+        let peers = ConnectedRouters::default();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = dlep_ext::ExtensionRegistry::new();
+        registry.register(Arc::new(GroupObserver {
+            sends: count.clone(),
+            panic_once: false,
+        }));
+        let fsm = ModemDiscoveryFsm::new("0.0.0.0:854".parse().unwrap(), "modem".into(), true)
+            .with_offer_retries(2, Duration::from_secs(1))
+            .unwrap();
+        let task = tokio::spawn(run_discovery_io(
+            fsm,
+            socket,
+            None,
+            rx,
+            events,
+            Some(peers.clone()),
+            DiscoveryHooks::new(&registry, dlep_ext::Role::Modem),
+        ));
+        input
+            .send(incoming(SignalType::PEER_DISCOVERY, "192.0.2.1:1000"))
+            .unwrap();
+        settle().await;
+        assert_eq!(observed.sends.lock().unwrap().len(), 1);
+        // Retry once after the initial OS send failure.
+        tick(1000).await;
+        assert_eq!(observed.sends.lock().unwrap().len(), 2);
+        let accepted = peers.register("192.0.2.1:9999".parse().unwrap());
+        tick(1000).await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(observed.sends.lock().unwrap().len(), 2);
+        drop(accepted);
+        tick(2000).await;
+        assert_eq!(observed.sends.lock().unwrap().len(), 2);
+        input
+            .send(incoming(SignalType::PEER_DISCOVERY, "192.0.2.1:1000"))
+            .unwrap();
+        settle().await;
+        assert_eq!(observed.sends.lock().unwrap().len(), 3);
+        stop.send(()).await.unwrap();
+        task.await.unwrap().unwrap();
+        tick(3000).await;
+        assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]

@@ -568,8 +568,37 @@ fn default_link_request_timeout_ms() -> u32 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModemDiscoveryConfig {
+    /// Extra offers after the immediate response; zero keeps one reply/probe.
+    pub offer_retries: u8,
+    pub offer_retry_interval_ms: u32,
+}
+
+impl Default for ModemDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            offer_retries: 0,
+            offer_retry_interval_ms: 1000,
+        }
+    }
+}
+
+impl ModemDiscoveryConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        dlep_fsm::discovery_modem::validate_offer_retries(
+            self.offer_retries,
+            std::time::Duration::from_millis(self.offer_retry_interval_ms.into()),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(from = "ModemConfigFile")]
 pub struct ModemConfig {
+    /// Modem-only optional unicast Peer Offer retransmission settings.
+    #[serde(default)]
+    pub discovery: ModemDiscoveryConfig,
     /// Whether the shared RF medium implements access control (Peer Type S flag).
     #[serde(default)]
     pub secured_medium: bool,
@@ -587,6 +616,7 @@ pub struct ModemConfig {
 impl Default for ModemConfig {
     fn default() -> Self {
         Self {
+            discovery: ModemDiscoveryConfig::default(),
             secured_medium: false,
             metrics: MetricsConfig::default(),
             radio: None,
@@ -683,6 +713,8 @@ impl From<RouterConfig> for RouterConfigFile {
 #[serde(deny_unknown_fields)]
 struct ModemConfigFile {
     #[serde(default)]
+    discovery: ModemDiscoveryConfig,
+    #[serde(default)]
     extensions: crate::ExtensionsConfig,
     /// Whether the shared RF medium implements access control (Peer Type S flag).
     #[serde(default)]
@@ -703,6 +735,7 @@ struct ModemConfigFile {
 impl From<ModemConfigFile> for ModemConfig {
     fn from(file: ModemConfigFile) -> Self {
         Self {
+            discovery: file.discovery,
             secured_medium: file.secured_medium,
             shared: SharedConfig {
                 extensions: file.extensions,

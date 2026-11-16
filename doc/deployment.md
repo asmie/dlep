@@ -379,6 +379,8 @@ metadata, even if a discovery offer advertised a different value.
 | `[timers]` | `discovery_interval_ms` | `5000` | Peer Discovery resend interval, minimum 1000 ms |
 | `[timers]` | `session_init_timeout_ms` | `5000` | positive deadline for initialization: router awaits response, modem awaits request |
 | `[timers]` | `termination_timeout_ms` | omitted: `4 × heartbeat_interval_ms` | positive explicit override for Session Termination Response; default resolves to `240000` ms |
+| `[discovery]` (modem) | `offer_retries` | `0` | Extra Peer Offers after the immediate reply, 0–5 |
+| `[discovery]` (modem) | `offer_retry_interval_ms` | `1000` | Interval between additional offers, minimum 1000 ms |
 | `[metrics]` (modem) | `max_data_rate_rx_bps` / `max_data_rate_tx_bps` | `0` | maximum receive/transmit rates, bits/second |
 | `[metrics]` (modem) | `current_data_rate_rx_bps` / `current_data_rate_tx_bps` | `0` | current receive/transmit rates, bits/second |
 | `[metrics]` (modem) | `latency_us` | `0` | transmission delay, microseconds |
@@ -490,6 +492,51 @@ Rust callers using full `NetworkConfig` initializers must supply the new
 `discovery_dual_stack` field or use `..NetworkConfig::default()`.
 
 
+### Modem Peer Offer retries
+
+The default modem behavior is one immediate Peer Offer per valid Peer Discovery.
+To recover lost offers before the router's next periodic probe, configure the
+modem only:
+
+```toml
+[discovery]
+offer_retries = 2
+offer_retry_interval_ms = 1000
+```
+
+This sends the immediate response and up to two further unicast offers, one
+second apart. It is an optional delivery policy; the immediate response and
+router's regular probes still follow [RFC 8175 §7.1](https://www.rfc-editor.org/rfc/rfc8175.html#section-7.1).
+At most five additional attempts are allowed, with a minimum one-second
+interval even when the configured retry count is zero. `--check-config` and
+startup use the same validation; routers reject this modem-only section.
+
+Each discovery socket retains at most 64 pending bursts, keyed by the router's
+UDP endpoint (including IPv6 scope). At capacity, new probes still receive their
+immediate response but do not schedule retries. Repeated probes from a pending
+endpoint also receive immediate replies without extending or resetting its
+burst. Dual-stack discovery has an independent bounded queue for each family.
+Failed sends consume attempts, so an unavailable route cannot cause unlimited
+retries.
+
+Each retry rebuilds the offer and runs outgoing extension hooks with the
+original probe's local address, interface index, and reply endpoint. Wildcard
+TCP connection points remain usable, and TLS/secured-medium declarations are
+preserved. Retries check the connected-router registry before sending or
+calling hooks. An observed TCP connection cancels the remaining burst,
+including during TLS/DLEP initialization; a later probe can start a new burst
+after that connection closes. Existing address/scope matching also applies
+across UDP and TCP families. Shutdown or task cancellation releases all timers.
+
+For Rust callers, `ModemConfig.discovery` contains `ModemDiscoveryConfig`;
+full modem struct initializers need the field or `..ModemConfig::default()`.
+Low-level users can enable the same bounded FSM policy with
+`ModemDiscoveryFsm::with_offer_retries(count, interval)`. Daemon runners supply
+connected-router suppression automatically; separate custom runtimes must
+deliver `FsmEvent::AppStopDiscoveryOffers { peer }` when appropriate.
+
+### Configuration validation
+
 Validate without starting the daemon:
 
 ```bash
@@ -499,7 +546,7 @@ dlep-modem  --config /etc/dlep/modem.toml  --check-config
 
 `configuration OK` on stdout and exit code 0 mean the TOML parses, static
 mode has peers, any explicit discovery interface is usable on this host, modem
-metric values and timers pass validation, and all TLS material loads. This does
+metrics/offer-retry settings and timers pass validation, and all TLS material loads. This does
 not open sockets or check GTSM capabilities, firewall rules, or peer reachability.
 
 Router `[limits]` values are checked by `--check-config` and daemon startup.

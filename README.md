@@ -547,6 +547,13 @@ silently ignores discovery from a router address with an accepted TCP
 connection, including during TLS and DLEP initialization. Offers resume after
 the last connection from that address closes.
 
+Modems can retry Peer Offers after the immediate reply by setting
+`[discovery].offer_retries` (default `0`, maximum `5`) and
+`offer_retry_interval_ms` (default/minimum `1000`). This can recover a lost
+offer without waiting for another router probe. Retries retain the original
+UDP endpoint and interface; a connected router cancels its pending burst.
+See [offer retries](doc/deployment.md#modem-peer-offer-retries) for limits.
+
 The termination-response timeout defaults to four local heartbeat intervals
 (240 seconds with the default heartbeat). Omit `[timers].termination_timeout_ms`
 to retain this automatic behavior, or set a positive explicit override.

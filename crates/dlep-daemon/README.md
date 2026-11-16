@@ -7,6 +7,13 @@ reject the strict default before startup. Native macOS validation is pending.
 
 Requires Rust 1.85 or newer.
 
+Modems can set `config.discovery.offer_retries` (0–5, default 0) and
+`offer_retry_interval_ms` (minimum/default 1000) for additional unicast Peer
+Offers after a valid probe. Each socket retains at most 64 bursts, preserving
+packet metadata and outgoing extension hooks. Connected routers suppress/cancel
+retries, and shutdown owns all timers. Full `ModemConfig` initializers need the
+new `discovery` field or a default.
+
 Set `config.shared.network.discovery_dual_stack = true` with an explicit
 `interface` to run IPv4 and IPv6 discovery together. Both usable address
 families are required. `bind_addr` still selects the modem's single TCP listener;
