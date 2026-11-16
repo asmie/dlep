@@ -1,8 +1,8 @@
 # Deploying dlep-router and dlep-modem
 
 This guide covers building, certificate provisioning, configuration, the
-privileged-port question, firewalls, and systemd. Working example configs
-and unit files live in [`examples/`](../examples/).
+privileged-port question, firewalls, and native service managers. Working example
+configs and service definitions live in [`examples/`](../examples/).
 
 ## 1. Build and install
 
@@ -769,7 +769,127 @@ DLEP initialization. UDP and TCP source ports do not need to match. IPv6
 link-local addresses are matched within their interface scope. Other router
 addresses remain eligible; the last connection closing restores replies.
 
-## 7. Troubleshooting
+## 7. macOS launchd and FreeBSD rc.d
+
+The experimental native services use the standalone executables in
+`/usr/local/bin`, a dedicated non-login `dlep` user/group, and configuration in
+`/usr/local/etc/dlep`. Provision that account with your platform's account
+management tools before loading a service. On FreeBSD, for example:
+
+```sh
+sudo pw groupadd dlep
+sudo pw useradd dlep -g dlep -d /nonexistent -s /usr/sbin/nologin
+```
+
+On macOS, provision a non-login `dlep` account and `dlep` group using your site's
+directory-service policy; the launchd definitions refer to both by name.
+Installing a plist does not create them.
+
+Use the shared [native router](../examples/native/router.toml) and
+[native modem](../examples/native/modem.toml) configurations. Both explicitly
+set `gtsm_enforce = false`, retain TLS, and use UDP/TCP port **1854** so the DLEP
+process needs no privileged-port access. A router in discovery mode must use
+the modem's UDP port. For static mode, use the modem's TCP port in `static_peers`.
+These settings do not change the Linux examples or protocol defaults.
+
+On each host, install only that host's role, and adjust its interface and PKI
+paths before starting it. For a modem:
+
+```sh
+sudo install -d -o root -g dlep -m 0750 /usr/local/etc/dlep /usr/local/etc/dlep/pki
+sudo install -o root -g dlep -m 0640 examples/native/modem.toml /usr/local/etc/dlep/modem.toml
+# Generate certificates as in section 2, with the modem's real IP/DNS SAN.
+sudo install -o root -g dlep -m 0640 ca.pem modem.pem modem.key /usr/local/etc/dlep/pki/
+# Edit /usr/local/etc/dlep/modem.toml, then validate with the service identity:
+sudo -u dlep /usr/local/bin/dlep-modem --config /usr/local/etc/dlep/modem.toml --check-config
+```
+
+Use `router.toml`, `router.pem`, `router.key`, and `dlep-router` for the router.
+The CA's private key stays off both service hosts. Match firewall rules to the
+chosen port. Adapters inherit the service identity and need their own device
+or routing permissions. These services provide user separation and supervision;
+they do not reproduce the Linux systemd sandbox.
+
+### macOS launchd services
+
+Install [the modem plist](../examples/launchd/org.dlep.modem.plist) as a root-owned
+LaunchDaemon after validating its configuration:
+
+```sh
+sudo install -d -o root -g dlep -m 0750 /var/log/dlep
+sudo touch /var/log/dlep/modem.log /var/log/dlep/modem.err.log
+sudo chown dlep:dlep /var/log/dlep/modem.log /var/log/dlep/modem.err.log
+sudo chmod 0640 /var/log/dlep/modem.log /var/log/dlep/modem.err.log
+sudo install -o root -g wheel -m 0644 examples/launchd/org.dlep.modem.plist /Library/LaunchDaemons/
+plutil -lint /Library/LaunchDaemons/org.dlep.modem.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/org.dlep.modem.plist
+sudo launchctl print system/org.dlep.modem
+sudo tail -f /var/log/dlep/modem.log /var/log/dlep/modem.err.log
+```
+
+Use `org.dlep.router.plist` and label `org.dlep.router` for the router. The daemon
+runs with `router.log` and `router.err.log`; provision those files the same way.
+The log directory stays root-owned, while each log file is writable by `dlep`.
+It runs in the foreground as `dlep`, starts when loaded, and restarts after a
+nonzero exit with a two-second throttle. A successful exit is left stopped.
+The files use absolute paths; shell variables are not expanded in plist values.
+
+To stop and unload the job:
+
+```sh
+sudo launchctl bootout system/org.dlep.modem
+```
+
+To apply changed configuration, boot out and bootstrap the job again. Avoid
+`kickstart -k` when a graceful DLEP shutdown is required. `ExitTimeOut = 300`
+allows the default 240-second protocol termination deadline plus transport I/O;
+increase it if your configured deadline is longer. See Apple's
+[launchd property-list reference](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
+for restart and shutdown settings. Manage log rotation according to local
+policy; unload/reload the job when replacing its open log files.
+
+### FreeBSD rc.d services
+
+Install [the modem script](../examples/rc.d/dlep_modem), enable it, and start it:
+
+```sh
+sudo install -o root -g wheel -m 0555 examples/rc.d/dlep_modem /usr/local/etc/rc.d/dlep_modem
+sudo sysrc dlep_modem_enable=YES
+sudo service dlep_modem start
+sudo service dlep_modem status
+sudo tail -f /var/log/messages
+```
+
+Use `dlep_router` and `dlep_router_enable` for the router. Each script defaults
+to disabled. `daemon(8)` supervises the DLEP child as `dlep`, routes stdout/stderr
+to syslog at notice priority with the service name, and restarts it after two
+seconds on exit.
+The supervisor stays privileged to maintain its root-owned PID file in
+`/var/run`; the DLEP process runs without those privileges. Keep the scripts'
+supervisor options intact; configure DLEP through its TOML file.
+
+Stop or restart after editing configuration:
+
+```sh
+sudo service dlep_modem stop
+# Or restart, allowing the existing process to shut down first:
+sudo service dlep_modem restart
+```
+
+The script targets the **supervisor** PID. SIGTERM is forwarded to DLEP, and
+the supervisor waits for the termination exchange before exiting, without
+restarting the child. A child PID would instead trigger an unwanted restart.
+See FreeBSD's [daemon(8) reference](https://github.com/freebsd/freebsd-src/blob/releng/15.1/usr.sbin/daemon/daemon.8)
+and [rc.d guide](https://docs.freebsd.org/en/articles/rc-scripting/).
+Allow the machine-wide `rcshutdown_timeout` enough time for the configured
+termination deadline and other services during system shutdown; a watchdog
+that expires sooner can interrupt that exchange. No reload command is provided.
+
+CI checks plist and shell syntax. Native launchd/rc.d start, restart, and stop
+execution is not yet validated; the portable transport tests exercise sessions
+independently of these service definitions.
+
+## 8. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|

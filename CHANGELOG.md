@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added launchd and FreeBSD rc.d service definitions for both daemons, with
+  dedicated service users, supervised restarts, logging, and graceful SIGTERM
+  shutdown. Shared native-platform configurations use port 1854, mutual TLS,
+  and the required explicit TCP GTSM opt-out. Installation and service-control
+  instructions cover both platforms; native service lifecycle validation is
+  pending.
 - Added an experimental FreeBSD transport path with explicit
   `[network].gtsm_enforce = false`. Discovery uses native IPv4 interface and
   destination control messages, resolves usable local addresses for multicast

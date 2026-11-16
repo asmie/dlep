@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.dlep.modem</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/dlep-modem</string>
+        <string>--config</string>
+        <string>/usr/local/etc/dlep/modem.toml</string>
+    </array>
+    <key>UserName</key>
+    <string>dlep</string>
+    <key>GroupName</key>
+    <string>dlep</string>
+    <key>WorkingDirectory</key>
+    <string>/</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>2</integer>
+    <!-- Allow the default 240-second Session Termination deadline plus I/O. -->
+    <key>ExitTimeOut</key>
+    <integer>300</integer>
+    <!-- Decimal 23 is octal 027. -->
+    <key>Umask</key>
+    <integer>23</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/dlep/modem.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/dlep/modem.err.log</string>
+</dict>
+</plist>

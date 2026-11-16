@@ -1,0 +1,26 @@
+# Experimental macOS/FreeBSD service configuration.
+# Install as /usr/local/etc/dlep/modem.toml; see doc/deployment.md.
+# Provision PKI first and select the interface attached to the router.
+peer_description = "dlep-modem"
+
+[network]
+gtsm_enforce = false  # explicit opt-out; strict TCP monitoring is Linux-only
+use_tls = true
+discovery_port = 1854
+tcp_port = 1854
+bind_addr = "0.0.0.0"
+# interface = "en0"  # macOS; for example "em0" on FreeBSD
+
+[tls]
+require_client_cert = true
+ca_bundle = "/usr/local/etc/dlep/pki/ca.pem"
+cert = "/usr/local/etc/dlep/pki/modem.pem"
+key = "/usr/local/etc/dlep/pki/modem.key"
+
+# Replace these illustrative values with measurements from the radio.
+[metrics]
+max_data_rate_rx_bps = 10000000
+max_data_rate_tx_bps = 10000000
+current_data_rate_rx_bps = 5000000
+current_data_rate_tx_bps = 5000000
+latency_us = 2500

@@ -172,6 +172,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Validate launchd service definitions
+        run: plutil -lint examples/launchd/*.plist
       # Strict TCP GTSM reset monitoring remains Linux-only. macOS requires an
       # explicit gtsm_enforce=false; discovery still validates received TTLs.
       - run: cargo test -p dlep-core -p dlep-fsm -p dlep-ext --all-features --locked
@@ -194,6 +196,8 @@ jobs:
             pkg install -y rust cmake ninja perl5 pkgconf
           run: |
             set -eu
+            /bin/sh -n examples/rc.d/dlep_router
+            /bin/sh -n examples/rc.d/dlep_modem
             # Use an ordinary user so loopback cases cannot accidentally rely
             # on privileges granted to the VM's setup process.
             pw useradd -n dlepci -m

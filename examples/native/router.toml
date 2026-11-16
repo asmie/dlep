@@ -1,0 +1,19 @@
+# Experimental macOS/FreeBSD service configuration.
+# Install as /usr/local/etc/dlep/router.toml; see doc/deployment.md.
+# Provision PKI first and select the interface attached to the modem.
+mode = "discovery"
+peer_description = "dlep-router"
+# For static mode, set mode = "static" and uncomment:
+# static_peers = ["modem.example:1854", "[fe80::1%en0]:1854"]
+
+[network]
+gtsm_enforce = false  # explicit opt-out; strict TCP monitoring is Linux-only
+use_tls = true
+discovery_port = 1854
+bind_addr = "0.0.0.0"
+# interface = "en0"  # macOS; for example "em0" on FreeBSD
+
+[tls]
+ca_bundle = "/usr/local/etc/dlep/pki/ca.pem"
+cert = "/usr/local/etc/dlep/pki/router.pem"
+key = "/usr/local/etc/dlep/pki/router.key"

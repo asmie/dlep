@@ -667,7 +667,9 @@ and incomplete TLS handshakes are cancelled during shutdown.
   API shape, testing strategy, milestone status and open questions. Read this
   before contributing.
 - [`doc/deployment.md`](doc/deployment.md) — PKI, privileges, firewall, and
-  systemd deployment.
+  systemd, launchd, and FreeBSD rc.d deployment. Native service examples in
+  [`examples/launchd/`](examples/launchd/) and [`examples/rc.d/`](examples/rc.d/)
+  use the experimental transport configurations in [`examples/native/`](examples/native/).
 - [`doc/radio-adapter.md`](doc/radio-adapter.md) — the JSON Lines protocol
   between `dlep-modem` and an external radio adapter.
 - [RFC 8175] — the protocol specification.

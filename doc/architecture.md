@@ -603,6 +603,8 @@ macOS path with explicit TCP enforcement opt-out; native build/loopback checks
 passed for `43f0ffd`. Chunk 82 adds an experimental FreeBSD path with native
 checks pending. Strict TCP monitoring on these platforms and other operating
 systems remains open. Physical-link multicast needs native deployment evidence.
+Chunk 83 adds native service definitions for both experimental platforms;
+service-manager lifecycle validation remains pending.
 
 Device-specific radio integration needs a selected device and its control API.
 The generic radio adapter and link-control backend are already available.
@@ -1588,6 +1590,16 @@ The order of work was:
     IPv4/IPv6 TCP/TLS, TTL, and interface checks. Rust cross-checking bypasses
     native crypto compilation in an isolated temporary copy; native FreeBSD
     results and physical-link behavior remain unverified until native execution.
+
+83. Native service definitions. **Implemented; native lifecycle validation pending** —
+    both roles have macOS launchd and FreeBSD rc.d definitions, using a dedicated
+    `dlep` account and `/usr/local/etc/dlep` configuration. Shared native examples
+    use high port 1854, mutual TLS, and explicit TCP GTSM opt-out. launchd restarts
+    failed jobs and allows 300 seconds for shutdown; FreeBSD supervises children
+    with `daemon(8)` and stops the supervisor so SIGTERM is forwarded without
+    an unwanted restart. Installation, permissions, log handling, and service
+    controls are documented. CI checks native syntax; actual service-manager
+    lifecycle and physical-link behavior still require native execution.
 
 ---
 
