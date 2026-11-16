@@ -110,6 +110,7 @@ dependencies = [
  "dlep-core",
  "dlep-fsm",
  "dlep-net",
+ "ipnet",
  "libfuzzer-sys",
  "tokio-util",
 ]

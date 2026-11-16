@@ -508,6 +508,12 @@ commands, timers, and teardown under both MAC formats. Every emitted message
 must encode/decode before delivery to the other FSM; operation and response
 budgets bound each input. The independent unpublished workspace keeps fuzzing
 dependencies and nightly requirements outside release packages.
+Structured session inputs add nonzero/optional metrics, IPv4/IPv6 addresses and
+subnets, duplicate/conflicting deltas, Announce hints, and link requests/replies.
+Configuration selects optional metric support and deferred replies; invalid
+percentages and duration overflow exercise command rejection. CI first runs a
+focused harness test requiring actual address updates and successful deferred
+link completion for both MAC formats, then executes the session fuzz run.
 `discovery_sequence` adds raw-signal injection and real request/offer exchanges
 through both discovery FSMs, including timers and restarts. It checks emitted
 signal serialization, reply targets, usable and unique endpoints, TLS/IPv6

@@ -83,6 +83,32 @@ def main():
     for first, later in [(0, 0), (1, 1), (2, 3), (3, 4), (4, 255)]:
         for name, payload in streams.items():
             seeds["message_framing"][f"{first}-{later}-{name}"] = bytes([first, later]) + payload
+    def payload(flags=79, number=1, value=1000, percent=100, mask=15, status=0):
+        return bytes([flags, number]) + value.to_bytes(8, 'big') + bytes([percent, 24, 64, status, mask, 2])
+
+    normal = payload()
+    clear = payload(mask=0)
+    scenarios = {
+        'address-lifecycle': [(1, normal), (0x40, payload(mask=47)),
+            (0x40, payload(number=2)), (0x41, normal), (0x46, payload(number=3)),
+            (0x46, clear), (0x82, normal), (0xc2, payload(mask=3))],
+        'link-grant': [(1, normal), (0xc3, payload(flags=7)), (0x44, normal),
+            (3, payload(value=2000)), (0x45, payload(value=3000))],
+        'link-denial': [(1, normal), (0xc3, payload(flags=7)),
+            (0x44, payload(flags=0, status=2)), (0xc3, payload(flags=7)), (0x44, normal)],
+        'invalid-and-recovery': [(1, payload(mask=31)), (1, payload(percent=255)),
+            (1, normal), (0x40, payload(mask=79)), (0xc2, normal),
+            (0x43, payload(flags=0)), (0x44, payload(status=128)),
+            (3, payload(flags=128, value=18446744073709551615)), (3, normal)],
+        'session-addresses': [(0x41, normal), (0x46, payload(number=2)),
+            (0x41, payload(number=2, mask=47)), (0x46, clear),
+            (0xc1, payload(mask=3)), (0xc1, payload(mask=35))],
+    }
+    for mode in [5, 7, 13, 15, 29, 31]:
+        for name, commands in scenarios.items():
+            seeds['session_sequence'][f'structured-{mode}-{name}'] = bytes([mode]) + b''.join(
+                bytes([op]) + data for op, data in commands)
+
     for target, inputs in seeds.items():
         root = Path("fuzz/corpus") / target
         root.mkdir(parents=True, exist_ok=True)

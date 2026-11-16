@@ -29,8 +29,9 @@ This allows documented normalization such as subnet canonicalization. The size
 limit includes an eight-byte signal header plus the largest 16-bit body.
 
 `session_sequence` runs the synchronous router and modem FSMs together. Its
-first byte selects EUI-48/EUI-64 (bit 1) and either real initialization (bit 0)
-or incomplete initialization. Up to 64 following operations select a recipient
+first byte selects EUI-48/EUI-64 (bit 1), real versus incomplete initialization
+(bit 0), structured payloads (bit 2), optional metric support (bit 3), and deferred
+link replies (bit 4). Up to 64 following operations select a recipient
 (bit 7), a destination number (bits 4–5), and an operation (bits 0–3):
 
 | Code | Event |
@@ -43,10 +44,40 @@ or incomplete initialization. Up to 64 following operations select a recipient
 
 Each action batch checks that emitted messages encode and decode, then delivers
 them to the other FSM. A 128-batch budget detects response loops. Inputs stop at
-64 operations, including after closure; application metrics/addresses currently
-use defaults. This checks panic freedom, message serialization, and bounded
+64 operations, including after closure. Basic modes 0–3 keep the original
+default metrics and empty addresses. This checks panic freedom, message serialization, and bounded
 responses. It does not assert complete protocol semantics or fuzz transports,
 TLS, plug-ins, or adapter processes.
+
+With mode bit 2 enabled, every non-raw-message operation consumes a 16-byte
+payload. Bit 6 of the operation selects additional commands, indexed by its low
+four bits: 0 destination address delta, 1 session address delta, 2 Announce with
+address hints, 3 link request, 4 link reply, 5 session metrics, 6 desired session
+addresses, 7 queued metrics, 8 defaults, 9 destination add, 10 destination metrics,
+and 11 destination drop. Other extended codes fall back to the basic operation.
+Raw-message injection retains its two-byte length format when bit 6 is clear.
+Basic add/update/defaults/queue/address commands also use the payload values.
+
+| Payload bytes | Meaning |
+| --- | --- |
+| 0 | Bits 0–3 select optional Resources/RLQ receive/RLQ transmit/MTU; bits 0–2 also select requested link fields; bit 6 includes reply metrics; bit 7 uses seconds instead of microseconds for latency |
+| 1 | IPv4/IPv6 address suffix |
+| 2–9 | Big-endian `u64` for rates and latency; current rates use one half and one third of this value |
+| 10 | Percentage value, including invalid values above 100; also the MTU high byte |
+| 11–12 | IPv4/IPv6 prefix lengths modulo 33/129; byte 11 also supplies the MTU low byte |
+| 13 | Link-reply or extended destination-drop status |
+| 14 | Bits 0–3 include IPv4/IPv6 addresses/subnets, bit 4 duplicates entries, bit 5 removes rather than adds, bit 6 creates conflicting additions/removals |
+| 15 | Empty, ASCII, or UTF-8 reply text selector |
+
+Address lists are bounded to two entries per family. Duplicate/conflicting
+updates, unsupported metrics, invalid percentages, and latency overflow exercise
+rejection paths; valid payloads reach real protocol transactions. The focused
+`structured_sessions` test verifies address updates and deferred link completion
+with both MAC formats. CI runs it before the session fuzz target. Run locally:
+
+```sh
+cargo test --manifest-path fuzz/Cargo.toml --test structured_sessions --locked --offline
+```
 
 `discovery_sequence` drives the router and modem discovery FSMs without sockets.
 The mode byte selects IPv4/IPv6 source (bit 0), IPv4/IPv6 advertised endpoint
@@ -79,13 +110,16 @@ accept a truncated frame. The 65,545-byte limit covers two selectors, a maximum
 The reference stops at the first malformed frame, matching the transport's
 failure behavior. It does not exercise socket I/O, TLS, or async backpressure.
 
-The seed generator writes 19 codec, 100 session, 184 discovery, and 90 framing starting inputs, covering
+The seed generator writes 19 codec, 130 session, 184 discovery, and 90 framing starting inputs, covering
 initialization, destination lifecycle, unknown items, duplicates, truncation,
 invalid prefixes/UTF-8, maximum body lengths, both MAC formats, and teardown.
 Discovery seeds include default ports, interleaved equivalent connection points,
 TLS preferences, unusable endpoints, duplicate peer items, and invalid flags.
 Framing seeds vary chunk boundaries around valid/coalesced messages, incomplete
 headers/bodies, malformed messages between valid frames, and maximum lengths.
+Thirty structured session seeds cover address replacement/removal, Announce
+hints, grants/denials, invalid inputs followed by valid reports, optional metric
+support, both MAC formats, and deferred versus immediate link replies.
 Generated corpora, artifacts, and builds are ignored. Rerunning the generator
 restores starting seeds and preserves newly discovered corpus entries.
 

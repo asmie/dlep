@@ -50,6 +50,9 @@ jobs:
       - run: cargo fetch --manifest-path fuzz/Cargo.toml --locked
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: python3 -B .github/scripts/seed-fuzz.py
+      - name: Verify structured session inputs reach protocol outcomes
+        if: matrix.target == 'session_sequence'
+        run: cargo test --manifest-path fuzz/Cargo.toml --test structured_sessions --locked --offline
       - name: Run bounded AddressSanitizer fuzzing
         env:
           CARGO_NET_OFFLINE: 'true'

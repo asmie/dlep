@@ -1298,6 +1298,16 @@ The order of work was:
     fuzz lockfile includes transport dependencies without certificate test
     helpers. Socket I/O, TLS, and async backpressure remain outside this target.
 
+67. Structured session fuzz inputs. **Done** — the session target now supports
+    nonzero and optional metrics, IPv4/IPv6 addresses and subnets, address deltas
+    and replacements, Announce hints, and link requests/replies. Mode bits select
+    optional metric support and deferred responses. Bounded payloads exercise
+    duplicate/conflicting sets, invalid percentages, latency overflow, refusals,
+    and later valid commands. Thirty new seeds retain the original basic seed
+    format. A focused harness test requires real address changes and deferred
+    link completion under both MAC formats; CI runs it before fuzzing. No
+    production behavior changes are needed for this validation expansion.
+
 ---
 
 ## 10. Open questions / risks

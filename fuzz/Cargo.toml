@@ -15,6 +15,7 @@ resolver = "3"
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 bytes = "1"
+ipnet = "2"
 dlep-core = { path = "../crates/dlep-core" }
 dlep-fsm = { path = "../crates/dlep-fsm" }
 dlep-net = { path = "../crates/dlep-net" }

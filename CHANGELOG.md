@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Session fuzzing now generates structured metrics, IPv4/IPv6 address changes,
+  Announce hints, and link-characteristic requests/replies, including deferred
+  replies and invalid command recovery. A harness test verifies that generated
+  commands reach address updates and successful link completion for both MAC
+  formats before CI fuzzes them.
 - Added a TCP message-framing fuzz target that compares fragmented/coalesced
   reads with whole-buffer decoding, including malformed frames, incomplete EOF,
   and maximum message lengths. CI now fuzzes the network codec alongside core
