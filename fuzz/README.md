@@ -15,6 +15,7 @@ fuzz_host=$(rustc +nightly -vV | sed -n 's/^host: //p')
 cargo +nightly fuzz run wire_decode --target "$fuzz_host" -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
 cargo +nightly fuzz run session_sequence --target "$fuzz_host" -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
 cargo +nightly fuzz run discovery_sequence --target "$fuzz_host" -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+cargo +nightly fuzz run message_framing --target "$fuzz_host" -- -max_total_time=30 -max_len=65545 -timeout=5 -rss_limit_mb=2048
 ```
 
 Always pass the nightly compiler's host target explicitly. Prebuilt cargo-fuzz
@@ -66,11 +67,25 @@ and TLS requirement, and ordered by TLS then IPv6 preference. IPv6 link-local
 endpoints must preserve the source scope. This target checks pure discovery
 logic; interface selection and UDP packet metadata remain runtime-test coverage.
 
-The seed generator writes 19 codec, 100 session, and 184 discovery starting inputs, covering
+`message_framing` tests the actual `dlep-net::MessageCodec` without opening TCP
+sockets. Two input bytes choose the first and subsequent read sizes: zero feeds
+all remaining bytes, and 1–255 selects that many bytes per read. The rest is a
+wire stream. A separate whole-buffer reference splits complete frames and calls
+the core decoder. Both fragmented and coalesced decoding must produce the same
+canonical messages and agree on whether the stream ends in an error. Incomplete
+reads must consume no bytes, successful reads must make progress, and EOF cannot
+accept a truncated frame. The 65,545-byte limit covers two selectors, a maximum
+65,539-byte TCP message, and four trailing bytes for framing/EOF mutations.
+The reference stops at the first malformed frame, matching the transport's
+failure behavior. It does not exercise socket I/O, TLS, or async backpressure.
+
+The seed generator writes 19 codec, 100 session, 184 discovery, and 90 framing starting inputs, covering
 initialization, destination lifecycle, unknown items, duplicates, truncation,
 invalid prefixes/UTF-8, maximum body lengths, both MAC formats, and teardown.
 Discovery seeds include default ports, interleaved equivalent connection points,
 TLS preferences, unusable endpoints, duplicate peer items, and invalid flags.
+Framing seeds vary chunk boundaries around valid/coalesced messages, incomplete
+headers/bodies, malformed messages between valid frames, and maximum lengths.
 Generated corpora, artifacts, and builds are ignored. Rerunning the generator
 restores starting seeds and preserves newly discovered corpus entries.
 

@@ -71,6 +71,18 @@ def main():
         for name, payload in signals.items():
             for side in (0, 128):
                 seeds["discovery_sequence"][f"{mode}-{side}-{name}"] = bytes([mode, side]) + struct.pack("!H", len(payload)) + payload
+    streams = dict(messages)
+    streams.update({
+        "empty": b"", "coalesced": init + reply + message(16) * 3,
+        "partial-header": message(16) + b"\0\3\0",
+        "partial-body": message(16) + bytes.fromhex("000300090008000501"),
+        "malformed-between": message(16) + messages["invalid-subnet"] + message(16),
+        "maximum": seeds["wire_decode"]["max-message"],
+    })
+    seeds["message_framing"] = {}
+    for first, later in [(0, 0), (1, 1), (2, 3), (3, 4), (4, 255)]:
+        for name, payload in streams.items():
+            seeds["message_framing"][f"{first}-{later}-{name}"] = bytes([first, later]) + payload
     for target, inputs in seeds.items():
         root = Path("fuzz/corpus") / target
         root.mkdir(parents=True, exist_ok=True)

@@ -7,6 +7,7 @@ on:
       - Cargo.lock
       - 'crates/dlep-core/**'
       - 'crates/dlep-fsm/**'
+      - 'crates/dlep-net/**'
       - 'fuzz/**'
       - '.github/scripts/seed-fuzz.py'
       - '.github/workflows/fuzz.yml'
@@ -17,6 +18,7 @@ on:
       - Cargo.lock
       - 'crates/dlep-core/**'
       - 'crates/dlep-fsm/**'
+      - 'crates/dlep-net/**'
       - 'fuzz/**'
       - '.github/scripts/seed-fuzz.py'
       - '.github/workflows/fuzz.yml'
@@ -36,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [wire_decode, session_sequence, discovery_sequence]
+        target: [wire_decode, session_sequence, discovery_sequence, message_framing]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -53,7 +55,7 @@ jobs:
           CARGO_NET_OFFLINE: 'true'
         # Prebuilt cargo-fuzz may default to its own musl build platform. Use
         # the GNU target installed with nightly on this Ubuntu x86-64 runner.
-        run: cargo +nightly fuzz run '${{ matrix.target }}' --target x86_64-unknown-linux-gnu -- -max_total_time=30 -max_len=65543 -timeout=5 -rss_limit_mb=2048
+        run: cargo +nightly fuzz run '${{ matrix.target }}' --target x86_64-unknown-linux-gnu -- -max_total_time=30 -max_len=65545 -timeout=5 -rss_limit_mb=2048
       - name: Verify fuzz dependency resolution stayed locked
         if: always()
         run: git diff --exit-code -- fuzz/Cargo.lock

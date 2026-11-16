@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added a TCP message-framing fuzz target that compares fragmented/coalesced
+  reads with whole-buffer decoding, including malformed frames, incomplete EOF,
+  and maximum message lengths. CI now fuzzes the network codec alongside core
+  decoding and the session/discovery FSMs.
 - Fuzz CI explicitly selects the runner's GNU target, fixing startup failures
   when the installed cargo-fuzz binary defaults to its musl build platform.
 - Discovery offers now remove equivalent endpoints even when another candidate

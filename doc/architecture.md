@@ -1277,14 +1277,26 @@ The order of work was:
     TLS settings. CI includes the new target and 184 discovery seeds. Interface
     metadata, UDP sockets, and TLS remain outside these pure-logic fuzz targets.
 
-65. Fuzz CI target selection. **Done locally** — the prebuilt cargo-fuzz tool
+65. Fuzz CI target selection. **Done** — the prebuilt cargo-fuzz tool
     defaults to its musl build platform, while the Ubuntu runner's nightly Rust
     installation targets GNU. All three hosted fuzz jobs at `56576d0` failed
     before executing inputs. The workflow now explicitly selects
     `x86_64-unknown-linux-gnu`; local instructions select the nightly compiler's
     host. Validation reproduces the failure with the same prebuilt musl package
-    and runs all three corrected targets. Hosted confirmation requires committing
-    and pushing the workflow fix.
+    and runs all three corrected targets. Hosted
+    [main CI](https://github.com/asmie/dlep/actions/runs/43772487629) and
+    [fuzz checks](https://github.com/asmie/dlep/actions/runs/43772487548)
+    subsequently passed at `49f3ab2`.
+
+66. TCP framing fuzz coverage. **Done** — a fourth target feeds fragmented and
+    coalesced reads through the real network message codec, comparing canonical
+    messages and failure outcomes with independent whole-buffer frame walking.
+    It checks progress, no consumption on incomplete reads, and truncated EOF
+    rejection. Ninety seeds cover boundary splits, multiple messages, malformed
+    frames between valid ones, and maximum lengths. CI includes network-crate
+    changes and retains the same bounded AddressSanitizer runs. The independent
+    fuzz lockfile includes transport dependencies without certificate test
+    helpers. Socket I/O, TLS, and async backpressure remain outside this target.
 
 ---
 

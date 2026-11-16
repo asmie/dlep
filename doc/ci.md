@@ -490,8 +490,8 @@ which is already ignored by Git.
 
 ## Fuzzing
 
-`.github/workflows/fuzz.yml` runs three cargo-fuzz 0.13.2 targets on changes to the
-codec, FSM, fuzz workspace, or workspace manifests, and on manual dispatch.
+`.github/workflows/fuzz.yml` runs four cargo-fuzz 0.13.2 targets on changes to the
+codec, FSM, network crate, fuzz workspace, or workspace manifests, and on manual dispatch.
 Each nightly AddressSanitizer job fuzzes for 30 seconds, with a five-second input
 deadline, 2 GiB RSS limit, and a 15-minute job deadline. Generated corpora and
 failure artifacts are uploaded for 14 days. CI verifies `fuzz/Cargo.lock` did
@@ -512,10 +512,15 @@ dependencies and nightly requirements outside release packages.
 through both discovery FSMs, including timers and restarts. It checks emitted
 signal serialization, reply targets, usable and unique endpoints, TLS/IPv6
 preference, and IPv6 link-local scope propagation.
+`message_framing` feeds fragmented and coalesced reads to the real TCP message
+codec and compares results with a whole-buffer core-decoder reference. It checks
+message order, progress, incomplete-read preservation, and truncated EOF errors.
+Its separate fuzz lockfile includes the network crate's dependencies, without
+enabling certificate test helpers or opening sockets.
 
 See [fuzzing instructions](../fuzz/README.md) for seed generation, longer runs,
 input formats, failure replay/minimization, and the local LeakSanitizer sandbox
-limitation. Short runs are smoke evidence; network transports, TLS, extensions,
+limitation. Short runs are smoke evidence; socket I/O, TLS, extensions,
 and adapters are outside these targets.
 
 ## Dependency audit
