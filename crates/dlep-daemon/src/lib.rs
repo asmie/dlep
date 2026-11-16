@@ -9,6 +9,7 @@ pub mod config;
 mod connections;
 pub mod discovery;
 pub mod events;
+pub mod extensions;
 pub mod link_control;
 pub mod modem;
 pub mod peer;
@@ -20,7 +21,8 @@ pub mod state;
 pub mod tls;
 
 pub use cli::{
-    ConfigCheckError, ConfigLoadError, check_modem_config, check_router_config, load_toml_config,
+    ConfigCheckError, ConfigLoadError, check_modem_config, check_modem_config_with_extensions,
+    check_router_config, check_router_config_with_extensions, load_toml_config,
 };
 pub use config::{
     DestinationPolicyConfig, DiscoveryMode, MetricsConfig, ModemConfig, NetworkConfig, RadioConfig,
@@ -31,6 +33,7 @@ pub use events::{
     AddressChanges, DaemonEvent, DestinationAddrs, DestinationEvent, DestinationId,
     LinkCharacteristics, LinkMetrics, MetricsEvent, PeerInfo, PeerOffer,
 };
+pub use extensions::{ExtensionCatalog, ExtensionConfig, ExtensionSetupError, ExtensionsConfig};
 pub use link_control::{LinkControl, LinkControlReply, LinkRequest, LinkResponse};
 pub use modem::{ModemBuilder, ModemDaemon};
 pub use peer::{NamedPeer, PeerEndpoint};

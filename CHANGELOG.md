@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Embedders can register configured extension factories on both daemon builders,
+  or supply an ordered `ExtensionCatalog`. Factories consume `[extensions.NAME]`
+  tables before networking, with plugin-owned validation and defaults. Matching
+  config-check helpers validate against the application's catalog. Unused
+  settings and invalid/duplicate factory names fail early; bundled commands
+  reject settings without registered factories before adapters or networking.
+  Prebuilt extension registration is unchanged. `SharedConfig` gains an
+  `extensions` map; full Rust struct initializers need that field or a default.
 - Negotiated extensions can call `ExtensionCtx::terminate_session(reason)` from
   in-session hooks. The runtime drives the existing FSM termination exchange
   and deadline, discards queued extension messages, and preserves session-scoped

@@ -46,6 +46,8 @@ where
 /// Errors surfaced by `--check-config` style validation.
 #[derive(Debug, Error)]
 pub enum ConfigCheckError {
+    #[error(transparent)]
+    Extension(#[from] crate::ExtensionSetupError),
     #[error("invalid [destinations] policy: {0}")]
     DestinationPolicy(String),
     #[error("invalid router limits: {0}")]
@@ -69,6 +71,16 @@ pub enum ConfigCheckError {
 /// Validate a router configuration without starting the daemon: TLS
 /// material must load when `use_tls` is on, and static mode needs peers.
 pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
+    check_router_config_with_extensions(cfg, &crate::ExtensionCatalog::default())
+}
+
+/// Check router configuration with the application's named plugin factories.
+/// Factories are invoked for validation; no daemon sockets or tasks are started.
+pub fn check_router_config_with_extensions(
+    cfg: &RouterConfig,
+    catalog: &crate::ExtensionCatalog,
+) -> Result<(), ConfigCheckError> {
+    catalog.build(&cfg.shared.extensions)?;
     cfg.destinations
         .policy(cfg.shared.network.mac_address_format)
         .map_err(ConfigCheckError::DestinationPolicy)?;
@@ -106,6 +118,16 @@ pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
 
 /// Validate a modem configuration without starting the daemon.
 pub fn check_modem_config(cfg: &ModemConfig) -> Result<(), ConfigCheckError> {
+    check_modem_config_with_extensions(cfg, &crate::ExtensionCatalog::default())
+}
+
+/// Check modem configuration with the application's named plugin factories.
+/// Factories are invoked for validation; no daemon sockets or tasks are started.
+pub fn check_modem_config_with_extensions(
+    cfg: &ModemConfig,
+    catalog: &crate::ExtensionCatalog,
+) -> Result<(), ConfigCheckError> {
+    catalog.build(&cfg.shared.extensions)?;
     cfg.shared
         .timers
         .validate()

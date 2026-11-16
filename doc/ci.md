@@ -84,6 +84,13 @@ time checks preserve the full termination response deadline, first-request
 precedence, and queued-message suppression. Portable extension tests also check
 that existing custom contexts inherit the Unsupported default.
 
+Configured-extension checks validate TOML round trips, factory-name errors,
+defaults, registration order, and matching check/startup failures. IPv4/IPv6
+sessions verify that settings affect negotiation and payloads while catalog
+clones construct independent daemon instances. Release smoke requires all
+standalone/launcher roles to reject unregistered settings on both config checks
+and startup before adapters or sockets.
+
 Checkpoint 60 (2026-11-15) passed all eight archives, 591 archived Rust tests
 across 60 suites, three command installations, and 113 CLI/certificate checks
 plus four session scenarios for each build. Formatting, clippy, Rust 1.85,

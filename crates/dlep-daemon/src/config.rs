@@ -211,6 +211,9 @@ impl Default for TimersConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedConfig {
+    /// Settings for named plugin factories, configured before networking.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extensions: crate::ExtensionsConfig,
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
@@ -515,6 +518,8 @@ impl Default for ModemConfig {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RouterConfigFile {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    extensions: crate::ExtensionsConfig,
     #[serde(default)]
     destinations: DestinationPolicyConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -550,6 +555,7 @@ impl From<RouterConfigFile> for RouterConfig {
             adapter: file.adapter,
             limits: file.limits,
             shared: SharedConfig {
+                extensions: file.extensions,
                 network: file.network,
                 tls: file.tls,
                 timers: file.timers,
@@ -565,6 +571,7 @@ impl From<RouterConfigFile> for RouterConfig {
 impl From<RouterConfig> for RouterConfigFile {
     fn from(config: RouterConfig) -> Self {
         Self {
+            extensions: config.shared.extensions,
             destinations: config.destinations,
             adapter: config.adapter,
             limits: config.limits,
@@ -591,6 +598,8 @@ impl From<RouterConfig> for RouterConfigFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModemConfigFile {
+    #[serde(default)]
+    extensions: crate::ExtensionsConfig,
     /// Whether the shared RF medium implements access control (Peer Type S flag).
     #[serde(default)]
     secured_medium: bool,
@@ -612,6 +621,7 @@ impl From<ModemConfigFile> for ModemConfig {
         Self {
             secured_medium: file.secured_medium,
             shared: SharedConfig {
+                extensions: file.extensions,
                 network: file.network,
                 tls: file.tls,
                 timers: file.timers,

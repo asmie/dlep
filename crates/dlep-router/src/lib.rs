@@ -99,6 +99,11 @@ where
     let mut config: RouterConfig =
         load_toml_config(cli.config.as_deref()).context("loading router configuration")?;
     apply_overrides(&mut config, &cli);
+    // Bundled commands have no dynamically loaded plugin factories. Reject
+    // unconsumed settings before TLS setup, adapters, or daemon startup.
+    dlep_daemon::ExtensionCatalog::default()
+        .build(&config.shared.extensions)
+        .context("configuring extensions")?;
 
     if cli.check_config {
         check_router_config(&config).context("configuration check failed")?;

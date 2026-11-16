@@ -450,7 +450,7 @@ impl RouterDaemon {
 #[derive(Default)]
 pub struct RouterBuilder {
     config: Option<RouterConfig>,
-    extensions: ExtensionRegistry,
+    extensions: crate::ExtensionCatalog,
     client_tls: Option<Arc<ClientConfig>>,
 }
 
@@ -465,6 +465,25 @@ impl RouterBuilder {
         self
     }
 
+    /// Replace the ordered startup recipes with an application catalog.
+    pub fn extension_catalog(mut self, catalog: crate::ExtensionCatalog) -> Self {
+        self.extensions = catalog;
+        self
+    }
+
+    /// Construct a plugin from `[extensions.NAME]` before networking starts.
+    pub fn register_extension_factory(
+        mut self,
+        name: impl Into<String>,
+        create: impl Fn(&crate::ExtensionConfig) -> Result<Arc<dyn DlepExtension>, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.extensions.register_factory(name, create);
+        self
+    }
+
     pub fn with_rustls_client(mut self, cfg: Arc<ClientConfig>) -> Self {
         self.client_tls = Some(cfg);
         self
@@ -474,6 +493,10 @@ impl RouterBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("RouterConfig required".into()))?;
+        let extensions = self
+            .extensions
+            .build(&cfg.shared.extensions)
+            .map_err(|error| DaemonError::Config(error.to_string()))?;
         let destination_policy = cfg
             .destinations
             .policy(cfg.shared.network.mac_address_format)
@@ -506,7 +529,7 @@ impl RouterBuilder {
             session_id_counter: new_session_id_counter(),
             peer_description: cfg.peer_description.clone(),
             client_tls: self.client_tls,
-            extensions: self.extensions,
+            extensions,
         })
     }
 }

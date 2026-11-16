@@ -138,6 +138,12 @@ termination_timeout_ms = 1000
                 self.run(command + ["--config", "missing-config.toml", "--check-config"], expected=1)
                 self.run(command + ["--config", str(path), "--no-tls", "--check-config"], expected=1)
                 self.run(command + ["--config", str(path)] + common, expected=1)
+                unregistered = self.config(f"unregistered-extension-{role}-{unified}", ip="192.0.2.123")
+                unregistered.write_text(unregistered.read_text() + "\n[extensions.not_installed]\nenabled=true\n")
+                for check in ([], ["--check-config"]):
+                    result = self.run(command + ["--config", str(unregistered), "--no-tls"] + check, expected=1)
+                    assert 'extension "not_installed"' in result.stderr
+                    assert "no registered factory" in result.stderr
                 if role == "router":
                     self.run(command + ["--peer", "127.0.0.1:854", "--peer", "[::1]:854", "--no-tls", "--check-config"])
                     self.run(command + ["--peer", "does-not-exist.invalid:854", "--no-tls", "--check-config"])

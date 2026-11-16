@@ -215,6 +215,45 @@ session address, announce, withdrawal, and link-characteristic commands. See the
 adapter. It shares the service sandbox and user, with ambient capabilities
 cleared; provision access to your routing service explicitly.
 
+### Configured extension factories
+
+Embedded applications can configure registered plugins on either role:
+
+```toml
+[extensions.radio]
+threshold = 12
+channels = [1, 6, 11]
+```
+
+These keys are illustrative: the plugin factory owns its entire settings schema,
+including nested values and defaults. Applications register a matching name with
+`register_extension_factory("radio", factory)` on the daemon builder, or supply
+an `ExtensionCatalog` with `.extension_catalog(catalog)`. The factory receives an
+`ExtensionConfig` (a TOML table) and returns `Result<Arc<dyn DlepExtension>, String>`.
+For typed schemas, deserialize `toml::Value::Table(settings.clone())` with
+`try_into()`; `#[serde(deny_unknown_fields)]` rejects plugin-setting typos.
+
+Settings are stored in `SharedConfig.extensions`. A missing table supplies empty
+settings so the factory can apply defaults. Every registered factory runs once
+per build, in registration order alongside prebuilt plugins. Catalog clones
+share factory recipes, allowing each build to create its own instances; they
+continue to share explicitly registered prebuilt instances. Factories should
+validate and construct local state without starting session work. Configuration
+checks also invoke them, then discard the constructed instances.
+
+Use `check_router_config_with_extensions(config, catalog)` or
+`check_modem_config_with_extensions(config, catalog)` for embedded applications;
+the ordinary checks use an empty catalog. Unregistered settings, empty/duplicate
+factory names, and factory validation errors fail startup before daemon sockets
+or tasks. Factory names are case-sensitive. Replacing a builder's catalog with
+`.extension_catalog(...)` replaces all its prior registrations.
+
+The bundled `dlep`, `dlep-router`, and `dlep-modem` commands have no dynamic plugin
+loader. They reject nonempty extension settings before TLS setup, adapter
+startup, or networking. An application must register the relevant factories;
+adding a TOML section alone does not install a plugin. Settings are fixed when
+the daemon starts; restart or construct another daemon to change them.
+
 ### Destination admission
 
 Routers accept all unsolicited Destination Up announcements by default. A
@@ -283,6 +322,7 @@ metadata, even if a discovery offer advertised a different value.
 | top level (router) | `static_peers` | `[]` | static modem endpoints: `HOST:PORT`, `IPv4:PORT`, or `[IPv6]:PORT` |
 | top level | `peer_description` | binary name | Peer Type data item text |
 | top level (modem) | `secured_medium` | `false` | Modem declaration of access control on the shared RF medium; independent of TLS |
+| `[extensions.NAME]` | plugin-defined | none | Settings for a named factory registered by an embedded application |
 | `[limits]` (router) | `max_sessions` | `64` | positive bound on TCP/TLS attempts plus registered sessions |
 | `[limits]` (router) | `max_discovered_peers` | `256` | positive bound on retained non-static endpoints, including active peers |
 | `[limits]` (router) | `peer_retention_secs` | `300` | positive retention window for inactive non-static peers; failed retries do not refresh it |

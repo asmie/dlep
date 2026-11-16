@@ -141,6 +141,7 @@ The integration layer. Wires `dlep-fsm` + `dlep-net` + `dlep-ext` together and e
 | `config.rs` | `RouterConfig`, `ModemConfig`, plus shared `NetworkConfig`, `TlsConfig`, `TimersConfig`. All `serde::Deserialize` for TOML. |
 | `events.rs` | Public `DaemonEvent` enum (`PeerDiscovered`, `SessionUp`, `SessionDown`, `Destination`, `Metrics`, `Extension`), plus `DestinationId`, `LinkMetrics`, `PeerInfo`. `SessionUp`, `SessionDown`, `Destination`, and `Metrics` carry both `PeerInfo` and a `SessionId` so a multi-session embedder can attribute events across reconnects. `DaemonEvent: Clone` (required by `tokio::sync::broadcast`); `Debug` is hand-written because `Arc<dyn Any + Send + Sync>` does not derive `Debug`. |
 | `connections.rs` | Retained router endpoint state via `watch`: active task counts and cumulative successful initializations, updated directly by session guards. Reconnect decisions do not depend on the public event bus. Modem discovery uses a separate reference-counted TCP peer registry with entries removed on last close. |
+| `extensions.rs` | Ordered `ExtensionCatalog` recipes and named startup factories, plugin settings tables, and setup errors. Factories construct validated instances before daemon networking. |
 | `runtime.rs` | Channel plumbing: `EventTx = broadcast::Sender<DaemonEvent>` for the public event bus, `mpsc` for internal commands. `DaemonError` lives here too. |
 | `discovery.rs` | `run_discovery` background task: owns a `DiscoverySocket` + a discovery FSM (router or modem), bridges socket I/O to FSM events, applies GTSM filtering on inbound packets, drives periodic Peer_Discovery resends via `DiscoveryTimers`, and translates `EmittedEvent::PeerDiscovered` into `DaemonEvent::PeerDiscovered`. |
 | `session.rs` | The `SessionFsm` trait that the runtime drives, with blanket impls for the router and modem session FSMs. |
@@ -564,9 +565,8 @@ areas below. Validation should continue to accompany features.
 
 Three larger scope areas remain optional follow-ups:
 
-- Extension configuration and discovery hooks: explicit session termination
-  requests are complete in chunk 75; per-extension settings and discovery hooks
-  remain. Arbitrary rustls configurations can
+- Discovery extension hooks remain; explicit session termination requests and
+  per-extension factory settings are complete in chunks 75–76. Arbitrary rustls configurations can
   already be supplied through builders; custom TLS verification does not require
   weakening the default policy.
 - Simultaneous IPv4/IPv6 discovery; the configured bind family currently selects
@@ -1463,6 +1463,18 @@ The order of work was:
     input/destination hooks and session isolation; virtual-time cases cover
     session-up requests, first-reason precedence, message suppression, and full
     response deadlines with and without acknowledgements.
+
+76. Configured extension factories. **Done** — shared TOML
+    `[extensions.NAME]` tables feed application-registered factories on either
+    daemon builder. `ExtensionCatalog` preserves order across factories and
+    prebuilt instances; each build invokes factories to construct local plugin
+    state, leaving existing registrations unchanged. Missing tables allow plugin
+    defaults. Registration-name and unused-settings errors precede factory
+    invocation, while plugin-owned schema validation reports named errors before
+    daemon networking. Catalog-aware configuration checks use the same path.
+    Bundled commands reject unregistered settings before adapters or startup.
+    Round trips, defaults, validation, ordering, and IPv4/IPv6 negotiated payloads
+    cover independent configured instances from shared factory recipes.
 
 ---
 

@@ -339,7 +339,7 @@ impl ModemDaemon {
 #[derive(Default)]
 pub struct ModemBuilder {
     config: Option<ModemConfig>,
-    extensions: ExtensionRegistry,
+    extensions: crate::ExtensionCatalog,
     server_tls: Option<Arc<ServerConfig>>,
     link_control: Option<Arc<dyn LinkControl>>,
 }
@@ -352,6 +352,25 @@ impl ModemBuilder {
 
     pub fn register_extension(mut self, ext: Arc<dyn DlepExtension>) -> Self {
         self.extensions.register(ext);
+        self
+    }
+
+    /// Replace the ordered startup recipes with an application catalog.
+    pub fn extension_catalog(mut self, catalog: crate::ExtensionCatalog) -> Self {
+        self.extensions = catalog;
+        self
+    }
+
+    /// Construct a plugin from `[extensions.NAME]` before networking starts.
+    pub fn register_extension_factory(
+        mut self,
+        name: impl Into<String>,
+        create: impl Fn(&crate::ExtensionConfig) -> Result<Arc<dyn DlepExtension>, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.extensions.register_factory(name, create);
         self
     }
 
@@ -371,6 +390,10 @@ impl ModemBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
+        let extensions = self
+            .extensions
+            .build(&cfg.shared.extensions)
+            .map_err(|error| DaemonError::Config(error.to_string()))?;
         cfg.shared
             .timers
             .validate()
@@ -381,7 +404,7 @@ impl ModemBuilder {
             .map_err(|e| DaemonError::Config(e.to_string()))?;
         cfg.metrics.validate().map_err(DaemonError::Config)?;
         let initial_metrics = cfg.metrics.link_metrics();
-        let extensions_for_accept = self.extensions.clone();
+        let extensions_for_accept = extensions.clone();
 
         let bind_addr = cfg.shared.network.tcp_bind_addr()?;
         let socket = if bind_addr.is_ipv6() {
@@ -467,7 +490,7 @@ impl ModemBuilder {
             stopping,
             discovery_shutdown: Mutex::new(discovery_shutdown),
             discovery_task: Mutex::new(discovery_task),
-            extensions: self.extensions,
+            extensions,
             session_id_counter,
         })
     }

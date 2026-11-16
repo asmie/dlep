@@ -231,6 +231,15 @@ new requests, and custom contexts default to `Unsupported`. See the
 [extension API example](crates/dlep-ext/README.md). Reconnect policy remains with
 the application or CLI.
 
+Embedders can register named extension factories on either daemon builder with
+`register_extension_factory(name, factory)`, or share an `ExtensionCatalog` via
+`extension_catalog(catalog)`. Each factory receives its `[extensions.NAME]` TOML
+table from `SharedConfig.extensions`, validates it, and constructs a plugin
+before networking starts. Missing tables supply empty settings for plugin
+defaults. Prebuilt `register_extension` instances retain their existing behavior.
+Use `check_router_config_with_extensions` / `check_modem_config_with_extensions`
+to validate with the same catalog. See [configured plugins](doc/deployment.md#configured-extension-factories).
+
 For direct connections, `connect_named("modem.example", 854)` resolves the host
 with the system resolver and verifies TLS against that hostname. It tries up to
 16 distinct addresses in resolver order within a shared 15-second deadline and
