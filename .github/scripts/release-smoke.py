@@ -96,7 +96,7 @@ termination_timeout_ms = 1000
                     help_text = self.run(command + [flag]).stdout
                     for option in ("--config", "--interface", "--log-level", "--no-tls", "--cert",
                                    "--key", "--ca-bundle", "--bind-addr", "--discovery-port",
-                                   "--check-config", "--generate-completions", "--help", "--version"):
+                                   "--check-config", "--dual-stack-discovery", "--generate-completions", "--help", "--version"):
                         assert option in help_text, (role, option)
                     assert ("--peer" in help_text) == (role == "router")
                     assert ("--tcp-port" in help_text) == (role == "modem")
@@ -117,6 +117,12 @@ termination_timeout_ms = 1000
                     assert "invalid log level" not in result.stderr
                 result = self.run(command + ["--no-tls", "--check-config"], env={"DLEP_LOG": "[broken"})
                 assert "invalid log level" in result.stderr
+                result = self.run(command + ["--dual-stack-discovery", "--no-tls", "--check-config"], expected=1)
+                assert "explicit interface" in result.stderr
+                self.run(command + ["--dual-stack-discovery", "--interface", "dlep-test", "--no-tls", "--check-config"])
+                dual = self.config(f"dual-check-{role}-{unified}")
+                dual.write_text(dual.read_text().replace("[network]\n", "[network]\ndiscovery_dual_stack=true\n"))
+                self.run(command + ["-c", str(dual), "--interface", "dlep-test", "--bind-addr", "::", "--no-tls", "--check-config"])
                 for flag in ("--config", "--interface", "--log-level", "--cert", "--key", "--ca-bundle",
                              "--bind-addr", "--discovery-port"):
                     self.run(command + [flag], expected=2)
@@ -208,11 +214,13 @@ printf '%s\n' "${COMPREPLY[@]}"
                 assert {"router", "modem"} <= complete("")
                 for role in ("router", "modem"):
                     options = complete(role, "--")
+                    assert "--dual-stack-discovery" in options
                     assert ("--peer" in options) == (role == "router")
                     assert ("--tcp-port" in options) == (role == "modem")
                     assert shells == complete(role, "--generate-completions", "")
             else:
                 options = complete("--")
+                assert "--dual-stack-discovery" in options
                 assert "--config" in options
                 assert ("--peer" in options) == (binary == "dlep-router")
                 assert ("--tcp-port" in options) == (binary == "dlep-modem")
@@ -246,26 +254,30 @@ printf '%s\n' "${COMPREPLY[@]}"
         assert child.wait(timeout=8) == 0, log.read_text()
         assert "shutdown requested" in log.read_text(), log.read_text()
 
-    def session(self, name, unified, ip, tls, discovery=False, peers=1):
+    def session(self, name, unified, ip, tls, discovery=False, peers=1, dual=False):
         # Only discovery scenarios need a fixed UDP port; they run sequentially
         # inside a fresh network namespace. TCP always uses modem-assigned ports.
         port = 49854 if discovery else 0
+        interface = "dlep-test" if dual else "lo"
         modems = []
         addresses = []
         for index in range(peers):
             path = self.config(f"{name}-modem-{index}", "192.0.2.123", 1, mutual=tls)
             path.write_text(path.read_text().replace("tcp_port = 0", "tcp_port = 1"))
-            command = self.command("modem", unified) + ["--config", str(path), "--interface", "lo", "--log-level", "info",
-                "--bind-addr", ip, "--tcp-port", "0", "--discovery-port", str(port)]
+            modem_ip = ("192.0.2.1", "fe80::1")[index] if dual else ip
+            command = self.command("modem", unified) + ["--config", str(path), "--interface", interface, "--log-level", "info",
+                "--bind-addr", modem_ip, "--tcp-port", "0", "--discovery-port", str(port)]
             command += self.tls_flags("modem") if tls else ["--no-tls"]
             modem = self.start(f"{name}-modem-{index}", command)
             addresses.append(self.wait_log(modem, r"modem listening on (\S+)"))
             assert not addresses[-1].endswith(":1"), addresses[-1]
             modems.append(modem)
         path = self.config(f"{name}-router", "192.0.2.123", 1)
-        command = self.command("router", unified) + ["-c", str(path), "--interface", "lo", "--log-level", "info",
+        command = self.command("router", unified) + ["-c", str(path), "--interface", interface, "--log-level", "info",
             "--bind-addr", ip, "--discovery-port", str(port)]
         command += self.tls_flags("router") if tls else ["--no-tls"]
+        if dual:
+            command += ["--dual-stack-discovery"]
         if not discovery:
             for address in addresses:
                 command += ["--peer", address]
@@ -280,6 +292,7 @@ printf '%s\n' "${COMPREPLY[@]}"
         # Keep heartbeats active for more than two intervals.
         time.sleep(2.2)
         assert "session down" not in router[1].read_text(), router[1].read_text()
+        assert len(re.findall(r"session up", router[1].read_text())) == peers
         self.stop(router, signal.SIGINT)
         for modem in modems:
             self.stop(modem)
@@ -339,7 +352,8 @@ def main():
             smoke.session("launcher-ipv4-discovery-plaintext", True, "127.0.0.1", False, discovery=True)
             smoke.dns_session(False)
             smoke.dns_session(True)
-            print(json.dumps({"cli_and_certificate_checks": smoke.checked, "session_scenarios": 6, "version": args.version}))
+            smoke.session("launcher-dual-discovery-two-families", True, "0.0.0.0", False, discovery=True, peers=2, dual=True)
+            print(json.dumps({"cli_and_certificate_checks": smoke.checked, "session_scenarios": 7, "version": args.version}))
         except BaseException:
             for child, log in smoke.children:
                 print(f"--- {log.name}: {child.args}\n{log.read_text()}", flush=True)

@@ -376,8 +376,12 @@ The modem has no `mode` or `static_peers`; it uses `peer_description`, shared
 network/TLS/timer sections, and an optional `[metrics]` section. Its
 `network.tcp_port` configures the listener. The router instead connects to
 ports from Peer Offers or `static_peers`; its UDP source port is ephemeral.
-Both roles use `bind_addr` for discovery source preference and address family,
-while only the modem uses it for its TCP listener.
+Both roles use `bind_addr` for discovery source preference and the default
+address family, while only the modem uses it for its TCP listener. Setting
+`discovery_dual_stack = true` runs independent IPv4/IPv6 discovery FSMs on one
+explicit interface. All sockets bind before tasks start, and a supervisor owns
+their shutdown/cancellation. Both transports advertise the same concrete modem
+TCP endpoint; dual discovery does not add a second TCP listener.
 
 See [the deployment schema](deployment.md#3-configuration) and the complete
 [router](../examples/router.toml) and [modem](../examples/modem.toml) examples.
@@ -585,11 +589,9 @@ Extension termination, factory settings, and standard-signal discovery hooks are
 complete in chunks 75–77. Arbitrary rustls configurations can already be supplied
 through builders; custom TLS verification does not require weakening defaults.
 
-Two larger scope areas remain optional follow-ups:
-
-- Simultaneous IPv4/IPv6 discovery; the configured bind family currently selects
-  one discovery transport.
-- Non-Linux daemon transport; macOS currently covers portable protocol crates.
+Simultaneous IPv4/IPv6 discovery is complete in chunk 78. The remaining larger
+scope follow-up is non-Linux daemon transport; macOS currently covers portable
+protocol crates.
 
 Device-specific radio integration needs a selected device and its control API.
 The generic radio adapter and link-control backend are already available.
@@ -1508,6 +1510,20 @@ The order of work was:
     Focused checks cover callback order, opt-in, unclaimed/malformed input, and
     aggregate output budgets without disrupting the core signal.
 
+78. Simultaneous IPv4/IPv6 discovery. **Done** — optional
+    `[network].discovery_dual_stack` and `--dual-stack-discovery` run both UDP
+    families on an explicit interface with usable IPv4 and IPv6 addresses.
+    Single-family defaults remain unchanged. Each transport has its own FSM,
+    timers, packet metadata, and extension hooks; the group owns startup,
+    shutdown, cancellation, and unexpected child exits together. Partial bind
+    failures release sockets and modem listeners. Modems share one discovery
+    port across families, including ephemeral ports, and advertise a concrete
+    address of their single TCP listener across either UDP transport. Cases
+    cover a router using IPv4-only and IPv6-only modems together, scoped
+    endpoints, destination flow, TLS through cross-family offers, configuration
+    checks, and cleanup. Release smoke covers the combined launcher discovering
+    both modem families without duplicate sessions.
+
 ---
 
 ## 10. Open questions / risks
@@ -1546,6 +1562,6 @@ interoperability certification.
 - **Extension negotiation.** Plugins now require mutual support for their advertised IDs; callbacks cannot override that requirement.
 - **Order of Data Items inside a message.** The RFC says order is not significant, but some implementations are sensitive. We will be lenient on receive and pick a canonical order on send.
 - **Socket privileges.** The modem normally needs `CAP_NET_BIND_SERVICE` for port 854; the router uses ephemeral source ports. Both roles need `CAP_NET_RAW` for strict TCP GTSM. See [deployment §4](deployment.md#4-socket-privileges).
-- **IPv4 vs IPv6.** Wire encoding and discovery support both families. Each daemon uses the family of `bind_addr`; simultaneous discovery over both families is not enabled. IPv6 wildcard binds require an explicit interface to scope multicast. Link-local TCP endpoints retain the packet's ingress interface scope, including IPv6 Connection Points received over default-route IPv4 discovery.
+- **IPv4 vs IPv6.** Discovery uses the family of `bind_addr` by default. Opt-in `discovery_dual_stack` runs both families on an explicit interface; `bind_addr` still selects the modem's single TCP listener. IPv6 wildcard binds require an explicit interface to scope multicast. Link-local TCP endpoints retain the packet's ingress interface scope, including IPv6 Connection Points received over default-route IPv4 discovery.
 
 - **Heartbeat failure coverage.** `silent_peer_is_detected_by_heartbeat_while_request_is_pending` uses an independent TCP peer that completes initialization, starts a destination transaction, and then goes silent. It verifies termination and `SessionDown(TIMED_OUT)`. A virtual-time transport test verifies that a response delayed for three minutes is accepted while the peer continues communicating.

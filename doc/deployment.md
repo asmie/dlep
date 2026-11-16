@@ -327,12 +327,13 @@ metadata, even if a discovery offer advertised a different value.
 | `[limits]` (router) | `max_discovered_peers` | `256` | positive bound on retained non-static endpoints, including active peers |
 | `[limits]` (router) | `peer_retention_secs` | `300` | positive retention window for inactive non-static peers; failed retries do not refresh it |
 | `[network]` | `interface` | none | Discovery interface name: membership, sending, and receive filtering |
+| `[network]` | `discovery_dual_stack` | `false` | Run both discovery families; requires an explicit interface with usable IPv4 and IPv6 addresses |
 | `[network]` | `mac_address_format` | `"eui48"` | Destination MAC format: `"eui48"` or `"eui64"`; must match the modem's router-facing link |
 | `[network]` | `discovery_v4_group` | `224.0.0.117` | IPv4 discovery multicast group |
-| `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (used with an IPv6 `bind_addr`) |
+| `[network]` | `discovery_v6_group` | `ff02::1:7` | IPv6 discovery multicast group (IPv6 bind or dual-stack discovery) |
 | `[network]` | `discovery_port` | `854` | modem UDP listen port / router multicast destination port; router source port is ephemeral |
 | `[network]` | `tcp_port` | `854` | modem TCP/TLS listen port; ignored by router (which uses offered/static endpoints) |
-| `[network]` | `bind_addr` | `0.0.0.0` | discovery source preference/family and modem TCP listener address; does not bind router TCP sources |
+| `[network]` | `bind_addr` | `0.0.0.0` | discovery source preference/default family and modem TCP listener address; does not bind router TCP sources |
 | `[network]` | `use_tls` | `true` | TLS for the session transport |
 | `[network]` | `gtsm_enforce` | `true` | Linux TCP minimum-TTL filter and strict reset monitor (`CAP_NET_RAW`); discovery always checks TTL |
 | `[tls]` | `cert` / `key` | none | identity (modem: required; router: mTLS) |
@@ -379,7 +380,7 @@ interval; it does not postpone local sends. The two peers may use different
 intervals. See [RFC 8175 §12.20](https://www.rfc-editor.org/rfc/rfc8175.html#section-12.20)
 and [Appendix B.7](https://www.rfc-editor.org/rfc/rfc8175.html#appendix-B.7).
 
-CLI flags override the file: `--interface`, `--no-tls`, `--cert`, `--key`,
+CLI flags override the file: `--interface`, `--dual-stack-discovery`, `--no-tls`, `--cert`, `--key`,
 `--ca-bundle`, and (router) `--peer ADDR` (repeatable; implies static mode).
 
 For discovery on a particular link, set `interface = "eth1"` under `[network]`
@@ -399,7 +400,7 @@ startup. With no name, a specific IPv4 `bind_addr` selects its interface;
 discovery only, not TCP device binding.
 
 For IPv6 discovery, configure both peers with an IPv6 `bind_addr` and use
-`discovery_v6_group` (default `ff02::1:7`). Each daemon discovers over one family:
+`discovery_v6_group` (default `ff02::1:7`). By default, each daemon discovers over one family:
 IPv4 with `0.0.0.0`, IPv6 with `::`. For example:
 
 ```toml
@@ -418,6 +419,39 @@ listener also obtains its scope from the interface. Both multicast and unicast
 signals use hop limit 255, with received hop limits checked before decoding.
 Use a multicast-capable interface for IPv6 discovery; Linux loopback alone does
 not provide the link multicast route.
+
+To run IPv4 and IPv6 discovery together, enable:
+
+```toml
+[network]
+interface = "eth1"
+discovery_dual_stack = true
+bind_addr = "0.0.0.0"
+```
+
+The equivalent CLI options are `--dual-stack-discovery --interface eth1`.
+The interface must be up, support multicast, and have usable addresses in both
+families. `--check-config` validates both. The flag enables the setting; omitting
+it preserves the TOML value, whose default is `false`. A concrete `bind_addr`
+selects the preferred discovery source in its family; the other family selects
+an interface address automatically, preferring IPv6 link-local addresses.
+
+The modem still has one TCP listener, selected by `bind_addr` and `tcp_port`.
+Both discovery transports advertise its address, resolving wildcard listeners
+to a concrete address on the interface in the TCP listener's family. An offer
+received over IPv6 can therefore advertise IPv4 TCP, or the reverse. TLS uses
+that advertised TCP identity. Link-local endpoints retain their ingress scope.
+The modem shares one UDP discovery port across both families, including when
+port `0` requests an ephemeral port; routers use independent ephemeral source
+ports. Both sockets bind before discovery tasks start. Partial startup failure
+releases the sockets and modem TCP listener; shutdown or cancellation stops both
+families, and an unexpected child-task exit stops the complete discovery group.
+
+Connected-router suppression still matches the established TCP source address
+and scope. A probe using the router's other IP family can receive an offer;
+endpoint scheduling prevents duplicate TCP connections to an occupied endpoint.
+Rust callers using full `NetworkConfig` initializers must supply the new
+`discovery_dual_stack` field or use `..NetworkConfig::default()`.
 
 
 Validate without starting the daemon:

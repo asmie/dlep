@@ -10,7 +10,7 @@ The release job verifies all crates.io archives, fetches the complete locked
 dependency set (including test-only dependencies), compares archived Cargo
 targets with the source workspace, compiles their test targets in an isolated
 extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
-under `target/release-install`, then checks every CLI flag and six local
+under `target/release-install`, then checks every CLI flag and seven local
 plaintext/mutual-TLS session scenarios in a disposable network namespace.
 It does not publish packages. See [release validation](#release-validation).
 Package verification alone does not populate every development dependency;
@@ -72,7 +72,8 @@ discovery, and plaintext discovery through the combined launcher. Two DNS
 scenarios use CLI and TOML names with DNS-only certificates and reconnect after
 modem restart. A runtime case injects changing resolver answers to verify fresh
 lookup, hostname verification, and IPv4-to-IPv6 reconnection without changing
-host resolver configuration. Sessions cross
+host resolver configuration. A combined-launcher dual-discovery scenario keeps
+exactly two sessions to IPv4-only and IPv6-only modems. Sessions cross
 heartbeat intervals and must shut down cleanly on SIGINT/SIGTERM. All network
 changes occur in disposable namespaces. Use the sudo alternative in the network
 test instructions when user namespaces are unavailable.
@@ -96,6 +97,13 @@ protection, opt-in and registration order, and dropping unclaimed or invalid
 input before core processing. Real IPv4/IPv6 flows verify datagram metadata,
 core offer fields, and independent TCP negotiation. Bad-TTL/wrong-interface
 traffic and connected-router probes must not reach receive hooks.
+
+Dual-discovery checks cover both UDP families at once, scoped IPv6 endpoints,
+destination flow, TLS through offers received over either family, and concrete
+advertisements from wildcard TCP listeners. Startup rollback and group
+cancellation/failure must release both sockets and stop their timers. Config
+checks require an explicit interface with both usable address families; release
+smoke exercises the flag and TOML setting for standalone and launcher roles.
 
 Checkpoint 60 (2026-11-15) passed all eight archives, 591 archived Rust tests
 across 60 suites, three command installations, and 113 CLI/certificate checks

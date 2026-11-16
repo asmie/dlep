@@ -506,8 +506,8 @@ async fn spawn_modem_discovery(
 ) -> Result<Option<(mpsc::Sender<()>, JoinHandle<Result<(), DaemonError>>)>, DaemonError> {
     use dlep_fsm::discovery_modem::ModemDiscoveryFsm;
 
-    let socket = match cfg.shared.network.bind_discovery(true) {
-        Ok(s) => s,
+    let sockets = match cfg.shared.network.bind_discoveries(true) {
+        Ok(sockets) => sockets,
         Err(e) if cfg.shared.network.interface.is_some() => return Err(e.into()),
         Err(e) => {
             warn!(
@@ -519,23 +519,32 @@ async fn spawn_modem_discovery(
         }
     };
 
-    let fsm = ModemDiscoveryFsm::new(
-        local_addr,
-        cfg.peer_description.clone(),
-        cfg.shared.network.use_tls,
-    )
-    .with_secured_medium(cfg.secured_medium);
+    let endpoint = cfg.shared.network.discovery_tcp_endpoint(local_addr)?;
+    let members = sockets
+        .into_iter()
+        .map(|socket| {
+            (
+                ModemDiscoveryFsm::new(
+                    endpoint,
+                    cfg.peer_description.clone(),
+                    cfg.shared.network.use_tls,
+                )
+                .with_secured_medium(cfg.secured_medium),
+                socket,
+            )
+        })
+        .collect();
 
     let (tx, rx) = mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {
-        crate::discovery::run_discovery_with_peers(
-            fsm,
-            socket,
-            None,
+        crate::discovery::run_discovery_group(
+            members,
+            false,
             rx,
             events_tx,
             Some(connected_routers),
-            crate::discovery::DiscoveryHooks::new(&extensions, Role::Modem),
+            extensions,
+            Role::Modem,
         )
         .await
     });

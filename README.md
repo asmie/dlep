@@ -119,6 +119,7 @@ CLI flags shared by both binaries:
 |----------------|----------------------------------------------------------|
 | `--config`     | Path to the TOML config file.                            |
 | `--interface`  | Select the discovery interface (overrides config).        |
+| `--dual-stack-discovery` | Enable IPv4 and IPv6 discovery together; requires an interface. |
 | `--bind-addr` | Override the local discovery address; also the modem's TCP listen address. |
 | `--discovery-port` | Override the discovery destination/listen port.      |
 | `--log-level`  | Override the `DLEP_LOG` filter (`info`, `debug`, …).       |
@@ -591,7 +592,7 @@ name against the current host. Failure to create discovery on a named interface
 fails startup instead of silently disabling discovery. The setting does not bind
 TCP connections to a device.
 
-The `bind_addr` family selects one discovery transport per daemon. For IPv6,
+By default, the `bind_addr` family selects one discovery transport per daemon. For IPv6,
 set `bind_addr = "::"` and `interface = "eth1"` on both peers; this uses
 `discovery_v6_group` (default `ff02::1:7`). A wildcard IPv6 bind requires an
 interface because multicast needs a link scope. A concrete IPv6 address can
@@ -599,8 +600,15 @@ identify its interface without a name, provided it belongs to only one link.
 With no preferred address, discovery prefers a link-local address on that
 interface. Wildcard TCP listeners advertise that unicast address; discovered
 link-local connection points retain their interface scope for TCP. IPv4
-remains the default. Simultaneous discovery over both families is not enabled.
+remains the default.
 `DiscoverySocket::recv_with_local` now returns `IpAddr` for the local address.
+
+Enable `[network].discovery_dual_stack = true` or pass
+`--dual-stack-discovery --interface eth1` to run both discovery families together.
+The interface must have usable IPv4 and IPv6 addresses and support multicast.
+`bind_addr` still selects the modem's single TCP listener; both UDP transports
+advertise a concrete address in that listener's family. Both discovery sockets
+start and stop together. The default remains single-family discovery.
 
 
 `SessionUp`, `SessionDown`, `Destination`, and `Metrics` events carry a

@@ -4,6 +4,12 @@ Embeddable asynchronous router and modem runtime for DLEP (RFC 8175). Requires L
 
 Requires Rust 1.85 or newer.
 
+Set `config.shared.network.discovery_dual_stack = true` with an explicit
+`interface` to run IPv4 and IPv6 discovery together. Both usable address
+families are required. `bind_addr` still selects the modem's single TCP listener;
+both discovery transports advertise its concrete endpoint. Startup failure,
+shutdown, and cancellation clean up the complete discovery group.
+
 Router handles support numeric peers with `connect_static(addr)`, named peers
 with `connect_named(host, port)`, and explicit certificate identities with
 `connect_static_with_server_name(addr, name)`. Named connections preserve the

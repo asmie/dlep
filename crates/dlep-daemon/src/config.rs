@@ -14,13 +14,16 @@ pub struct NetworkConfig {
     pub interface: Option<String>,
     pub discovery_v4_group: Ipv4Addr,
     pub discovery_v6_group: Ipv6Addr,
+    /// Run IPv4 and IPv6 discovery together on an explicitly selected interface.
+    /// The TCP listener remains selected by bind_addr.
+    pub discovery_dual_stack: bool,
     /// Modem discovery listen port and router multicast destination port.
     /// Router discovery sockets bind an ephemeral local port.
     pub discovery_port: u16,
     /// Modem TCP listener port. Routers use offered/static endpoint ports.
     pub tcp_port: u16,
     /// Address the modem's TCP listener binds to; its family also selects
-    /// discovery transport for both roles. Defaults to `0.0.0.0`
+    /// discovery transport unless discovery_dual_stack is enabled. Defaults to `0.0.0.0`
     /// (all interfaces); tests pin this to `127.0.0.1` so they don't rely on
     /// the OS-specific behaviour of `connect("0.0.0.0:N")`.
     #[serde(default = "default_bind_addr")]
@@ -49,6 +52,25 @@ impl NetworkConfig {
 
     /// Validate interface selection and IPv6 scope without opening a socket.
     pub fn validate_discovery_interface(&self) -> std::io::Result<()> {
+        if self.discovery_dual_stack {
+            if self.interface.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "dual-stack discovery requires an explicit interface",
+                ));
+            }
+            let v4 = match self.bind_addr {
+                IpAddr::V4(addr) => addr,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let v6 = match self.bind_addr {
+                IpAddr::V6(addr) => addr,
+                _ => Ipv6Addr::UNSPECIFIED,
+            };
+            self.discovery_interface().resolve_v4(v4)?;
+            self.discovery_interface().resolve_v6(v6)?;
+            return Ok(());
+        }
         match self.bind_addr {
             IpAddr::V4(preferred) if self.interface.is_some() => {
                 self.discovery_interface().resolve_v4(preferred)?;
@@ -59,6 +81,67 @@ impl NetworkConfig {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Bind all requested discovery sockets before starting any tasks. A
+    /// failure drops the complete partial set. Ephemeral modem ports are shared
+    /// across families; routers retain independent ephemeral source ports.
+    pub(crate) fn bind_discoveries(
+        &self,
+        modem: bool,
+    ) -> std::io::Result<Vec<dlep_net::discovery::DiscoverySocket>> {
+        self.validate_discovery_interface()?;
+        let first = self.bind_discovery(modem)?;
+        if !self.discovery_dual_stack {
+            return Ok(vec![first]);
+        }
+        let mut other = self.clone();
+        other.discovery_dual_stack = false;
+        other.bind_addr = if self.bind_addr.is_ipv4() {
+            Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            Ipv4Addr::UNSPECIFIED.into()
+        };
+        if modem && self.discovery_port == 0 {
+            other.discovery_port = first.local_port();
+        }
+        let second = other.bind_discovery(modem)?;
+        Ok(vec![first, second])
+    }
+
+    /// A dual-family offer must advertise a usable TCP address even when its
+    /// discovery datagram uses the other family and the listener is wildcard.
+    pub(crate) fn discovery_tcp_endpoint(
+        &self,
+        listener: SocketAddr,
+    ) -> std::io::Result<SocketAddr> {
+        if !self.discovery_dual_stack || !listener.ip().is_unspecified() {
+            return Ok(listener);
+        }
+        let mut endpoint = listener;
+        match &mut endpoint {
+            SocketAddr::V4(addr) => addr.set_ip(
+                self.discovery_interface()
+                    .resolve_v4(Ipv4Addr::UNSPECIFIED)?
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            "dual-stack discovery requires an IPv4 interface address",
+                        )
+                    })?
+                    .address,
+            ),
+            SocketAddr::V6(addr) => {
+                let interface = self
+                    .discovery_interface()
+                    .resolve_v6(Ipv6Addr::UNSPECIFIED)?;
+                addr.set_ip(interface.address);
+                if interface.address.is_unicast_link_local() {
+                    addr.set_scope_id(interface.index);
+                }
+            }
+        }
+        Ok(endpoint)
     }
     /// Create discovery for the configured family. Routers use an ephemeral
     /// port and receive unicast offers; only modems join the multicast group.
@@ -120,6 +203,7 @@ impl Default for NetworkConfig {
             interface: None,
             discovery_v4_group: DISCOVERY_IPV4_GROUP,
             discovery_v6_group: DISCOVERY_IPV6_GROUP,
+            discovery_dual_stack: false,
             discovery_port: DEFAULT_PORT,
             tcp_port: DEFAULT_PORT,
             bind_addr: default_bind_addr(),
@@ -644,6 +728,27 @@ fn default_modem_peer_description() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dual_stack_modem_shares_an_ephemeral_port_and_releases_both_sockets() {
+        for bind in ["0.0.0.0", "::"] {
+            let mut config = NetworkConfig {
+                bind_addr: bind.parse().unwrap(),
+                interface: Some("dlep-test".into()),
+                discovery_dual_stack: true,
+                discovery_port: 0,
+                ..Default::default()
+            };
+            let sockets = config.bind_discoveries(true).unwrap();
+            assert_eq!(sockets.len(), 2);
+            assert!(sockets[0].local_port() > 0);
+            assert_eq!(sockets[0].local_port(), sockets[1].local_port());
+            config.discovery_port = sockets[0].local_port();
+            drop(sockets);
+            let rebound = config.bind_discoveries(true).unwrap();
+            assert_eq!(rebound.len(), 2);
+        }
+    }
 
     #[test]
     fn mac_format_defaults_roundtrips_and_rejects_unknown_values() {

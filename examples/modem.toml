@@ -19,6 +19,9 @@ mac_address_format = "eui48"
 # IPv6: set bind_addr = "::" and interface to use ff02::1:7 discovery.
 # A concrete bind_addr must belong to this interface.
 # interface = "eth0"
+# Enable both families on the named interface; requires usable IPv4 and IPv6.
+# The TCP listener below still uses bind_addr's family.
+# discovery_dual_stack = true
 # Address the TCP listener binds to; 0.0.0.0 means all interfaces.
 bind_addr = "0.0.0.0"
 # DLEP well-known port is 854 (UDP for discovery, TCP for the session).

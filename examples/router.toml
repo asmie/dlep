@@ -38,7 +38,9 @@ mac_address_format = "eui48"
 # IPv6: set bind_addr = "::" and interface to use ff02::1:7 discovery.
 # A concrete bind_addr must belong to this interface.
 # interface = "eth0"
-# Preferred discovery source and address family; not a TCP source bind.
+# Enable both families on the named interface; requires usable IPv4 and IPv6.
+# discovery_dual_stack = true
+# Preferred discovery source and default address family; not a TCP source bind.
 # bind_addr = "0.0.0.0"
 # Discovery destination port on the modem; the router binds an ephemeral port.
 # TCP endpoints come from Peer Offers or static_peers, not network.tcp_port.

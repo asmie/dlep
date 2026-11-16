@@ -183,6 +183,76 @@ pub(crate) async fn run_discovery_with_peers<F: DiscoveryFsm>(
     .await
 }
 
+/// Own both family tasks as one lifecycle. Dropping the supervisor aborts all
+/// children; ordinary shutdown closes their stop channels and joins them.
+/// Any unexpected child exit stops the complete group.
+pub(crate) async fn run_discovery_group<F: DiscoveryFsm>(
+    mut members: Vec<(F, DiscoverySocket)>,
+    start: bool,
+    mut shutdown_rx: mpsc::Receiver<()>,
+    events_tx: EventTx,
+    connected_routers: Option<ConnectedRouters>,
+    registry: dlep_ext::ExtensionRegistry,
+    role: dlep_ext::Role,
+) -> Result<(), DaemonError> {
+    if members.len() == 1 {
+        let (fsm, socket) = members.pop().expect("one discovery member");
+        return run_discovery_with_peers(
+            fsm,
+            socket,
+            start.then_some(FsmEvent::AppStartDiscovery),
+            shutdown_rx,
+            events_tx,
+            connected_routers,
+            DiscoveryHooks::new(&registry, role),
+        )
+        .await;
+    }
+    if members.is_empty() {
+        return Err(DaemonError::Config("discovery group has no sockets".into()));
+    }
+    let mut children = tokio::task::JoinSet::new();
+    let mut stops = Vec::new();
+    for (fsm, socket) in members {
+        let (stop, rx) = mpsc::channel(1);
+        stops.push(stop);
+        children.spawn(run_discovery_with_peers(
+            fsm,
+            socket,
+            start.then_some(FsmEvent::AppStartDiscovery),
+            rx,
+            events_tx.clone(),
+            connected_routers.clone(),
+            DiscoveryHooks::new(&registry, role),
+        ));
+    }
+    let mut failure = tokio::select! {
+        _ = shutdown_rx.recv() => None,
+        result = children.join_next() => Some(match result {
+            Some(Ok(Err(error))) => error,
+            Some(Err(error)) => DaemonError::Config(format!("discovery task failed: {error}")),
+            _ => DaemonError::Config("discovery task stopped unexpectedly".into()),
+        }),
+    };
+    drop(stops);
+    while let Some(result) = children.join_next().await {
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(DaemonError::Config(format!(
+                "discovery task failed: {error}"
+            ))),
+        };
+        if failure.is_none() {
+            failure = error;
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 async fn run_discovery_io<F: DiscoveryFsm>(
     mut fsm: F,
     socket: impl DiscoveryIo,
@@ -400,6 +470,102 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::time::{Instant, advance, timeout};
+
+    struct GroupObserver {
+        sends: Arc<AtomicUsize>,
+        panic_once: bool,
+    }
+    impl dlep_ext::DlepExtension for GroupObserver {
+        fn advertised_ids(&self) -> &[dlep_core::ExtensionId] {
+            &[dlep_core::ExtensionId(0xF051)]
+        }
+        fn supports_discovery(&self) -> bool {
+            true
+        }
+        fn on_discovery_send(&self, _: SignalType, _: &mut dyn dlep_ext::DiscoveryCtx) {
+            let previous = self.sends.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !self.panic_once || previous != 0,
+                "injected discovery hook failure"
+            );
+        }
+    }
+
+    async fn group_lifecycle(panic_once: bool) {
+        let config = crate::NetworkConfig {
+            interface: Some("dlep-test".into()),
+            discovery_dual_stack: true,
+            discovery_port: 50091,
+            ..Default::default()
+        };
+        let members: Vec<_> = config
+            .bind_discoveries(false)
+            .unwrap()
+            .into_iter()
+            .map(|socket| (router(), socket))
+            .collect();
+        let ports: Vec<_> = members
+            .iter()
+            .map(|(_, socket)| socket.local_port())
+            .collect();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut registry = dlep_ext::ExtensionRegistry::new();
+        registry.register(Arc::new(GroupObserver {
+            sends: count.clone(),
+            panic_once,
+        }));
+        let (_stop, rx) = mpsc::channel(1);
+        let (events, _) = crate::runtime::new_event_channel();
+        let task = tokio::spawn(run_discovery_group(
+            members,
+            true,
+            rx,
+            events,
+            None,
+            registry,
+            dlep_ext::Role::Router,
+        ));
+        if panic_once {
+            assert!(
+                timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+        } else {
+            timeout(Duration::from_secs(2), async {
+                while count.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        settle().await;
+        let _v4 = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, ports[0]))
+            .expect("IPv4 discovery socket leaked");
+        let _v6 = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, ports[1]))
+            .expect("IPv6 discovery socket leaked");
+        let stopped = count.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            stopped,
+            "discovery child or timer outlived the group"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_dual_discovery_releases_both_sockets_and_timers() {
+        group_lifecycle(false).await;
+    }
+    #[tokio::test]
+    async fn failing_discovery_child_stops_the_complete_group() {
+        group_lifecycle(true).await;
+    }
 
     struct ScriptedIo {
         input: tokio::sync::Mutex<mpsc::UnboundedReceiver<io::Result<ReceivedSignal>>>,

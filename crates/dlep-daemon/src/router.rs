@@ -98,7 +98,6 @@ impl RouterDaemon {
     pub async fn start_discovery(&self) -> Result<(), DaemonError> {
         use std::time::Duration;
 
-        use dlep_fsm::FsmEvent;
         use dlep_fsm::discovery_router::{RouterDiscoveryConfig, RouterDiscoveryFsm};
 
         let mut slot = self.discovery_shutdown.lock().await;
@@ -106,12 +105,16 @@ impl RouterDaemon {
             return Err(DaemonError::Config("discovery already running".into()));
         }
 
-        let socket = self.network.bind_discovery(false)?;
+        let sockets = self.network.bind_discoveries(false)?;
 
-        let fsm = RouterDiscoveryFsm::with_config(RouterDiscoveryConfig {
+        let config = RouterDiscoveryConfig {
             peer_description: self.peer_description.clone(),
             discovery_interval: Duration::from_millis(self.timers.discovery_interval_ms.into()),
-        });
+        };
+        let members = sockets
+            .into_iter()
+            .map(|socket| (RouterDiscoveryFsm::with_config(config.clone()), socket))
+            .collect();
 
         // Acquire both registry locks before spawning. Cancellation must not
         // leave a running task that shutdown cannot find and join.
@@ -120,12 +123,12 @@ impl RouterDaemon {
         let events_tx = self.events_tx.clone();
         let extensions = self.extensions.clone();
         let handle = tokio::spawn(async move {
-            crate::discovery::run_discovery_with_extensions(
-                fsm,
-                socket,
-                Some(FsmEvent::AppStartDiscovery),
+            crate::discovery::run_discovery_group(
+                members,
+                true,
                 shutdown_rx,
                 events_tx,
+                None,
                 extensions,
                 Role::Router,
             )

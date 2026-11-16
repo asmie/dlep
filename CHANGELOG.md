@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Both daemons support simultaneous IPv4/IPv6 discovery with
+  `[network].discovery_dual_stack = true` or `--dual-stack-discovery`.
+  An explicit interface with usable addresses in both families is required.
+  Both UDP transports share lifecycle and rollback; modem offers advertise a
+  usable address for the single TCP listener, including across discovery
+  families. Single-family discovery remains the default. Full Rust
+  `NetworkConfig` initializers need the new field or a default.
 - Extensions can opt in to pre-session discovery hooks on both daemon roles.
   Plugins can append bounded TLVs to Peer Discovery/Peer Offer signals and
   inspect validated incoming items/signals with datagram metadata. Core fields,

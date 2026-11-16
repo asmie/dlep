@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long, short = 'c', env = "DLEP_MODEM_CONFIG")]
     config: Option<PathBuf>,
 
+    /// Run IPv4 and IPv6 discovery together; requires --interface or network.interface.
+    #[arg(long)]
+    dual_stack_discovery: bool,
+
     /// Override the network interface used for discovery.
     #[arg(long)]
     interface: Option<String>,
@@ -179,6 +183,9 @@ fn init_tracing(requested: &str) {
 }
 
 fn apply_overrides(cfg: &mut ModemConfig, cli: &Cli) {
+    if cli.dual_stack_discovery {
+        cfg.shared.network.discovery_dual_stack = true;
+    }
     if let Some(addr) = cli.bind_addr {
         cfg.shared.network.bind_addr = addr;
     }
