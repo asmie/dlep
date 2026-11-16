@@ -64,7 +64,9 @@ sources. The checker validates required package files, flattened symlinks, and
 matching Cargo targets before running tests and installing the three commands.
 CI compiles the archived tests; `--run-tests` above also executes them.
 
-Smoke checks cover CLI flags and configuration precedence, certificate errors,
+Smoke checks cover CLI flags and configuration precedence, all five completion
+generators without configuration or logging setup, and actual Bash completion
+of launcher roles and role-specific options. They also cover certificate errors,
 two static plaintext IPv4 peers, mutual TLS over IPv6, mutual TLS with IPv4
 discovery, and plaintext discovery through the combined launcher. Sessions cross
 heartbeat intervals and must shut down cleanly on SIGINT/SIGTERM. All network

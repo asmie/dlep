@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- All commands can print Bash, Elvish, Fish, PowerShell, and Zsh completion
+  scripts with `--generate-completions SHELL`. Scripts use the actual CLI
+  definitions, including both roles in the combined launcher. Generation exits
+  before configuration, logging, or networking setup.
 - Modems can set top-level `secured_medium` (default false) to advertise RF-medium
   access control in Peer Offers and initialization responses. Routers expose the
   received flag in discovery/session metadata, snapshots, and adapter `session`

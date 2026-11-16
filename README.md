@@ -126,6 +126,7 @@ CLI flags shared by both binaries:
 | `--cert`, `--key` | Override the TLS identity files.                     |
 | `--ca-bundle` | Override the trusted CA bundle.                          |
 | `--check-config` | Validate configuration and TLS material, then exit.   |
+| `--generate-completions SHELL` | Print shell completions and exit.       |
 | `--help` / `-h` | Show options without starting networking.              |
 | `--version` / `-V` | Show the installed version.                         |
 
@@ -136,6 +137,20 @@ wins. Router-only `--peer ADDR` is repeatable and selects static connections.
 Modem-only `--tcp-port PORT` overrides its listener; zero selects an allocated
 port. Routers use the TCP port supplied by each peer endpoint or offer.
 See the [deployment guide](doc/deployment.md#3-configuration) for details.
+
+Generate completions for Bash, Elvish, Fish, PowerShell, or Zsh from the installed
+CLI definitions. For example, enable Bash completion in the current shell:
+
+```bash
+source <(dlep --generate-completions bash)
+# For standalone installations:
+source <(dlep-router --generate-completions bash)
+source <(dlep-modem --generate-completions bash)
+```
+
+The launcher script includes both roles and their options. Generation exits
+before loading configuration or starting networking; see
+[completion installation](doc/deployment.md#shell-completions) for persistent setup.
 
 A minimal plaintext development configuration for either role (select an
 interface present on your host):

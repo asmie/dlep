@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use dlep_daemon::{
     DaemonEvent, DiscoveryMode, PeerConnectionState, RouterConfig, RouterDaemon,
     check_router_config, load_toml_config,
@@ -20,6 +20,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Print a shell completion script and exit without loading configuration.
+    #[arg(long, value_enum, value_name = "SHELL")]
+    generate_completions: Option<clap_complete::Shell>,
+
     /// Path to a TOML configuration file.
     #[arg(long, short = 'c', env = "DLEP_ROUTER_CONFIG")]
     config: Option<PathBuf>,
@@ -68,15 +72,27 @@ struct Cli {
     check_config: bool,
 }
 
+/// CLI definition shared by parsing and shell completion generation.
+pub fn command() -> clap::Command {
+    Cli::command()
+}
+
 /// Run the daemon CLI with the supplied argument vector, including argv[0].
 /// Help/version and argument errors follow clap's normal process-exit behavior.
-/// Registers process-wide tracing and signal handlers; call once per process.
+/// Completion generation exits before configuration, tracing, or signal setup.
+/// Daemon startup registers process-wide tracing and signals; call once per process.
 pub async fn run_from<I, T>(args: I) -> Result<()>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
     let cli = Cli::parse_from(args);
+    if let Some(shell) = cli.generate_completions {
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut command(), "dlep-router", &mut script);
+        std::io::Write::write_all(&mut std::io::stdout().lock(), &script)?;
+        return Ok(());
+    }
     init_tracing(&cli.log_level);
 
     let mut config: RouterConfig =

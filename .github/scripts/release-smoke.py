@@ -91,7 +91,7 @@ termination_timeout_ms = 1000
                     help_text = self.run(command + [flag]).stdout
                     for option in ("--config", "--interface", "--log-level", "--no-tls", "--cert",
                                    "--key", "--ca-bundle", "--bind-addr", "--discovery-port",
-                                   "--check-config", "--help", "--version"):
+                                   "--check-config", "--generate-completions", "--help", "--version"):
                         assert option in help_text, (role, option)
                     assert ("--peer" in help_text) == (role == "router")
                     assert ("--tcp-port" in help_text) == (role == "modem")
@@ -139,6 +139,68 @@ termination_timeout_ms = 1000
                 else:
                     self.run(command + ["--peer", "127.0.0.1:854"], expected=2)
                 print(f"PASS CLI flags: {'dlep ' if unified else 'dlep-'}{role}", flush=True)
+
+    def completion_checks(self):
+        launcher = [str(self.binaries / "dlep")]
+        commands = [launcher] + [self.command(role, unified)
+                                for unified in (False, True) for role in ("router", "modem")]
+        shells = {"bash", "elvish", "fish", "powershell", "zsh"}
+        # Completion scripts must work before configuration, tracing, or socket setup.
+        env = {"DLEP_ROUTER_CONFIG": "missing-router.toml", "DLEP_MODEM_CONFIG": "missing-modem.toml",
+               "DLEP_LOG": "[broken"}
+        scripts = {}
+        for command in commands:
+            self.run(command + ["--generate-completions"], expected=2)
+            self.run(command + ["--generate-completions", "unknown-shell"], expected=2)
+            for shell in sorted(shells):
+                result = self.run(command + [f"--generate-completions={shell}"], env=env)
+                assert result.stdout and not result.stderr, (command, shell, result)
+                assert "generate-completions" in result.stdout, (command, shell)
+                scripts[tuple(command), shell] = result.stdout
+                if command[0] == launcher[0] and len(command) > 1:
+                    assert result.stdout == scripts[tuple(launcher), shell], (command, shell)
+                elif command != launcher:
+                    assert ("tcp-port" in result.stdout) == command[0].endswith("dlep-modem")
+                    assert ("--peer" in result.stdout or "-l peer " in result.stdout) == command[0].endswith("dlep-router"), (command, shell)
+        self.run(launcher + ["--generate-completions", "bash", "router"], expected=2)
+        self.run(launcher + ["router", "--generate-completions", "bash", "--unknown-flag"], expected=2)
+
+        invoke = r'''
+source "$1"
+shift
+COMP_WORDS=("$@")
+COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
+COMP_LINE="${COMP_WORDS[*]}"
+COMP_POINT=${#COMP_LINE}
+binding=$(complete -p "${COMP_WORDS[0]}")
+[[ $binding =~ -F\ ([^[:space:]]+) ]] || exit 1
+"${BASH_REMATCH[1]}" "${COMP_WORDS[0]}" "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}"
+printf '%s\n' "${COMPREPLY[@]}"
+'''
+        for command in commands[:3]:
+            binary = Path(command[0]).name
+            script = self.root / f"{binary}.bash"
+            script.write_text(scripts[tuple(command), "bash"])
+            self.run(["bash", "-n", str(script)])
+
+            def complete(*words):
+                return set(self.run(["bash", "--noprofile", "--norc", "-c", invoke, "completion-check",
+                                     str(script), binary, *words]).stdout.splitlines())
+
+            if binary == "dlep":
+                assert {"router", "modem"} <= complete("")
+                for role in ("router", "modem"):
+                    options = complete(role, "--")
+                    assert ("--peer" in options) == (role == "router")
+                    assert ("--tcp-port" in options) == (role == "modem")
+                    assert shells == complete(role, "--generate-completions", "")
+            else:
+                options = complete("--")
+                assert "--config" in options
+                assert ("--peer" in options) == (binary == "dlep-router")
+                assert ("--tcp-port" in options) == (binary == "dlep-modem")
+            assert shells == complete("--generate-completions", "")
+        print("PASS shell completions: five generators, launcher/standalone names and Bash behavior", flush=True)
 
     def start(self, name, command):
         log = self.root / f"{name}.log"
@@ -225,6 +287,7 @@ def main():
         try:
             smoke.certificates()
             smoke.cli_checks()
+            smoke.completion_checks()
             smoke.session("standalone-ipv4-plaintext-two-peers", False, "127.0.0.1", False, peers=2)
             smoke.session("launcher-ipv6-mutual-tls", True, "::1", True)
             smoke.session("standalone-ipv4-discovery-mutual-tls", False, "127.0.0.1", True, discovery=True)

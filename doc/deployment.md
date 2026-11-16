@@ -30,6 +30,46 @@ cargo build --release --workspace --locked
 sudo install -m 0755 target/release/dlep-router target/release/dlep-modem /usr/local/bin/
 ```
 
+### Shell completions
+
+All three commands accept `--generate-completions SHELL`, with `bash`, `elvish`,
+`fish`, `powershell`, or `zsh`. The script goes to stdout and generation exits
+before loading configuration, initializing logging, or opening sockets. Generate
+it again after upgrading to keep options aligned with the installed version.
+
+For Bash, load the script in the current shell:
+
+```bash
+source <(dlep --generate-completions bash)
+```
+
+For persistent Bash completion with the `bash-completion` package installed:
+
+```sh
+mkdir -p ~/.local/share/bash-completion/completions
+dlep --generate-completions bash > ~/.local/share/bash-completion/completions/dlep
+```
+
+For Fish:
+
+```sh
+mkdir -p ~/.config/fish/completions
+dlep --generate-completions fish > ~/.config/fish/completions/dlep.fish
+```
+
+For Zsh, save `dlep --generate-completions zsh` as `_dlep` in a directory on
+`$fpath`, then initialize completion with `autoload -Uz compinit; compinit` in
+your Zsh startup configuration. For PowerShell, save the generated script as a
+`.ps1` file and dot-source it from your profile. For Elvish, save the script in
+your library directory and load it from `rc.elv` with `use`.
+
+The launcher script includes `router` and `modem` and their role-specific flags.
+Requesting completions with `dlep router --generate-completions SHELL` or
+`dlep modem --generate-completions SHELL` prints the same launcher script.
+For standalone installations, generate a separate script with each installed
+command (`dlep-router` and `dlep-modem`), using that command's name for the file
+(`_dlep-router` for Zsh, `dlep-router.fish` for Fish, and so on).
+
 ## 2. Certificates
 
 TLS is **on by default** (RFC 8175 security guidance). DLEP runs on

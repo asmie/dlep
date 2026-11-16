@@ -164,6 +164,9 @@ embedders should use `dlep-daemon` instead. Each role:
 1. Parses CLI flags via `clap` (`--config`, `--interface`, `--log-level`,
    `--no-tls`, `--cert`, `--key`, `--ca-bundle`, `--check-config`; the
    router also takes repeatable `--peer ADDR`, which implies static mode).
+   `--generate-completions SHELL` prints a script from the same CLI definition
+   and exits before the remaining steps. Each package exposes `command()` so
+   the launcher can include both role definitions in its completion script.
 2. Initialises `tracing-subscriber` (with a stderr warning if the requested
    log level is invalid).
 3. Loads configuration via `dlep_daemon::load_toml_config` and applies CLI
@@ -520,10 +523,10 @@ section records the limits of the available evidence.
 
 ### Feature backlog
 
-The current practical feature scope has five areas, three completed in chunks 69–71.
-The two remaining areas are the next product priorities. Roughly 6–10 focused
-implementation chunks for the whole group is a planning estimate, including
-chunks 69–71; it is not an RFC-completeness percentage or a release prerequisite.
+The current practical feature scope has five areas, four completed in chunks 69–72.
+DNS endpoints and TLS server names are the remaining product priority. Roughly
+6–10 focused implementation chunks for the whole group is a planning estimate, including
+chunks 69–72; it is not an RFC-completeness percentage or a release prerequisite.
 Validation should accompany features rather than become an open-ended queue.
 
 | Feature | Status / next behavior |
@@ -532,7 +535,7 @@ Validation should accompany features rather than become an open-ended queue.
 | Router destination acceptance policy | Done in chunk 70: startup allow/deny lists and default acceptance, with Not Interested replies for declined Up announcements |
 | Secured-medium Peer Type flag | Done in chunk 71: modem configuration and received discovery/session metadata, including router-adapter snapshots |
 | DNS endpoints and TLS server names | Pending: resolve named peers while retaining the intended certificate identity |
-| Shell completions | Pending: generate completions for standalone commands and the combined launcher |
+| Shell completions | Done in chunk 72: Bash, Elvish, Fish, PowerShell, and Zsh scripts generated from the standalone and combined CLI definitions |
 
 Three larger scope areas are separate from that estimate:
 
@@ -564,7 +567,7 @@ The order of work was:
 6. UDP multicast discovery, including GTSM cmsg handling. **Done (M6)** — IPv4 multicast group join, `socket2`-built UDP sockets with TTL=255 outbound (GTSM), cmsg-based inbound TTL extraction via `nix::recvmsg`, router + modem discovery FSMs, and the `discovery_loopback_finds_modem_and_establishes_session` integration test. The router is an *active probe* (sends `Peer_Discovery` to the well-known group from an ephemeral source port; does **not** join the group) — the modem is the only group member and replies with unicast `Peer_Offer` to the discovery's source. Without an explicit interface, modem-side discovery socket bind remains best-effort for direct `connect_static` callers. Named interface failures are fatal. Interface selection is implemented below. IPv6 transport is implemented below. Follow-up: `OfferBurst` retries.
 7. TLS via tokio-rustls, then flip the `use_tls` default. **Done (M7)** — `tokio_rustls::TlsConnector` / `TlsAcceptor` wired through `Connector::tls(client_cfg)` / `Acceptor::tls(listener, server_cfg)` factory constructors with private fields; `Transport` implemented for both `tokio_rustls::{client,server}::TlsStream<TcpStream>`; `NetworkConfig::default().use_tls` flipped to `true`; `with_rustls_client(...)` / `with_rustls_server(...)` becomes the required setup step when TLS is on (spawn fails fast otherwise). Cert verification uses `ServerName::IpAddress` derived from the connect target's IP. Verified by the `tls_session_establishes_and_carries_destination_lifecycle` integration test covering handshake plus a destination Up/Down round-trip. The Drop/Up race now returns an explicit Busy error; TLS tests retry on that result rather than waiting a guessed 50 ms. Follow-ups: DNS-based `ServerName` resolution and custom certificate verifier hooks.
 8. Wire the extension plug-in API and round-trip a private-use ID through a test-only extension. **Done (M8)** — `ExtensionRegistry` is now plumbed from `RouterBuilder`/`ModemBuilder` into each session task; `SessionConfig.advertised_extensions` is populated from `registry.advertised()` and shows up in the `ExtensionsSupported` data item of `Session Initialization` / `Session Initialization Response` (omitted when empty); both FSMs capture the peer's advertised IDs into `peer_extensions` and surface them via `EmittedEvent::SessionUp { peer_extensions }`; the daemon computes `negotiated_extensions = advertised_local ∩ peer_extensions` for `DaemonEvent::SessionUp`. The session task routes inbound messages with an unknown `MessageType` through `on_unknown_message`, dispatches `DataItem::Unknown` items inside known messages through `on_unknown_data_item`, and drives `on_session_state` / `on_destination_state` on lifecycle transitions. Verified by the `private_use_extension_round_trips_session_init_and_unknown_message` integration test (Private-Use `ExtensionId(0xF000)` + `MessageType(0xF000)`). Follow-ups: extension-driven Session Termination, per-extension config plumbing, extensions over the UDP discovery socket, and an "ask FSM to terminate" hook.
-9. Polish the CLI binaries and document deployment. **Done (M9)** — the binaries build rustls configs from the TOML `[tls]` section via `dlep_daemon::tls::{client_config, server_config}`: the router requires `ca_bundle` (private PKI; no system-roots fallback) and presents `cert`+`key` as its mTLS identity when set; the modem requires `cert`+`key` and, with `require_client_cert = true`, enforces client certificates through `WebPkiClientVerifier` — closing the mutual-TLS follow-up from M7. New flags: `--cert` / `--key` / `--ca-bundle` overrides, `--check-config` (validates TOML shape, static peers and TLS material via `check_router_config` / `check_modem_config`, then exits), and the router's repeatable `--peer` (implies static mode). The router binary gained its missing run loop: static peers connect at startup, discovery mode auto-connects on `PeerDiscovered` (deduplicated by address). `NetworkConfig` is now `#[serde(default)]` so partial `[network]` sections parse, and the `[network]`/`[tls]`/`[timers]` sections reject unknown keys. Deployment guide at `doc/deployment.md` (private-CA openssl walkthrough, port-854 privileges, firewall/GTSM, systemd) plus working artifacts in `examples/` (TOML configs, hardened systemd units with a static `dlep` user). Verified by the `mtls_session_requires_and_accepts_client_certificate` / `mtls_modem_rejects_client_without_certificate` integration tests and an end-to-end smoke run with openssl-issued certificates. Network overrides are completed in chunk 69; shell completions remain in the feature backlog. Packaging and reconnect-on-drop were completed in later milestones below.
+9. Polish the CLI binaries and document deployment. **Done (M9)** — the binaries build rustls configs from the TOML `[tls]` section via `dlep_daemon::tls::{client_config, server_config}`: the router requires `ca_bundle` (private PKI; no system-roots fallback) and presents `cert`+`key` as its mTLS identity when set; the modem requires `cert`+`key` and, with `require_client_cert = true`, enforces client certificates through `WebPkiClientVerifier` — closing the mutual-TLS follow-up from M7. New flags: `--cert` / `--key` / `--ca-bundle` overrides, `--check-config` (validates TOML shape, static peers and TLS material via `check_router_config` / `check_modem_config`, then exits), and the router's repeatable `--peer` (implies static mode). The router binary gained its missing run loop: static peers connect at startup, discovery mode auto-connects on `PeerDiscovered` (deduplicated by address). `NetworkConfig` is now `#[serde(default)]` so partial `[network]` sections parse, and the `[network]`/`[tls]`/`[timers]` sections reject unknown keys. Deployment guide at `doc/deployment.md` (private-CA openssl walkthrough, port-854 privileges, firewall/GTSM, systemd) plus working artifacts in `examples/` (TOML configs, hardened systemd units with a static `dlep` user). Verified by the `mtls_session_requires_and_accepts_client_certificate` / `mtls_modem_rejects_client_without_certificate` integration tests and an end-to-end smoke run with openssl-issued certificates. Network overrides and shell completions are completed in chunks 69 and 72. Packaging and reconnect-on-drop were completed in later milestones below.
 10. Close the RFC-conformance gaps a post-M9 audit turned up. **Done (M10)** — three defects, all of which had survived because nothing in the tree exercised them:
     - **`Session Update` / `Session Update Response` (RFC 8175 §12.7-12.8) were entirely absent.** Neither FSM had an arm, so an inbound `Session Update` fell through the `InSession` catch-all: the missed-heartbeat deadline was reset and the message was then dropped **without the mandatory Response** ("A Session Update Response Message MUST be sent … when a Session Update Message is received"). Both FSMs acknowledge valid Session Updates and close matching transactions. The subsequent review corrected the original interpretation of §12.7: only modem-originated updates may contain metrics. Inbound session-wide metrics now surface as `DaemonEvent::Metrics`, which had been a defined-but-never-constructed variant.
     - **`Destination Announce` was on the wrong role.** `ModemDaemon::announce_destination` existed, took a MAC, discarded it and returned `Ok(())` — a public method that silently did nothing, advertised in both the README and §7. But §12.13 makes Destination Announce *router*-originated ("MAY be sent by a router to announce such an interest"), and §12.14 obliges the *modem* to answer it. The no-op is gone; `RouterDaemon::announce_destination` sends the message under a per-destination transaction, and the modem answers and emits `DestinationEvent::Announced` (another previously-dead variant) so its application can decide whether to follow up with a `Destination_Up`. A malformed announce with no MAC now terminates the session with Invalid Data.
@@ -1388,6 +1391,15 @@ The order of work was:
     does not configure security or authenticate that declaration. IPv4/IPv6
     discovery-to-session cases cover both values, while router transmission keeps
     the modem-only flag clear.
+
+72. Shell completions. **Done** — standalone commands and the launcher accept
+    `--generate-completions SHELL` for Bash, Elvish, Fish, PowerShell, and Zsh.
+    Generation uses the actual role CLI definitions and exits before config,
+    tracing, or socket setup. The launcher includes both roles and their flags;
+    requests through either subcommand produce the same launcher script.
+    Deployment instructions cover installation. Release smoke checks exercise
+    every generator, invalid shell arguments, config-independent generation,
+    and actual Bash completion of roles, options, and shell names.
 
 ---
 
