@@ -6,8 +6,9 @@ and unit files live in [`examples/`](../examples/).
 
 ## 1. Build and install
 
-Requires Linux and Rust 1.85+ (edition 2024). macOS CI covers the portable
-protocol crates, not the daemon transport. See [CI documentation](ci.md).
+Requires Rust 1.85+ (edition 2024). Linux supports strict TCP GTSM. Experimental
+macOS transport requires an explicit TCP enforcement opt-out as described below.
+See [CI documentation](ci.md) for validation scope.
 
 Install version 0.2.0 from crates.io after publication:
 
@@ -29,6 +30,41 @@ To build from a source checkout:
 cargo build --release --workspace --locked
 sudo install -m 0755 target/release/dlep-router target/release/dlep-modem /usr/local/bin/
 ```
+
+### macOS transport
+
+The experimental macOS path supports TCP/TLS sessions and ports discovery's
+ancillary-data handling. Each macOS process must explicitly opt out of strict
+TCP receive enforcement:
+
+```toml
+[network]
+gtsm_enforce = false
+```
+
+Apply this to each role's configuration before `--check-config` or startup.
+The default remains `true` and fails with an unsupported-platform error on
+macOS, including for a router that has not connected yet. This validation opens
+no sockets and checks platform support, not Linux packet-monitor privileges.
+TLS validation, outbound TTL/hop limit 255, and UDP discovery's inbound TTL
+checks remain enabled independently of this opt-out. Use a port above 1023 when
+running without privileged-port access; Linux capability and systemd examples
+below apply only to Linux.
+
+Discovery uses `IP_PKTINFO` to retain the ingress interface and selects a usable
+IPv4 address on that interface because Darwin leaves `ipi_spec_dst` empty.
+Selected IPv4 egress uses `IP_BOUND_IF` plus the preferred source address;
+IPv6 retains scoped packet information. Apple reports IPv4 TTL as one byte and
+IPv6 hop limit as an integer; both are required and checked before decoding.
+See Apple's [receive control-message implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/ip_input.c)
+and [IPv6 socket-option implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet6/ip6_output.c).
+
+Native macOS CI now builds the workspace commands and runs unprivileged
+IPv4/IPv6 plaintext/TLS sessions, destination delivery, and discovery unicast
+metadata checks. Native results are pending for this change; local Linux
+checks do not validate macOS runtime behavior or multicast on physical links.
+Strict TCP reset monitoring on macOS and transport support for other operating
+systems remain follow-up work.
 
 ### Shell completions
 

@@ -14,15 +14,31 @@ use socket2::Socket;
 /// Threshold TTL/HopLimit: packets with a lower value must be dropped.
 pub const REQUIRED_TTL: u8 = 255;
 
+/// Check platform support without opening sockets or checking privileges.
+/// Opting out only disables TCP receive enforcement; discovery stays strict.
+pub fn validate_tcp_enforcement(enforce: bool) -> io::Result<()> {
+    if enforce && !cfg!(target_os = "linux") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict TCP GTSM requires Linux; set network.gtsm_enforce = false to opt out explicitly",
+        ));
+    }
+    Ok(())
+}
+
 /// Configure TCP before connect/listen, including the SYN/SYN-ACK. Linux
 /// rejects segments below the minimum in the kernel, before delivery to TCP.
 /// The transport's privileged packet monitor resets established connections
 /// on rejected segments, because the TCP stream API does not report them.
 pub fn configure_tcp<F: std::os::fd::AsFd>(sock: &F, is_v6: bool, enforce: bool) -> io::Result<()> {
+    validate_tcp_enforcement(enforce)?;
     let socket = socket2::SockRef::from(sock);
     if is_v6 {
         socket.set_unicast_hops_v6(REQUIRED_TTL.into())?;
-        // A dual-stack listener also sends IPv4 SYN-ACKs on this socket.
+        // A dual-stack listener also sends IPv4 SYN-ACKs. Darwin copies the
+        // IPv6 hop option into the mapped IPv4 TTL; setting IP_TTL on an IPv6
+        // socket there fails with EINVAL. Linux needs both options.
+        #[cfg(not(target_os = "macos"))]
         socket.set_ttl(REQUIRED_TTL.into())?;
     } else {
         socket.set_ttl(REQUIRED_TTL.into())?;
@@ -90,11 +106,28 @@ pub fn set_send_ttl(sock: &Socket, is_v6: bool) -> io::Result<()> {
 /// extract IP_TTL (v4) or IPV6_HOPLIMIT (v6) from ancillary data and
 /// enforce `is_gtsm_valid`.
 pub fn enable_recv_ttl<F: AsFd>(sock: &F, is_v6: bool) -> io::Result<()> {
-    use nix::sys::socket::{setsockopt, sockopt};
-    if is_v6 {
-        setsockopt(sock, sockopt::Ipv6RecvHopLimit, &true).map_err(io::Error::from)?;
+    use nix::libc;
+    use std::os::fd::AsRawFd;
+    let (level, option) = if is_v6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVHOPLIMIT)
     } else {
-        setsockopt(sock, sockopt::Ipv4RecvTtl, &true).map_err(io::Error::from)?;
+        (libc::IPPROTO_IP, libc::IP_RECVTTL)
+    };
+    let enabled: libc::c_int = 1;
+    // SAFETY: the borrowed descriptor stays live, and these options read a
+    // c_int of the supplied size without retaining the pointer. nix does not
+    // expose the receive-TTL options on macOS.
+    let result = unsafe {
+        libc::setsockopt(
+            sock.as_fd().as_raw_fd(),
+            level,
+            option,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

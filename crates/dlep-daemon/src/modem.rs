@@ -390,6 +390,7 @@ impl ModemBuilder {
         let cfg = self
             .config
             .ok_or_else(|| DaemonError::Config("ModemConfig required".into()))?;
+        dlep_net::gtsm::validate_tcp_enforcement(cfg.shared.network.gtsm_enforce)?;
         let extensions = self
             .extensions
             .build(&cfg.shared.extensions)

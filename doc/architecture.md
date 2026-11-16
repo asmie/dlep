@@ -250,7 +250,13 @@ IPv4/IPv6 UDP discovery sends with TTL/hop limit 255 and checks the received
 value through ancillary data before decoding signals. TCP sockets set TTL/hop limit 255 before connecting or listening. On Linux,
 `gtsm_enforce` additionally configures `IP_MINTTL` / `IPV6_MINHOPCOUNT` so the
 kernel rejects lower-TTL TCP segments, including handshake traffic. Other
-platforms fail explicitly when TCP enforcement is requested.
+platforms fail explicitly when TCP enforcement is requested. The experimental
+macOS path accepts an explicit `gtsm_enforce = false` while retaining outbound
+TTL/hop limit 255 and strict discovery receive checks. Builders and config-check
+helpers validate platform support before starting networking. Darwin's
+`IP_RECVTTL` byte and `IPV6_HOPLIMIT` integer are decoded from control messages;
+IPv4 packet metadata is resolved to a usable ingress-interface address, and
+`IP_BOUND_IF` preserves interface selection alongside the preferred send source.
 
 Linux does not surface minimum-TTL drops through the stream API. The transport
 therefore opens an `AF_PACKET` monitor before accepting/connecting, requiring
@@ -554,7 +560,8 @@ for this checkpoint.
 
 See [CI documentation](ci.md) for exact jobs and reproduction
 commands. Linux tests run in a disposable network namespace with strict GTSM
-privileges. CI additionally checks Rust 1.85, portable crates on macOS,
+privileges. CI additionally checks Rust 1.85, protocol crates and experimental
+opt-out transport on macOS,
 formatting, clippy, workflow syntax, and dependency advisories. Coverage reports
 are downloadable artifacts; the audit has one documented, guarded exception.
 
@@ -590,8 +597,10 @@ complete in chunks 75–77. Arbitrary rustls configurations can already be suppl
 through builders; custom TLS verification does not require weakening defaults.
 
 Simultaneous IPv4/IPv6 discovery is complete in chunk 78. The remaining larger
-scope follow-up is non-Linux daemon transport; macOS currently covers portable
-protocol crates.
+scope follow-up is full non-Linux daemon transport. Chunk 79 adds an experimental
+macOS path with explicit TCP enforcement opt-out and native CI coverage;
+native results are pending. Strict TCP monitoring on macOS and other operating
+systems remain open. Physical-link multicast needs native deployment evidence.
 
 Device-specific radio integration needs a selected device and its control API.
 The generic radio adapter and link-control backend are already available.
@@ -1523,6 +1532,20 @@ The order of work was:
     endpoints, destination flow, TLS through cross-family offers, configuration
     checks, and cleanup. Release smoke covers the combined launcher discovering
     both modem families without duplicate sessions.
+
+79. Experimental macOS transport. **Implemented; native validation pending** —
+    TCP/TLS supports explicit `gtsm_enforce = false`, retaining outbound TTL/hop
+    limit 255. Darwin IPv6 sockets use the hop option for both IPv6 and mapped
+    IPv4 sends. Discovery handles native IPv4 TTL/IPv6 hop-limit control
+    messages, resolves usable ingress IPv4 addresses, and preserves preferred
+    source/interface selection. Configuration checks and both builders reject
+    unsupported strict TCP enforcement before networking. The macOS job now
+    checks workspace libraries/binaries and runs loopback session, TLS,
+    destination, and UDP metadata cases. Linux checks cover the shared paths;
+    a local Rust cross-check bypasses native crypto compilation in an isolated
+    temporary copy because this host has no macOS SDK. It is type-check evidence,
+    not a native build or runtime result. Full strict transport portability and
+    real-link multicast validation remain open.
 
 ---
 

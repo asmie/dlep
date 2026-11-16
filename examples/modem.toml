@@ -32,6 +32,9 @@ tcp_port = 854
 # TLS is on by default per the RFC's security guidance. With use_tls = true
 # the [tls] section below is required.
 use_tls = true
+# Experimental macOS transport requires disabling strict TCP receive enforcement.
+# Discovery still checks received TTLs. Linux defaults to strict enforcement.
+# gtsm_enforce = false
 
 [tls]
 # Server certificate + key presented to routers (required with TLS).

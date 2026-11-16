@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Added an experimental macOS transport path with explicit
+  `[network].gtsm_enforce = false`: TCP/TLS retains outbound TTL/hop limit 255,
+  and discovery handles Darwin TTL control messages, interface/source selection,
+  and usable local addresses. Strict TCP enforcement remains Linux-only;
+  configuration checks and both builders now reject it early on other platforms.
+  `ConfigCheckError` gains a `Transport` variant. Native macOS build and loopback
+  checks are added to CI; native runtime results are pending.
 - Both daemons support simultaneous IPv4/IPv6 discovery with
   `[network].discovery_dual_stack = true` or `--dual-stack-discovery`.
   An explicit interface with usable addresses in both families is required.

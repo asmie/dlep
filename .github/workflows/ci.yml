@@ -165,17 +165,19 @@ jobs:
             python3 .github/scripts/release-smoke.py --bin-dir target/release-install/bin
 
   macos:
-    name: macOS portable protocol crates
+    name: macOS protocol and opt-out transport
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Strict TCP reset monitoring and the transport implementation require
-      # Linux. This job checks portability of the codec, FSM, and plug-in API;
-      # it does not claim macOS daemon support.
+      # Strict TCP GTSM reset monitoring remains Linux-only. macOS requires an
+      # explicit gtsm_enforce=false; discovery still validates received TTLs.
       - run: cargo test -p dlep-core -p dlep-fsm -p dlep-ext --all-features --locked
+      - run: cargo check --workspace --lib --bins --all-features --locked
+      - name: Exercise unprivileged IPv4/IPv6 TCP, TLS, and discovery metadata
+        run: cargo test -p dlep-daemon --test portable_transport --locked
 
   coverage:
     name: Linux workspace coverage

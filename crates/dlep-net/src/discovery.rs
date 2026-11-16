@@ -111,6 +111,13 @@ impl DiscoverySocket {
         nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)?;
         sock.set_multicast_loop_v4(params.multicast_loop)?;
         sock.set_multicast_if_v4(&address)?;
+        // Darwin gives pktinfo's interface precedence over its source address.
+        // Pin the socket's egress interface, then specify only the preferred
+        // source in each sendmsg so both selections take effect.
+        #[cfg(target_os = "macos")]
+        if let Some(interface) = interface {
+            sock.bind_device_by_index_v4(std::num::NonZeroU32::new(interface.index))?;
+        }
         // Linux otherwise also delivers multicast joined by other sockets.
         #[cfg(target_os = "linux")]
         sock.set_multicast_all_v4(false)?;
@@ -235,7 +242,10 @@ impl DiscoverySocket {
             use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg};
             let nix_addr = SockaddrStorage::from(dest);
             let info = self.interface.map(|i| nix::libc::in_pktinfo {
+                #[cfg(not(target_os = "macos"))]
                 ipi_ifindex: i.index as _,
+                #[cfg(target_os = "macos")]
+                ipi_ifindex: 0,
                 ipi_spec_dst: nix::libc::in_addr {
                     s_addr: u32::from_ne_bytes(i.address.octets()),
                 },
@@ -300,9 +310,8 @@ impl DiscoverySocket {
         // Bound discovery packet storage to one standard Ethernet MTU.
         // Reject MSG_TRUNC rather than decoding an incomplete datagram.
         // Hoisted above the retry loop so an EAGAIN spin doesn't re-allocate.
-        // IP_TTL cmsg payload is `int` on Linux (`ControlMessageOwned::Ipv4Ttl(i32)`);
-        // `i32` matches `libc::c_int` on every supported target, keeping
-        // `dlep-net` free of an explicit `libc` dep.
+        // Linux reports IPv4 TTL as int; Darwin uses one byte in IP_RECVTTL.
+        // IPv6 hop limits are int on both. Reserve the larger representation.
         let mut payload = [0u8; 1500];
         let mut cmsg_space = nix::cmsg_space!(i32, nix::libc::in_pktinfo, nix::libc::in6_pktinfo);
 
@@ -347,6 +356,9 @@ impl DiscoverySocket {
                 let mut local = None;
                 let mut interface_index = None;
                 for cmsg in res.cmsgs().map_err(io::Error::from)? {
+                    if let Some(value) = received_ttl(&cmsg) {
+                        ttl = Some(value);
+                    }
                     if let ControlMessageOwned::Ipv4PacketInfo(info) = cmsg {
                         local = Some(IpAddr::V4(Ipv4Addr::from(
                             info.ipi_spec_dst.s_addr.to_ne_bytes(),
@@ -366,14 +378,6 @@ impl DiscoverySocket {
                                 }
                             }
                         }
-                    }
-                    if let ControlMessageOwned::Ipv4Ttl(t) | ControlMessageOwned::Ipv6HopLimit(t) =
-                        cmsg
-                    {
-                        // TTL is a single byte in the IP header; the kernel
-                        // hands it back as `int` (0..=255), so the cast is
-                        // lossless.
-                        ttl = Some(t as u8);
                     }
                 }
                 Ok::<_, io::Error>((bytes_read, from, ttl, local, interface_index))
@@ -407,6 +411,26 @@ impl DiscoverySocket {
                         tokio::task::yield_now().await;
                         continue;
                     }
+                    // Darwin's IPv4 pktinfo leaves ipi_spec_dst unspecified.
+                    // Resolve a usable unicast address on the actual ingress
+                    // interface, retaining the configured preference if any.
+                    #[cfg(target_os = "macos")]
+                    let local = match local {
+                        Some(IpAddr::V4(addr)) if addr.is_unspecified() => {
+                            Some(IpAddr::V4(match self.interface {
+                                Some(interface) => interface.address,
+                                None => {
+                                    crate::addr::InterfaceSpec::ByIndex(interface_index)
+                                        .resolve_v4(Ipv4Addr::UNSPECIFIED)?
+                                        .ok_or_else(|| {
+                                            io::Error::other("missing IPv4 ingress address")
+                                        })?
+                                        .address
+                                }
+                            }))
+                        }
+                        other => other,
+                    };
                     let buf = BytesMut::from(&payload[..bytes_read]);
                     let signal = self
                         .codec
@@ -426,6 +450,37 @@ impl DiscoverySocket {
                 Err(_would_block) => continue,
             }
         }
+    }
+}
+
+fn received_ttl(cmsg: &nix::sys::socket::ControlMessageOwned) -> Option<u8> {
+    use nix::sys::socket::ControlMessageOwned;
+    match cmsg {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+        ControlMessageOwned::Ipv6HopLimit(value) => u8::try_from(*value).ok(),
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+        ControlMessageOwned::Ipv4Ttl(value) => u8::try_from(*value).ok(),
+        // nix exposes Darwin's IP_RECVTTL message as Unknown. XNU sends the
+        // one-byte IP header field, unlike Linux's int-valued IP_TTL message.
+        #[cfg(target_os = "macos")]
+        ControlMessageOwned::Unknown(message)
+            if message.cmsg_header.cmsg_level == nix::libc::IPPROTO_IP
+                && message.cmsg_header.cmsg_type == nix::libc::IP_RECVTTL =>
+        {
+            match message.data_bytes.as_slice() {
+                [value] => Some(*value),
+                _ => None,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        ControlMessageOwned::Unknown(message)
+            if message.cmsg_header.cmsg_level == nix::libc::IPPROTO_IPV6
+                && message.cmsg_header.cmsg_type == nix::libc::IPV6_HOPLIMIT =>
+        {
+            let bytes: [u8; 4] = message.data_bytes.as_slice().try_into().ok()?;
+            u8::try_from(i32::from_ne_bytes(bytes)).ok()
+        }
+        _ => None,
     }
 }
 

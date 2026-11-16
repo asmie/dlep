@@ -2,7 +2,7 @@
 
 `.github/workflows/ci.yml` runs formatting and workflow validation, clippy, a
 Linux workspace build/test, a Rust 1.85.0 check of all targets and features,
-macOS tests of the portable crates, and instrumented Linux tests. Cargo commands
+macOS protocol/opt-out transport checks, and instrumented Linux tests. Cargo commands
 use the committed lockfile. Jobs have read-only repository permissions and
 deadlines; new pushes cancel obsolete runs for the same branch or pull request.
 
@@ -32,9 +32,14 @@ path-filtered dependency audit.
 It invokes both Python regression files explicitly, so a missing file fails
 instead of passing through test discovery with zero tests.
 
-The macOS job covers `dlep-core`, `dlep-fsm`, and `dlep-ext`. It does **not**
-validate the daemons or advertise macOS transport support. Discovery ancillary
-socket handling and strict TCP GTSM reset monitoring currently require Linux.
+The macOS job tests `dlep-core`, `dlep-fsm`, and `dlep-ext`, checks all workspace
+libraries and command binaries, and runs the daemon's `portable_transport`
+target. Those unprivileged loopback cases exercise IPv4/IPv6 plaintext and TLS
+sessions, destination delivery, UDP TTL/interface metadata, low-TTL filtering,
+and rejection of strict TCP enforcement until explicitly disabled. This is
+experimental macOS support; it does not validate physical-link multicast,
+adapters, or strict TCP GTSM reset monitoring. Native execution is pending for
+the first change enabling this job; Linux results are not macOS evidence.
 
 ## Release validation
 

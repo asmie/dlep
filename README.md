@@ -63,8 +63,11 @@ responsibilities and the design rationale.
 
 ## Build
 
-Requires Rust **1.85** or newer (edition 2024). The daemons and transport
-currently require Linux; the core, FSM, and extension API are portable.
+Requires Rust **1.85** or newer (edition 2024). Linux supports the full transport,
+including strict TCP GTSM. An experimental macOS path requires explicitly setting
+`[network].gtsm_enforce = false`; TCP/TLS and discovery retain outbound TTL/hop
+limit 255, and discovery still checks received TTLs. The core, FSM, and extension
+API are portable. See [macOS setup](doc/deployment.md#macos-transport).
 
 ```bash
 cargo build --workspace --locked
@@ -72,8 +75,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 Run network tests using the [isolated namespace command below](#network-tests).
-CI also checks Rust 1.85, the portable crates on macOS, coverage, workflow syntax,
-and dependency advisories. See [CI documentation](doc/ci.md) for job scope,
+CI also checks Rust 1.85, protocol crates and opt-out transport on macOS,
+coverage, workflow syntax, and dependency advisories. See [CI documentation](doc/ci.md) for job scope,
 local commands, coverage artifacts, and the guarded audit exception.
 
 ## Run
