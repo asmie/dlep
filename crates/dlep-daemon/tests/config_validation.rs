@@ -3,6 +3,46 @@ use dlep_daemon::{
     RouterDaemon, TimersConfig, check_modem_config, check_router_config, load_toml_config,
 };
 
+#[test]
+fn named_static_peers_validate_offline_and_round_trip_with_numeric_peers() {
+    let config: RouterConfig = toml::from_str("mode='static'\nstatic_peers=['127.0.0.1:854','[::1]:1854','MoDeM.Example:854']\n[network]\nuse_tls=false").unwrap();
+    assert_eq!(config.static_peers.len(), 2);
+    assert_eq!(config.named_peers[0].to_string(), "modem.example:854");
+    check_router_config(&config).unwrap();
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(!serialized.contains("named_peers"));
+    let copy: RouterConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(copy.static_peers, config.static_peers);
+    assert_eq!(copy.named_peers, config.named_peers);
+    let config: RouterConfig = toml::from_str(
+        "mode='static'\nstatic_peers=['does-not-exist.invalid:854']\n[network]\nuse_tls=false",
+    )
+    .unwrap();
+    check_router_config(&config).unwrap();
+    assert!(toml::from_str::<ModemConfig>("static_peers=['modem.example:854']").is_err());
+    for invalid in [
+        "modem.example",
+        "https://modem.example:854",
+        "modem.example:-1",
+        "modem.example:65536",
+        "modem.example:+854",
+        "modem.example:",
+        "bad name:854",
+        "[::1]:bad",
+        "::1:854",
+        "127.0.0.999:854",
+    ] {
+        assert!(
+            invalid.parse::<dlep_daemon::PeerEndpoint>().is_err(),
+            "{invalid}"
+        );
+        assert!(
+            toml::from_str::<RouterConfig>(&format!("static_peers=['{invalid}']")).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn router_limits_are_validated_by_config_checks_and_startup() {
     for settings in [

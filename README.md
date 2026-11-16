@@ -134,6 +134,11 @@ Logging precedence is `--log-level`, then `DLEP_LOG`, then `info`; `RUST_LOG`
 is not read. `--config` also accepts `-c` and the role-specific
 `DLEP_ROUTER_CONFIG` / `DLEP_MODEM_CONFIG` environment variable; an explicit flag
 wins. Router-only `--peer ADDR` is repeatable and selects static connections.
+It accepts `modem.example:854`, IPv4 `192.0.2.10:854`, or bracketed IPv6
+`[2001:db8::10]:854`; the port is required. TOML `static_peers` accepts the same
+forms. DNS peers use the requested hostname for TLS verification and SNI, and
+each retry calls the system resolver again. `--check-config` validates names
+without resolving them.
 Modem-only `--tcp-port PORT` overrides its listener; zero selects an allocated
 port. Routers use the TCP port supplied by each peer endpoint or offer.
 See the [deployment guide](doc/deployment.md#3-configuration) for details.
@@ -228,8 +233,9 @@ One connection/session slot covers resolution and all fallback attempts.
 endpoint with an explicit certificate identity, without DNS lookup.
 `connect_static(addr)` continues to verify the endpoint IP. All three return
 after transport registration, before DLEP initialization; wait for `SessionUp`
-before sending session commands. DNS names in `--peer` and `static_peers` are
-still pending CLI integration.
+before sending session commands. `RouterConfig.static_peers` retains its numeric
+Rust type; programmatic callers add DNS entries through `named_peers` using
+`NamedPeer::new(host, port)`. Serialization combines both into `static_peers`.
 
 Both daemons expose `state()`, a retained `watch::Receiver<DaemonSnapshot>` for
 late or slow consumers. Read its initial value and subsequent changes; clone the
@@ -524,7 +530,8 @@ doubling to a 30-second cap). TCP connection success preserves that retry
 history while DLEP initialization is pending; only `SessionUp` resets it.
 Repeated discovery offers for a queued endpoint do not bypass the delay.
 Static startup, discovered modems, and retries share at most eight concurrent
-TCP/TLS connection attempts. Slow peers leave other connections and event
+connection attempts; named static configurations include resolution in this
+bound and use the session budget to limit admission. Slow peers leave other connections and event
 handling responsive. Unavailable static peers stay queued for retry; queued
 peers wait when all slots are occupied, and discovery can retry on later offers.
 Reconnect decisions use `RouterDaemon::connection_states()`, a retained state
@@ -535,6 +542,14 @@ while a peer remains retained. Router limits default to 64 connections/sessions,
 peers stay eligible for retries; expired/evicted discovered peers require a fresh
 offer or explicit connection request. See [router limits](doc/deployment.md#3-configuration)
 for configuration and snapshot-consumer requirements.
+
+DNS retries keep the configured hostname as their key, try at most 16 distinct
+answers in resolver order, and share a 15-second resolution/connection deadline.
+Changing answers can move a session between IPv4 and IPv6 without changing the
+TLS identity. Duplicate entries and aliases cannot open concurrent sessions to
+the same numeric endpoint; an alias whose address is occupied stays queued.
+Resolved numeric history remains subject to the discovered-endpoint budget,
+while each configured hostname stays eligible for retry after that history expires.
 
 `[network].interface` / `--interface` selects discovery group membership,
 multicast egress, unicast reply source, and accepted ingress interface. For

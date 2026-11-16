@@ -79,8 +79,8 @@ revocation (CRLs) is not supported; rotate by reissuing and restarting.
 
 Create a CA, a modem (server) certificate, and a router (client)
 certificate. The modem certificate's subjectAltName **must** contain the
-IP address routers connect to when using the bundled CLI (its peer configuration
-currently takes numeric addresses):
+identity routers request: an IP SAN for numeric peers, or a DNS SAN for named
+peers. This example uses an IP address:
 
 ```bash
 MODEM_IP=192.0.2.10   # the address routers will connect to
@@ -129,7 +129,7 @@ without resolving DNS. CA trust and certificate validation still apply.
 Named connections resolve afresh on each call and try up to 16 distinct answers
 in resolver order within 15 seconds; the caller owns automatic retries and
 hostname-to-session tracking. Events expose the connected numeric endpoint.
-The CLI's `--peer` and TOML `static_peers` still require numeric addresses.
+The CLI also accepts DNS peers and manages their retries as described below.
 
 ## 3. Configuration
 
@@ -163,6 +163,47 @@ and port from `--peer` or a Peer Offer; `--tcp-port` is therefore modem-only.
 Its value may be zero to request an allocated TCP listen port, which discovery
 advertises. Ports are numeric values from 0 to 65535; use a nonzero matching
 discovery port for deployment (zero is useful only for ephemeral/local setups).
+
+### DNS peers
+
+Use an explicit port with a DNS name, IPv4 address, or bracketed IPv6 address:
+
+```sh
+dlep router --config /etc/dlep/router.toml --peer modem.example:854
+```
+
+Or set these top-level keys before any TOML section:
+
+```toml
+mode = "static"
+static_peers = ["modem.example:854", "192.0.2.20:854", "[2001:db8::20]:854"]
+```
+
+Names must be valid ASCII DNS names (use their IDNA/punycode form when needed).
+They are normalized to lowercase; a trailing dot retains absolute-name resolver
+semantics. The system resolver runs on every connection attempt, including
+retries after transport failures, failed initialization, and dropped sessions.
+Up to 16 distinct answers are tried in resolver order within a shared 15-second
+deadline. Resolution failures use the same 1–30 second reconnect backoff.
+`--check-config` validates syntax and TLS files without DNS queries.
+
+TLS verifies the configured hostname and sends it as SNI, including when a
+later answer changes address family. Issue the modem certificate with a matching
+DNS SAN. Numeric peers continue to require matching IP SANs. Events, snapshots,
+and adapter records identify the connected numeric endpoint.
+
+Duplicate configured entries are coalesced. If names or numeric peers overlap,
+the driver reserves each endpoint during connection and skips active endpoints;
+an alias remains queued with backoff rather than borrowing another identity's
+authenticated session. At most eight connection jobs run concurrently, with
+resolution counted toward admission against the session budget. Shutdown cancels
+pending jobs; the OS resolver may finish its underlying blocking work afterward.
+
+Rust callers keep numeric peers in `RouterConfig.static_peers` and add validated
+DNS peers with `RouterConfig.named_peers.push(NamedPeer::new("modem.example", 854)?)`.
+Serialization writes both lists into TOML `static_peers`; `named_peers` is not a
+separate TOML setting. The library handle does not automatically connect either
+list; embedders own connection scheduling.
 
 An optional router `[adapter]` section runs an external integration process;
 `command` is an absolute executable path and `args` defaults to `[]`.
@@ -239,7 +280,7 @@ metadata, even if a discovery offer advertised a different value.
 | Section | Field | Default | Meaning |
 |---|---|---|---|
 | top level (router) | `mode` | `"discovery"` | `"discovery"` or `"static"` |
-| top level (router) | `static_peers` | `[]` | modem `addr:port` list for static mode |
+| top level (router) | `static_peers` | `[]` | static modem endpoints: `HOST:PORT`, `IPv4:PORT`, or `[IPv6]:PORT` |
 | top level | `peer_description` | binary name | Peer Type data item text |
 | top level (modem) | `secured_medium` | `false` | Modem declaration of access control on the shared RF medium; independent of TLS |
 | `[limits]` (router) | `max_sessions` | `64` | positive bound on TCP/TLS attempts plus registered sessions |
@@ -365,8 +406,10 @@ with cleanup at least once a second. Successful initialization resets the window
 which starts at disconnect; failed initialization and TCP/TLS retries do not
 extend it. Initial unsuccessful sessions start the window at registration.
 Expired or evicted peers stop retrying until a new discovery offer or explicit
-connection request. Configured static peers never expire or consume discovered
-history slots; their storage is bounded by the configured list. These limits do
+connection request. Configured numeric static peers never expire or consume discovered
+history slots; their storage is bounded by the configured list. DNS answers use
+the bounded endpoint history, but configured hostnames remain eligible for retry
+after answers expire or are evicted. These limits do
 not require a static-peer count smaller than the session budget.
 
 `connection_states()` subscribers must discard retry records for removed

@@ -368,8 +368,11 @@ endpoint used by events and snapshots. It preserves the requested host as the
 TLS identity and re-resolves on every call. `connect_static_with_server_name`
 sets an explicit identity for a numeric endpoint; `connect_static` retains IP
 verification. All use the shared connection budget, and callers wait for
-`SessionUp` before sending commands. Named peer configuration and automatic
-reconnection by hostname remain CLI follow-ups.
+`SessionUp` before sending commands. The CLI accepts named `static_peers` and
+`--peer` endpoints and retries by configured identity. Numeric-only configurations
+retain the discovery-capable driver; configurations containing DNS peers use a
+static driver with bounded resolution and per-endpoint reservations. Both read
+retained connection state rather than depending on lifecycle broadcasts.
 
 The modem-side API is symmetric, with `add_destination`, `update_destination` and `drop_destination` taking the place of `start_discovery` / `connect_static`. `ModemBuilder::link_control` registers the backend that answers router Link Characteristics Requests; without one they are denied.
 
@@ -531,21 +534,20 @@ section records the limits of the available evidence.
 
 ### Feature backlog
 
-The current practical feature scope has five areas, four completed in chunks 69–72.
-DNS endpoints and TLS server names are the remaining product priority. Roughly
-6–10 focused implementation chunks for the whole group is a planning estimate, including
-chunks 69–72; it is not an RFC-completeness percentage or a release prerequisite.
-Validation should accompany features rather than become an open-ended queue.
+All five practical feature areas are complete in the six chunks 69–74. This
+closes that scoped backlog; it is not an RFC-completeness percentage or a
+conformance certificate. Further product work can select from the larger scope
+areas below. Validation should continue to accompany features.
 
 | Feature | Status / next behavior |
 | --- | --- |
 | Network CLI overrides | Done in chunk 69: bind/discovery options for both roles and TCP listen port for the modem |
 | Router destination acceptance policy | Done in chunk 70: startup allow/deny lists and default acceptance, with Not Interested replies for declined Up announcements |
 | Secured-medium Peer Type flag | Done in chunk 71: modem configuration and received discovery/session metadata, including router-adapter snapshots |
-| DNS endpoints and TLS server names | Library support in chunk 73: bounded resolution/fallback and explicit TLS names; next: CLI/configuration peers and name-aware retries |
+| DNS endpoints and TLS server names | Done in chunks 73–74: library connections, CLI/configuration DNS peers, preserved TLS identities, and name-aware retries |
 | Shell completions | Done in chunk 72: Bash, Elvish, Fish, PowerShell, and Zsh scripts generated from the standalone and combined CLI definitions |
 
-Three larger scope areas are separate from that estimate:
+Three larger scope areas remain optional follow-ups:
 
 - Extension controls/configuration: explicit termination requests, per-extension
   settings, and discovery extension hooks. Arbitrary rustls configurations can
@@ -1418,7 +1420,21 @@ The order of work was:
     failure or cancellation. Numeric connections retain IP verification; events
     and snapshots retain numeric endpoints. IPv4/IPv6 cases cover DNS-only
     identities, wrong names, untrusted certificates, SNI, fallback, and usable
-    DLEP sessions. CLI/configuration names and name-aware retries remain next.
+    DLEP sessions. CLI/configuration names and name-aware retries follow in chunk 74.
+
+74. Configured DNS peers and reconnects. **Done** — router `--peer` and TOML
+    `static_peers` accept validated DNS names with explicit ports alongside
+    numeric endpoints. Config checks require no DNS queries. The existing Rust
+    numeric list is preserved, with a new validated `named_peers` list serialized
+    into the same TOML array. The static driver retains configured identities,
+    re-resolves on every retry, preserves hostname verification/SNI across answer
+    and address-family changes, and uses bounded jobs, fallback, deadlines, and
+    backoff. Endpoint reservations and active-state checks prevent duplicate
+    alias sessions without borrowing authentication from another identity.
+    DNS answer history stays bounded while configured names remain retryable.
+    Runtime cases cover resolver failure, IPv4-to-IPv6 answer changes, aliases,
+    resolution admission, and cancellation. Release smoke covers both CLI and
+    TOML names, DNS-only certificates, and reconnect after modem restart.
 
 ---
 

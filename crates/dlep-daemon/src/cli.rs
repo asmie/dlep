@@ -92,7 +92,10 @@ pub fn check_router_config(cfg: &RouterConfig) -> Result<(), ConfigCheckError> {
         .network
         .validate_discovery_interface()
         .map_err(ConfigCheckError::Interface)?;
-    if matches!(cfg.mode, DiscoveryMode::Static) && cfg.static_peers.is_empty() {
+    if matches!(cfg.mode, DiscoveryMode::Static)
+        && cfg.static_peers.is_empty()
+        && cfg.named_peers.is_empty()
+    {
         return Err(ConfigCheckError::StaticModeWithoutPeers);
     }
     if cfg.shared.network.use_tls {

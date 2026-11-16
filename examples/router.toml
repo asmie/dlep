@@ -7,9 +7,11 @@
 
 # How the router finds its modem:
 #   "discovery" — RFC 8175 UDP multicast Peer Discovery (default)
-#   "static"    — connect directly to the addresses in static_peers
+#   "static"    — connect to numeric or DNS endpoints in static_peers
 mode = "discovery"
 # static_peers = ["192.0.2.10:854"]
+# DNS peers are re-resolved on retries; TLS checks the hostname's DNS SAN.
+# static_peers = ["modem.example:854", "[2001:db8::10]:854"]
 
 # Free-text description sent in the Peer Type data item.
 peer_description = "dlep-router"

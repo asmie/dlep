@@ -1,5 +1,6 @@
 mod adapter;
 mod connect;
+mod static_peers;
 
 use connect::ConnectAttempts;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -10,8 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use dlep_daemon::{
-    DaemonEvent, DiscoveryMode, PeerConnectionState, RouterConfig, RouterDaemon,
-    check_router_config, load_toml_config,
+    DaemonEvent, DiscoveryMode, NamedPeer, PeerConnectionState, PeerEndpoint, RouterConfig,
+    RouterDaemon, check_router_config, load_toml_config,
 };
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing_subscriber::EnvFilter;
@@ -62,10 +63,10 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     key: Option<PathBuf>,
 
-    /// Modem address to connect to directly instead of multicast
-    /// discovery. Repeatable; implies mode = "static".
+    /// Modem IP:PORT, [IPv6]:PORT, or HOST:PORT. DNS names are re-resolved
+    /// on retries and used for TLS verification. Repeatable; implies static mode.
     #[arg(long, value_name = "ADDR")]
-    peer: Vec<SocketAddr>,
+    peer: Vec<PeerEndpoint>,
 
     /// Validate the configuration (including TLS material) and exit.
     #[arg(long)]
@@ -126,6 +127,7 @@ where
 
     let mode = config.mode.clone();
     let static_peers = config.static_peers.clone();
+    let named_peers = config.named_peers.clone();
     // Fail a bad adapter command before opening DLEP connections.
     let mut adapter = config
         .adapter
@@ -148,7 +150,7 @@ where
     let result = tokio::select! {
         biased;
         _ = shutdown.recv() => Ok(()),
-        result = run(&daemon, &mut events, mode, &static_peers) => result,
+        result = run_configured(&daemon, &mut events, mode, &static_peers, &named_peers) => result,
         result = async {
             match &mut adapter {
                 Some(adapter) => adapter.run(&daemon).await,
@@ -169,6 +171,21 @@ where
         adapter.stop().await;
     }
     result.and(shutdown_result)
+}
+
+async fn run_configured(
+    daemon: &RouterDaemon,
+    events: &mut Receiver<DaemonEvent>,
+    mode: DiscoveryMode,
+    addresses: &[SocketAddr],
+    names: &[NamedPeer],
+) -> Result<()> {
+    if matches!(mode, DiscoveryMode::Static) && !names.is_empty() {
+        static_peers::run(daemon, events, addresses, names).await;
+        Ok(())
+    } else {
+        run(daemon, events, mode, addresses).await
+    }
 }
 
 async fn run(
@@ -515,7 +532,12 @@ fn apply_overrides(cfg: &mut RouterConfig, cli: &Cli) {
     }
     if !cli.peer.is_empty() {
         cfg.mode = DiscoveryMode::Static;
-        cfg.static_peers.extend(cli.peer.iter().copied());
+        for peer in &cli.peer {
+            match peer {
+                PeerEndpoint::Address(addr) => cfg.static_peers.push(*addr),
+                PeerEndpoint::Named(peer) => cfg.named_peers.push(peer.clone()),
+            }
+        }
     }
 }
 
@@ -654,6 +676,18 @@ mod tests {
                 "192.0.2.2:854".parse().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn named_peer_flag_appends_and_preserves_existing_numeric_configuration() {
+        let cli = parse(&["--peer", "Modem.Example:1854", "--peer", "127.0.0.1:854"]);
+        let mut cfg = RouterConfig::default();
+        cfg.static_peers.push("[::1]:854".parse().unwrap());
+        apply_overrides(&mut cfg, &cli);
+        assert!(matches!(cfg.mode, DiscoveryMode::Static));
+        assert_eq!(cfg.static_peers.len(), 2);
+        assert_eq!(cfg.named_peers[0].to_string(), "modem.example:1854");
+        assert!(Cli::try_parse_from(["dlep-router", "--peer", "bad name:854"]).is_err());
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod events;
 pub mod link_control;
 pub mod modem;
+pub mod peer;
 pub mod router;
 pub mod runtime;
 pub mod session;
@@ -32,6 +33,7 @@ pub use events::{
 };
 pub use link_control::{LinkControl, LinkControlReply, LinkRequest, LinkResponse};
 pub use modem::{ModemBuilder, ModemDaemon};
+pub use peer::{NamedPeer, PeerEndpoint};
 pub use router::{RouterBuilder, RouterDaemon};
 pub use state::{
     DaemonSnapshot, DestinationPhase, DestinationSnapshot, SessionPhase, SessionSnapshot,

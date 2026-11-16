@@ -10,7 +10,7 @@ The release job verifies all crates.io archives, fetches the complete locked
 dependency set (including test-only dependencies), compares archived Cargo
 targets with the source workspace, compiles their test targets in an isolated
 extracted workspace, installs `dlep`, `dlep-router`, and `dlep-modem`
-under `target/release-install`, then checks every CLI flag and four local
+under `target/release-install`, then checks every CLI flag and six local
 plaintext/mutual-TLS session scenarios in a disposable network namespace.
 It does not publish packages. See [release validation](#release-validation).
 Package verification alone does not populate every development dependency;
@@ -68,7 +68,11 @@ Smoke checks cover CLI flags and configuration precedence, all five completion
 generators without configuration or logging setup, and actual Bash completion
 of launcher roles and role-specific options. They also cover certificate errors,
 two static plaintext IPv4 peers, mutual TLS over IPv6, mutual TLS with IPv4
-discovery, and plaintext discovery through the combined launcher. Sessions cross
+discovery, and plaintext discovery through the combined launcher. Two DNS
+scenarios use CLI and TOML names with DNS-only certificates and reconnect after
+modem restart. A runtime case injects changing resolver answers to verify fresh
+lookup, hostname verification, and IPv4-to-IPv6 reconnection without changing
+host resolver configuration. Sessions cross
 heartbeat intervals and must shut down cleanly on SIGINT/SIGTERM. All network
 changes occur in disposable namespaces. Use the sudo alternative in the network
 test instructions when user namespaces are unavailable.

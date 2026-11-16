@@ -2,12 +2,20 @@
 
 ## Unreleased
 
+- Router `--peer` and TOML `static_peers` accept DNS names with explicit ports.
+  Retries resolve names afresh while preserving hostname-based TLS verification
+  and SNI, bounded fallback, connection limits, and exponential backoff. Duplicate
+  entries and overlapping aliases cannot open duplicate endpoint sessions.
+  `--check-config` validates names without DNS queries. Numeric Rust peers stay
+  in `RouterConfig.static_peers`; DNS peers use the new `named_peers` field, and
+  serialization combines both lists. Manual full Rust struct initializers need
+  to supply that field or use `..RouterConfig::default()`.
 - Library routers can connect to DNS peers with `connect_named(host, port)` or
   verify an explicit TLS identity at a numeric address with
   `connect_static_with_server_name(addr, name)`. Named connections preserve the
   requested hostname across address fallback, with 16-address/15-second bounds
   and one shared connection slot. Numeric connections retain IP verification.
-  CLI/configuration support for named peers is still pending.
+  CLI/configuration support includes name-aware retries as described above.
 - All commands can print Bash, Elvish, Fish, PowerShell, and Zsh completion
   scripts with `--generate-completions SHELL`. Scripts use the actual CLI
   definitions, including both roles in the combined launcher. Generation exits

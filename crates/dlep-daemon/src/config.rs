@@ -228,7 +228,7 @@ pub enum DiscoveryMode {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(from = "RouterConfigFile")]
+#[serde(from = "RouterConfigFile", into = "RouterConfigFile")]
 pub struct RouterConfig {
     #[serde(default)]
     pub destinations: DestinationPolicyConfig,
@@ -243,6 +243,8 @@ pub struct RouterConfig {
     pub mode: DiscoveryMode,
     #[serde(default)]
     pub static_peers: Vec<SocketAddr>,
+    /// Configured DNS peers; serialized alongside numeric `static_peers`.
+    pub named_peers: Vec<crate::NamedPeer>,
     #[serde(default = "default_router_peer_description")]
     pub peer_description: String,
 }
@@ -256,6 +258,7 @@ impl Default for RouterConfig {
             shared: SharedConfig::default(),
             mode: DiscoveryMode::default(),
             static_peers: Vec::new(),
+            named_peers: Vec::new(),
             peer_description: default_router_peer_description(),
         }
     }
@@ -509,12 +512,12 @@ impl Default for ModemConfig {
 // Serde's deny_unknown_fields does not support flattened structs. Deserialize
 // a strict, flat file schema while preserving the public `shared` layout and
 // the existing flattened serialization format.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RouterConfigFile {
     #[serde(default)]
     destinations: DestinationPolicyConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     adapter: Option<RouterAdapterConfig>,
     #[serde(default)]
     limits: RouterLimits,
@@ -527,13 +530,21 @@ struct RouterConfigFile {
     #[serde(default)]
     mode: DiscoveryMode,
     #[serde(default)]
-    static_peers: Vec<SocketAddr>,
+    static_peers: Vec<crate::PeerEndpoint>,
     #[serde(default = "default_router_peer_description")]
     peer_description: String,
 }
 
 impl From<RouterConfigFile> for RouterConfig {
     fn from(file: RouterConfigFile) -> Self {
+        let mut static_peers = Vec::new();
+        let mut named_peers = Vec::new();
+        for peer in file.static_peers {
+            match peer {
+                crate::PeerEndpoint::Address(addr) => static_peers.push(addr),
+                crate::PeerEndpoint::Named(peer) => named_peers.push(peer),
+            }
+        }
         Self {
             destinations: file.destinations,
             adapter: file.adapter,
@@ -544,8 +555,35 @@ impl From<RouterConfigFile> for RouterConfig {
                 timers: file.timers,
             },
             mode: file.mode,
-            static_peers: file.static_peers,
+            static_peers,
+            named_peers,
             peer_description: file.peer_description,
+        }
+    }
+}
+
+impl From<RouterConfig> for RouterConfigFile {
+    fn from(config: RouterConfig) -> Self {
+        Self {
+            destinations: config.destinations,
+            adapter: config.adapter,
+            limits: config.limits,
+            network: config.shared.network,
+            tls: config.shared.tls,
+            timers: config.shared.timers,
+            mode: config.mode,
+            static_peers: config
+                .static_peers
+                .into_iter()
+                .map(crate::PeerEndpoint::Address)
+                .chain(
+                    config
+                        .named_peers
+                        .into_iter()
+                        .map(crate::PeerEndpoint::Named),
+                )
+                .collect(),
+            peer_description: config.peer_description,
         }
     }
 }
